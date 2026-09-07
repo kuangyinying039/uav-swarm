@@ -1,0 +1,30 @@
+{
+  "lidar_model": "mid360",
+  "pursuit_target_observable": false,
+  "decision_dt": 0.2,
+  "velocity_response_time": 0.35,
+  "attitude_response_time": 0.2,
+  "max_horizontal_acceleration": 2.5,
+  "max_vertical_acceleration": 2.0,
+  "max_tilt_deg": 30.0,
+  "max_body_rate": 2.0,
+  "lidar_min_range": 0.2,
+  "lidar_target_detection_range": 12.0,
+  "lidar_horizontal_fov_deg": 360.0,
+  "lidar_vertical_min_deg": -7.0,
+  "lidar_vertical_max_deg": 52.0,
+  "lidar_scan_hz": 10.0,
+  "lidar_detection_probability": 0.9,
+  "lidar_position_noise_std": 0.08,
+  "lidar_noise_per_meter": 0.005,
+  "lidar_mount_xyz": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "lidar_mount_rpy_deg": [
+    0.0,
+    0.0,
+    0.0
+  ]
+}

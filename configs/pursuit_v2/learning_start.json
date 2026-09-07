@@ -1,0 +1,15 @@
+{
+  "scenario_version": 2,
+  "capture_mode": "single_distance",
+  "target_diameter": 0.5,
+  "policy_observation_version": 2,
+  "grid_size": 25,
+  "building_count": 2,
+  "building_state_capacity": 5,
+  "initial_distance_min": 6.0,
+  "initial_distance_max": 10.0,
+  "target_speed": 1.54,
+  "target_vertical_speed": 0.88,
+  "pursuit_target_observable": true,
+  "search_steps": 300
+}

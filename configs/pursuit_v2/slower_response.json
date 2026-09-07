@@ -1,0 +1,6 @@
+{
+  "scenario_version": 2,
+  "velocity_response_time": 0.55,
+  "attitude_response_time": 0.3,
+  "yaw_response_time": 0.3
+}
