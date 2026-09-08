@@ -24,7 +24,7 @@ class PursuitDemoTests(unittest.TestCase):
 
     def trainer(self, gat=False):
         return PursuitDemoTrainer(lambda: QuadrotorPursuitEnv(self.env_cfg),
-                                  TrainConfig(episodes=1, hidden_dim=16, batch_size=3, update_epochs=1,
+                                  TrainConfig(episodes=1, gamma=self.env_cfg.reward_gamma, hidden_dim=16, batch_size=3, update_epochs=1,
                                               use_gat=gat, use_hetero_entities=gat, gat_heads=1,
                                               gat_layers=1, device="cpu"))
 
@@ -33,7 +33,7 @@ class PursuitDemoTests(unittest.TestCase):
         actor = trainer.actor
         obs = torch.zeros((3, trainer.obs_dim))
         _, std = actor(obs).chunk(2, -1)
-        self.assertTrue(torch.allclose(std.exp(), torch.full_like(std, 0.2)))
+        self.assertTrue(torch.allclose(std.exp(), torch.full_like(std, 0.4)))
         before = actor.std_parameter.detach().clone()
         std.sum().backward()
         self.assertTrue(torch.all(actor.std_parameter.grad.abs() > 0))
@@ -98,6 +98,9 @@ class PursuitDemoTests(unittest.TestCase):
         self.assertAlmostEqual(history[0]["reward"], sum(history[0]["reward_components"].values()))
         self.assertLessEqual(history[0]["closest_capture_gap"], history[0]["minimum_capture_gap"])
         self.assertTrue(np.isfinite(history[0]["policy_loss"]))
+        self.assertLessEqual(history[0]['exact_policy_kl'], 1.5*trainer.cfg.target_kl)
+        self.assertLess(history[0]['pre_update_logprob_error'], 2e-3)
+        self.assertGreater(history[0]['ppo_accepted_steps'], 0)
         obs = QuadrotorPursuitEnv(self.env_cfg).observe_search()
         before = trainer.action(obs)
         with tempfile.TemporaryDirectory() as folder:
@@ -124,6 +127,19 @@ class PursuitDemoTests(unittest.TestCase):
         dataset["env_config"]["target_diameter"] = 100
         with self.assertRaises(ValueError):
             validate_demos(dataset, self.env_cfg)
+
+    def test_legacy_execution_contract_rejected(self):
+        from train_pursuit_with_demos import load_environment_config
+        recorded = asdict(self.env_cfg)
+        recorded.pop('execution_reward_version')
+        with self.assertRaisesRegex(ValueError, 'Safety execution'):
+            load_environment_config(recorded)
+
+    def test_initial_action_mean_is_not_directionally_saturated(self):
+        env = QuadrotorPursuitEnv(self.env_cfg)
+        for gat in (False, True):
+            trainer = self.trainer(gat)
+            self.assertLess(np.max(np.abs(trainer.action(env.observe_search()))), .1)
 
     def test_old_control_dataset_rejected_even_with_same_action_dimension(self):
         recorded = asdict(self.env_cfg)

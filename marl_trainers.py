@@ -546,6 +546,10 @@ def capture_env_frame(env, result: dict, actions: list[int]) -> dict:
         frame["execution_mode"] = "velocity_yaw_rate"
         frame["sensor_mode"] = "noisy_game_observation" if env.cfg.pursuit_target_observable else "lidar"
         frame["controller_feasible_rate"] = float(result.get("controller_feasible_rate", 0.0))
+        for key in ('desired_velocities', 'executed_velocity_references', 'safety_reasons',
+                    'safety_correction_rate', 'safety_correction_magnitude', 'emergency_stop_rate'):
+            if key in result:
+                frame[key] = result[key]
         frame["body_angular_rates"] = _tolist(env.quadrotor_states[:, 10:13])
         frame["lidar_model"] = env.cfg.lidar_model
         try:

@@ -9,6 +9,8 @@ import numpy as np
 
 
 FIELDS = (
+    "safety_correction_rate", "safety_correction_magnitude", "emergency_stop_rate", "safety_reason_counts",
+    "exact_policy_kl", "pre_update_logprob_error", "ppo_backtracks", "ppo_accepted_steps", "action_mean_saturation", "policy_std",
     "reward_components", "closest_capture_gap", "disabled_uavs_final",
     "episode", "capture_success", "capture_time", "steps", "reward",
     "minimum_capture_gap", "collisions", "uav_collisions", "obstacle_conflicts",
@@ -50,12 +52,12 @@ def write_learning_chart(path, history):
         ("Episode length (includes timeouts, rolling 50)", "steps", None),
         ("Final capture gap (rolling 50)", "minimum_capture_gap", None),
         ("Collisions per episode (rolling 50)", "collisions", None),
-        ("Controller feasible fraction (rolling 50)", "controller_feasible_rate", (0, 1)),
+        ("Execution without emergency stop (rolling 50)", "controller_feasible_rate", (0, 1)),
     ]
     body = ['<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="860" viewBox="0 0 1100 860">',
             '<rect width="1100" height="860" fill="#f4f7fb"/>',
             '<g font-family="Arial, sans-serif" fill="#183249">',
-            '<text x="30" y="34" font-size="22">Cooperative capture | MAPPO + demonstrations</text>',
+            '<text x="30" y="34" font-size="22">Cooperative capture | MAPPO</text>',
             '<text x="30" y="58" font-size="13">Stochastic training statistics. Compare policies using held-out deterministic evaluation.</text>']
     for index, (title, key, bounds) in enumerate(panels):
         x, y = 65 + (index % 2)*540, 115 + (index // 2)*250
@@ -197,7 +199,7 @@ def write_pursuit_outputs(folder, history, traces):
                              "found_targets", "tracked_targets", "completed_targets")}
                            for frame in trace["frames"]]
         stem = f"capture_episode_{trace['episode']}"
-        write_episode_scene_3d_svg(folder / f"{stem}.svg", "MAPPO + demos", trace)
+        write_episode_scene_3d_svg(folder / f"{stem}.svg", "MAPPO", trace)
         write_pursuit_animation_html(folder / f"{stem}.html", trace, f"Cooperative capture | episode {trace['episode']}")
         links.append(f'<p><a href="{stem}.html">第 {trace["episode"]} 回合三维围捕回放</a></p><img src="{stem}.svg" style="max-width:940px;width:100%">')
     (folder / "index.html").write_text('<!doctype html><meta charset="utf-8"><title>协同围捕</title><body style="font-family:Arial;background:#f4f7fb;margin:24px">'+"\n".join(links)+'</body>', encoding="utf-8")

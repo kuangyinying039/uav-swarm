@@ -1,0 +1,127 @@
+{
+  "date": "2026-09-08",
+  "execution_reward_version": 3,
+  "tests": [
+    {
+      "log": "tmp/pursuit_v3_tests.log",
+      "tests_run": 53,
+      "passed": true
+    },
+    {
+      "log": "tmp/pursuit_v3_final_guards.log",
+      "tests_run": 17,
+      "passed": true
+    }
+  ],
+  "note_tests": "The second test run overlaps the first; do not sum their counts.",
+  "training_smoke": {
+    "directory": "outputs\\pursuit_v3_final_smoke_seed11",
+    "episodes": 10,
+    "seed": 11,
+    "bc_updates": 0,
+    "demo_weight": 0,
+    "device": "cpu",
+    "capture_count": 0,
+    "max_exact_policy_kl": 0.005232747178524733,
+    "max_pre_update_logprob_error": 1.430511474609375e-06,
+    "max_action_mean_saturation": 0.0,
+    "controller_feasible_rate": 1.0,
+    "safety_correction_rate": 0.07322222222222222,
+    "emergency_stop_rate": 0.0,
+    "policy_std": 0.40000411570072175
+  },
+  "held_out_evaluation": {
+    "seeds": [
+      3000000,
+      3000001,
+      3000002
+    ],
+    "summary": {
+      "mappo": {
+        "episodes": 3,
+        "capture_rate": 0.0,
+        "mean_censored_steps": 300.0,
+        "mean_success_steps": null,
+        "mean_return": -72.8567381904601,
+        "mean_collisions": 0.0,
+        "mean_safety_interventions": 214.0,
+        "mean_controller_feasible_rate": 1.0,
+        "mean_safety_correction_rate": 0.2377777777777783,
+        "mean_emergency_stop_rate": 0.0
+      }
+    }
+  },
+  "baseline_smoke": {
+    "seeds": [
+      23,
+      37,
+      51
+    ],
+    "summary": {
+      "apf": {
+        "episodes": 3,
+        "capture_rate": 0.6666666666666666,
+        "mean_capture_time_success_only": 190.5,
+        "mean_censored_time": 227.0,
+        "mean_visibility_ratio": 1.0,
+        "mean_safety_interventions": 21.666666666666668,
+        "mean_controller_feasible_rate": 1.0,
+        "mean_safety_correction_rate": 0.02987416230751455,
+        "mean_emergency_stop_rate": 0.0,
+        "mean_return": 28.886363108338625
+      },
+      "frpn": {
+        "episodes": 3,
+        "capture_rate": 0.6666666666666666,
+        "mean_capture_time_success_only": 112.0,
+        "mean_censored_time": 174.66666666666666,
+        "mean_visibility_ratio": 1.0,
+        "mean_safety_interventions": 179.33333333333334,
+        "mean_controller_feasible_rate": 0.9974074074074074,
+        "mean_safety_correction_rate": 0.3642165242165243,
+        "mean_emergency_stop_rate": 0.002592592592592592,
+        "mean_return": 31.0810791634171
+      },
+      "mpc": {
+        "episodes": 3,
+        "capture_rate": 0.6666666666666666,
+        "mean_capture_time_success_only": 184.0,
+        "mean_censored_time": 222.66666666666666,
+        "mean_visibility_ratio": 1.0,
+        "mean_safety_interventions": 97.33333333333333,
+        "mean_controller_feasible_rate": 1.0,
+        "mean_safety_correction_rate": 0.15420289855072475,
+        "mean_emergency_stop_rate": 0.0,
+        "mean_return": 27.80709427714491
+      }
+    }
+  },
+  "unchanged_physical_fields": {
+    "scenario_version": 2,
+    "n_uavs": 3,
+    "n_targets": 1,
+    "grid_size": 25,
+    "search_steps": 300,
+    "decision_dt": 0.2,
+    "target_speed": 1.54,
+    "target_vertical_speed": 0.88,
+    "max_horizontal_velocity": 1.4,
+    "max_vertical_velocity": 0.8,
+    "capture_mode": "single_distance",
+    "capture_radius": 1.0,
+    "capture_required_uavs": 1,
+    "capture_hold_steps": 1,
+    "initial_distance_min": 8.0,
+    "initial_distance_max": 16.0,
+    "game_position_noise_std": 0.1,
+    "velocity_response_time": 0.35,
+    "max_horizontal_acceleration": 2.5,
+    "max_vertical_acceleration": 2.0
+  },
+  "limitations": [
+    "Short smoke tests verify execution/update health; they do not establish learned capture performance.",
+    "Baseline smoke seeds and policy evaluation seeds differ; these are not a paired performance comparison.",
+    "Controller feasible rate changed semantics: it includes corrected actions and excludes disabled UAVs.",
+    "Local projection and emergency fallback are simulation mechanisms, not a formal hardware safety guarantee."
+  ]
+}

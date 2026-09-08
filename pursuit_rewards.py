@@ -36,14 +36,49 @@ def obstacle_cost(positions, active, buildings, heights, cfg):
     return -cfg.obstacle_proximity_weight * float(np.where(active, risk, 0.).mean())
 
 
-def shaped_rewards(previous, current, active_before, active_after, cfg):
+def clearance_costs(positions, active, cfg, obstacles):
+    """Bounded, continuous costs for boundary, spherical obstacles and peers."""
+    points = np.asarray(positions)
+    active = np.asarray(active, dtype=bool)
+    lower = np.array([.2, .2, cfg.min_altitude])
+    upper = np.array([cfg.grid_size-.2, cfg.grid_size-.2, cfg.max_altitude])
+    clearance = np.minimum(points-lower, upper-points).min(axis=1)
+    boundary = np.clip(1.-clearance/cfg.boundary_reward_safe_distance, 0., 1.)**2
+    obstacle = np.zeros(len(points))
+    for point in obstacles:
+        gap = np.linalg.norm(points-point, axis=1)-cfg.obstacle_radius
+        obstacle = np.maximum(obstacle, np.clip(1.-gap/cfg.obstacle_reward_safe_distance, 0., 1.)**2)
+    peer = np.zeros(len(points))
+    for i in np.flatnonzero(active):
+        others = active.copy()
+        others[i] = False
+        if np.any(others):
+            gap = np.min(np.linalg.norm(points[others]-points[i], axis=1))-cfg.uav_collision_radius
+            peer[i] = np.clip(1.-gap/cfg.boundary_reward_safe_distance, 0., 1.)**2
+    # Fixed team denominator: a dead UAV does not amplify survivors' costs.
+    return {"boundary_proximity": -cfg.boundary_proximity_weight*float(np.where(active, boundary, 0.).mean()),
+            "point_obstacle_proximity": -cfg.obstacle_proximity_weight*float(np.where(active, obstacle, 0.).mean()),
+            "peer_proximity": -cfg.peer_proximity_weight*float(peer.mean())}
+
+
+def shaped_rewards(previous, current, active_before, active_after, cfg, terminal=False):
+    """Discount-consistent potentials, zero at *all* episode terminal states.
+
+    Nearest-agent progress matches any-one-UAV capture; mean progress and
+    altitude-aware enclosure encourage the other UAVs to assist. No teacher
+    actions or target-truth observations are injected into the actor.
+    """
     old_log, _, old_enclosure = previous
-    new_log, proximity, enclosure = current
-    # Lost vehicles never earn progress by disappearing from the minimum.
-    valid = np.asarray(active_before) & np.asarray(active_after)
-    progress = np.where(valid, np.clip(old_log-new_log, -1., 1.), 0.)
+    new_log, _, enclosure = current
+    old_potential = np.where(active_before, np.exp(-cfg.capture_radius*np.expm1(old_log)/cfg.approach_distance_scale), 0.)
+    new_potential = np.where(active_after, np.exp(-cfg.capture_radius*np.expm1(new_log)/cfg.approach_distance_scale), 0.)
+    if terminal:
+        new_potential = np.zeros_like(new_potential)
+        enclosure = 0.
+    progress = cfg.reward_gamma*new_potential-old_potential
     return {
         "individual_approach": cfg.individual_approach_weight * float(progress.mean()),
-        "target_proximity": cfg.target_proximity_weight * proximity,
-        "encirclement_progress": cfg.encirclement_progress_weight * (enclosure-old_enclosure),
+        "nearest_approach": cfg.nearest_approach_weight * float(cfg.reward_gamma*new_potential.max()-old_potential.max()),
+        "target_proximity": 0.0,
+        "encirclement_progress": cfg.encirclement_progress_weight * (cfg.reward_gamma*enclosure-old_enclosure),
     }, progress

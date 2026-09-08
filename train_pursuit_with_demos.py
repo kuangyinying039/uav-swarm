@@ -24,15 +24,16 @@ from marl_trainers import (
 from pursuit_baselines_3d import BASELINES_3D
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from pursuit_training_output import clean_history_row, write_pursuit_outputs, write_evaluation_chart, write_reward_capture_chart
+from pursuit_ppo import update_pursuit
 
 
 class PursuitActor(nn.Module):
     """Shared means with trainable, smoothly bounded per-action exploration."""
 
-    def __init__(self, mean_actor, action_dim, upper=-0.5, initial_std=0.2):
+    def __init__(self, mean_actor, action_dim, upper=-0.5, initial_std=0.4):
         super().__init__()
         self.mean_actor = mean_actor
-        self.lower, self.upper = -5.0, upper
+        self.lower, self.upper = math.log(0.05), upper
         initial = math.log(initial_std)
         if not self.lower < initial < upper:
             raise ValueError("Initial log standard deviation must lie inside its bounds")
@@ -52,6 +53,10 @@ class PursuitDemoTrainer(MAPPOTrainer):
             raise ValueError("This trainer is restricted to quadrotor pursuit")
         if cfg.use_assignment_head or cfg.use_search_weights:
             raise ValueError("Pursuit demonstration training requires direct motion actions")
+        if not math.isclose(cfg.gamma, probe.cfg.reward_gamma, abs_tol=1e-10):
+            raise ValueError("PPO gamma must equal environment reward_gamma for potential shaping")
+        if cfg.normalize_returns:
+            raise ValueError("Per-rollout return standardization changes critic units; use unnormalized returns")
         # PPO must recompute the same policy likelihood before any update.
         # Fresh dropout masks invalidate that ratio; exploration comes from Normal.
         cfg = replace(cfg, dropout=0.0)
@@ -61,10 +66,18 @@ class PursuitDemoTrainer(MAPPOTrainer):
                        cfg.gat_layers, cfg.dropout)
             if cfg.use_gat else FlatMLP(self.obs_dim, self.action_dim, cfg.hidden_dim)
         )
+        # Official MAPPO uses a small (0.01) orthogonal action-head gain.
+        # A default random head on LayerNorm features created a large initial
+        # common-direction bias in the failed run.
+        output_head = mean_actor.head if cfg.use_gat else mean_actor.net[-1]
+        nn.init.orthogonal_(output_head.weight, gain=0.01)
+        nn.init.zeros_(output_head.bias)
         self.actor = PursuitActor(mean_actor, self.action_dim, cfg.continuous_log_std_max).to(self.device)
         self.actors = nn.ModuleList([self.actor])
-        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
-        self.algorithm_name = "mappo_pursuit_demo"
+        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr, eps=1e-5)
+        self.critic = nn.Sequential(nn.LayerNorm(self.state_dim), self.critic).to(self.device)
+        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr, eps=1e-5)
+        self.algorithm_name = "mappo_pursuit_safe_v3"
         self.environment_config = asdict(probe.cfg)
         self.demo_metadata = {}
         self.demo_episodes = []
@@ -74,13 +87,15 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.validation_interval = 50
         self.validation_records = []
         self.pursuit_history = []
-        self.best_capture_score = (-1.0, -float("inf"))
+        self.best_capture_score = (-1.0, -float("inf"), -float("inf"))
         self.output_directory = None
 
     def _make_env(self, episode):
         self.active_env = super()._make_env(episode)
         self.environment_seconds = 0.0
         self.controller_rates = []
+        self.safety_metrics = {k: [] for k in ('safety_correction_rate', 'safety_correction_magnitude', 'emergency_stop_rate')}
+        self.safety_reason_counts = {}
         self.reward_totals = {}
         self.closest_capture_gap = float("inf")
         self.lidar_rates = []
@@ -94,6 +109,11 @@ class PursuitDemoTrainer(MAPPOTrainer):
                     self.reward_totals[key] = self.reward_totals.get(key, 0.0) + float(value)
             self.closest_capture_gap = min(self.closest_capture_gap, result.get("minimum_capture_gap", float("inf")))
             self.controller_rates.append(result.get("controller_feasible_rate", 0.0))
+            for key in self.safety_metrics:
+                self.safety_metrics[key].append(result[key])
+            for reasons in result['safety_reasons']:
+                for reason in reasons:
+                    self.safety_reason_counts[reason] = self.safety_reason_counts.get(reason, 0)+1
             if "lidar_detection_ratio" in result:
                 self.lidar_rates.append(result["lidar_detection_ratio"])
             return result
@@ -102,7 +122,7 @@ class PursuitDemoTrainer(MAPPOTrainer):
 
     def _update(self, rollout, episode):
         started = time.perf_counter()
-        result = super()._update(rollout, episode)
+        result = update_pursuit(self, rollout, episode)
         result["ppo_update_seconds"] = time.perf_counter() - started
         return result
 
@@ -112,6 +132,8 @@ class PursuitDemoTrainer(MAPPOTrainer):
         row = clean_history_row(row)
         row["environment_seconds"] = self.environment_seconds
         row["controller_feasible_rate"] = float(np.mean(self.controller_rates)) if self.controller_rates else None
+        row.update({key: float(np.mean(values)) for key, values in self.safety_metrics.items()})
+        row['safety_reason_counts'] = dict(self.safety_reason_counts)
         if self.lidar_rates:
             row["lidar_detection_ratio"] = float(np.mean(self.lidar_rates))
         row["target_observation_ratio"] = row.get("continuous_visibility_ratio")
@@ -130,11 +152,16 @@ class PursuitDemoTrainer(MAPPOTrainer):
                           "final_capture_gap": row["minimum_capture_gap"],
                           "controller_feasible_rate": row["controller_feasible_rate"],
                           "disabled_uavs_final": row["disabled_uavs_final"]}
+            diagnostic.update({key: row[key] for key in (*self.safety_metrics, 'safety_reason_counts',
+                               'exact_policy_kl', 'pre_update_logprob_error', 'action_mean_saturation', 'ppo_backtracks')})
             with (self.output_directory / "reward_diagnostics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(diagnostic) + "\n")
             if row["episode"] == 1 or row["episode"] % 10 == 0:
                 terms = " ".join(f"{key}={value:.2f}" for key, value in self.reward_totals.items())
                 print(f"[reward-breakdown] episode={row['episode']} {terms} closest_capture_gap={self.closest_capture_gap:.3f} disabled={row['disabled_uavs_final']}", flush=True)
+                print(f"[pursuit-health] episode={row['episode']} kl={row['exact_policy_kl']:.5f} "
+                      f"saturation={row['action_mean_saturation']:.3f} correction={row['safety_correction_rate']:.3f} "
+                      f"emergency={row['emergency_stop_rate']:.3f}", flush=True)
         self.pursuit_history.append(row)
         if self.output_directory and (row["episode"] == 1 or row["episode"] % 50 == 0):
             write_reward_capture_chart(self.output_directory / "reward_capture.svg", self.pursuit_history)
@@ -145,7 +172,7 @@ class PursuitDemoTrainer(MAPPOTrainer):
     def validate_capture(self, episode):
         result = evaluate(self, QuadrotorPursuitConfig(**self.environment_config), self.validation_seeds, ["mappo"])
         metrics = result["summary"]["mappo"]
-        score = (metrics["capture_rate"], -metrics["mean_censored_steps"])
+        score = (metrics["capture_rate"], -metrics["mean_censored_steps"], metrics['mean_return'])
         self.validation_records.append({"episode": episode, **metrics})
         if score > self.best_capture_score:
             self.best_capture_score = score
@@ -168,6 +195,8 @@ class PursuitDemoTrainer(MAPPOTrainer):
         torch.save(payload, path)
 
     def load_checkpoint(self, path):
+        recorded = torch.load(path, map_location='cpu', weights_only=False)
+        load_environment_config(recorded['env_config'])
         payload = super().load_checkpoint(path)
         self.demo_metadata = payload.get("demo_metadata", {})
         self.best_capture_score = tuple(payload.get("best_capture_score", self.best_capture_score))
@@ -344,6 +373,7 @@ def evaluate(trainer, env_cfg, seeds, methods):
                 policy.reset(env)
             obs, total, components = env.observe_search(), 0.0, {}
             collisions, safety, feasible = 0, 0, 0.0
+            correction, emergency = 0., 0.
             for step in range(env.cfg.search_steps):
                 action = deterministic_action(trainer, obs) if policy is None else policy.actions(env)
                 result = env.step_joint(action)
@@ -352,6 +382,8 @@ def evaluate(trainer, env_cfg, seeds, methods):
                 collisions += int(result.get("collisions", 0))
                 safety += int(result.get("continuous_safety_interventions", 0))
                 feasible += float(result.get("controller_feasible_rate", 0.0))
+                correction += float(result.get('safety_correction_rate', 0.))
+                emergency += float(result.get('emergency_stop_rate', 0.))
                 if (step + 1) % 100 == 0:
                     print(f"[evaluation] {method} seed={seed} step={step+1}", flush=True)
                 for key, value in result["reward_components"].items():
@@ -366,6 +398,8 @@ def evaluate(trainer, env_cfg, seeds, methods):
                          "evader_safety_interventions": getattr(env, "evader_safety_interventions", 0),
                          "collisions": collisions, "safety_interventions": safety,
                          "controller_feasible_rate": feasible / (step + 1),
+                         "safety_correction_rate": correction / (step + 1),
+                         "emergency_stop_rate": emergency / (step + 1),
                          "final_capture_gap": env.minimum_capture_gap()})
             print(f"[evaluation] {method} seed={seed} captured={rows[-1]['captured']} steps={step+1}", flush=True)
     trainer.actor.train()
@@ -379,7 +413,9 @@ def evaluate(trainer, env_cfg, seeds, methods):
                            "mean_return": np.mean([r["return"] for r in group]).item(),
                            "mean_collisions": float(np.mean([r["collisions"] for r in group])),
                            "mean_safety_interventions": float(np.mean([r["safety_interventions"] for r in group])),
-                           "mean_controller_feasible_rate": float(np.mean([r["controller_feasible_rate"] for r in group]))}
+                           "mean_controller_feasible_rate": float(np.mean([r["controller_feasible_rate"] for r in group])),
+                           "mean_safety_correction_rate": float(np.mean([r["safety_correction_rate"] for r in group])),
+                           "mean_emergency_stop_rate": float(np.mean([r["emergency_stop_rate"] for r in group]))}
     return {"env_config": asdict(env_cfg), "rows": rows, "summary": summary}
 
 
@@ -395,6 +431,8 @@ def load_environment_config(recorded):
             key in recorded for key in ("execution_mode", "sensor_mode", "nmpc_horizon")):
         raise ValueError("Old NMPC/FOV demonstrations or checkpoint are incompatible. "
                          "Recollect with the current velocity/MID-360 environment into a new file.")
+    if recorded.get('execution_reward_version') != 3:
+        raise ValueError('Safety execution and rewards changed to v3; recollect demos and retrain in a new directory')
     return QuadrotorPursuitConfig(**recorded)
 
 
@@ -414,7 +452,10 @@ def main():
     parser.add_argument("--demo-weight", type=float, default=0.1, help="Auxiliary BC weight, decays to zero by halfway through RL")
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--update-epochs", type=int, default=3)
+    parser.add_argument("--target-kl", type=float, default=0.01)
     parser.add_argument("--no-gat", action="store_true")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1, help="Small graph batches usually benefit from a single CPU thread")
@@ -429,6 +470,10 @@ def main():
     parser.add_argument("--correction-updates", type=int, default=500)
     parser.add_argument("--correction-seed", type=int, default=5000000)
     args = parser.parse_args()
+    if not (math.isfinite(args.lr) and args.lr > 0 and math.isfinite(args.target_kl) and args.target_kl > 0 and args.update_epochs > 0):
+        parser.error('lr, target-kl and update-epochs must be positive and finite')
+    if args.mode == 'train' and not args.checkpoint and any((args.out/name).exists() for name in ('latest.pt', 'final.pt', 'history.json')):
+        parser.error('Output already contains a run; choose a new --out directory or explicitly resume a v3 checkpoint')
     if args.correction_rounds < 0 or min(args.correction_episodes, args.correction_updates) < 1:
         parser.error("Invalid correction counts")
     if args.correction_rounds and args.mode != "pretrain":
@@ -450,9 +495,10 @@ def main():
         torch.save(dataset, args.demos)
         args.demos.with_suffix(".json").write_text(json.dumps({k: v for k, v in dataset.items() if k != "episodes"}, indent=2), encoding="utf-8")
         return
-    cfg = TrainConfig(episodes=args.episodes, gamma=0.995, gae_lambda=0.97,
+    cfg = TrainConfig(episodes=args.episodes, gamma=env_cfg.reward_gamma, gae_lambda=0.97,
                       hidden_dim=args.hidden_dim, batch_size=args.batch_size, device=args.device,
-                      entropy_coef=0.001, entropy_coef_end=0.0001, adaptive_entropy=False,
+                      lr=args.lr, update_epochs=args.update_epochs, target_kl=args.target_kl, clip_eps=0.1,
+                      entropy_coef=0.003, entropy_coef_end=0.001, adaptive_entropy=False,
                       use_gat=not args.no_gat, use_hetero_entities=not args.no_gat,
                       checkpoint_path=str(args.out / "latest.pt"))
     if args.checkpoint:
@@ -529,7 +575,7 @@ def main():
             parser.error("Validation seeds overlap training or demonstrations")
         prior_validation = trainer.demo_metadata.get("validation_seeds", [])
         if args.checkpoint and prior_validation != trainer.validation_seeds:
-            trainer.best_capture_score = (-1.0, -float("inf"))
+            trainer.best_capture_score = (-1.0, -float("inf"), -float("inf"))
         trainer.demo_metadata["validation_seeds"] = sorted(set(prior_validation + trainer.validation_seeds))
         trainer.validate_capture(trainer.start_episode)
     history = trainer.train()

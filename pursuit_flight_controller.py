@@ -20,9 +20,10 @@ def _euler_quaternion(roll, pitch, yaw):
                      cr*sp*cy+sr*cp*sy, cr*cp*sy-sr*sp*cy])
 
 
-def integrate_velocity_reference(state, velocity, yaw_rate, dt, cfg):
+def integrate_velocity_reference(state, velocity, yaw_rate, dt, cfg, *, return_path=False):
     """Lagged, acceleration-limited velocity tracking with rate-limited tilt."""
     result = np.asarray(state, dtype=float).copy()
+    path = [result[:3].copy()] if return_path else None
     target = np.asarray(velocity, dtype=float).copy()
     speed = np.linalg.norm(target[:2])
     if speed > cfg.max_horizontal_velocity:
@@ -43,6 +44,8 @@ def integrate_velocity_reference(state, velocity, yaw_rate, dt, cfg):
         old_velocity = result[3:6].copy()
         result[3:6] += step*acceleration
         result[:3] += 0.5*step*(old_velocity+result[3:6])
+        if return_path:
+            path.append(result[:3].copy())
         rotation = quaternion_to_rotation(result[6:10])
         roll = math.atan2(rotation[2, 1], rotation[2, 2])
         pitch = math.asin(float(np.clip(-rotation[2, 0], -1, 1)))
@@ -63,4 +66,4 @@ def integrate_velocity_reference(state, velocity, yaw_rate, dt, cfg):
         result[10:13] = body_rates*factor
         result[6:10] = _euler_quaternion(roll+step*roll_dot*factor,
                                         pitch+step*pitch_dot*factor, yaw+step*tracked_yaw_rate*factor)
-    return result
+    return (result, np.asarray(path)) if return_path else result

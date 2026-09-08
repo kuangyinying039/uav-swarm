@@ -30,6 +30,7 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     action_mode: str = "world_velocity_xyz_and_yaw_rate_to_autopilot"
     scenario_version: int = 2
     policy_observation_version: int = 2
+    execution_reward_version: int = 3
     target_speed: float = 1.82  # 1.3 times pursuer horizontal speed; simulation assumption
     target_vertical_speed: float = 1.04
     initial_distance_min: float = 8.0
@@ -50,17 +51,25 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     quadrotor_gravity: float = 9.81
     quadrotor_clearance: float = 0.45
     controller_rejection_penalty: float = 0.20
-    reference_smoothness_weight: float = 0.01
+    reference_smoothness_weight: float = 0.002
+    safety_buffer: float = 0.10
+    safety_correction_weight: float = 0.05
+    boundary_proximity_weight: float = 0.03
+    peer_proximity_weight: float = 0.03
+    boundary_reward_safe_distance: float = 0.75
+    reward_gamma: float = 0.995
+    approach_distance_scale: float = 12.0
+    nearest_approach_weight: float = 4.0
     capture_mode: str = "single_distance"
     target_diameter: float = 0.5  # simulation equivalent, not a hardware measurement
     capture_required_uavs: int = 1
     capture_hold_steps: int = 1
     individual_approach_weight: float = 2.0
-    target_proximity_weight: float = 0.02
+    target_proximity_weight: float = 0.0
     encirclement_progress_weight: float = 2.0
     encirclement_distance_scale: float = 6.0
     encirclement_height_scale: float = 2.0
-    obstacle_proximity_weight: float = 0.2
+    obstacle_proximity_weight: float = 0.03
     obstacle_reward_safe_distance: float = 1.5
     obstacle_reward_log_scale: float = 0.1
     # Fully observed pursuit: estimation and messaging remain diagnostics.
@@ -89,6 +98,16 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     lidar_mount_rpy_deg: tuple = (0.0, 0.0, 0.0)
 
     def __post_init__(self):
+        if self.execution_reward_version != 3:
+            raise ValueError("Use execution_reward_version=3 and retrain with the corrected safety/reward contract")
+        if not 0 < self.reward_gamma <= 1 or min(self.approach_distance_scale, self.boundary_reward_safe_distance, self.safety_buffer) <= 0:
+            raise ValueError("Invalid shaping discount, distance scale, or safety buffer")
+        if self.target_proximity_weight != 0:
+            raise ValueError("v3 uses terminal-aware potential shaping, not a per-step proximity bonus")
+        if min(self.safety_correction_weight, self.boundary_proximity_weight, self.peer_proximity_weight,
+               self.controller_rejection_penalty, self.obstacle_proximity_weight,
+               self.individual_approach_weight, self.nearest_approach_weight, self.encirclement_progress_weight) < 0:
+            raise ValueError("Reward weights must be nonnegative")
         if min(self.encirclement_distance_scale, self.encirclement_height_scale,
                self.obstacle_reward_safe_distance, self.obstacle_reward_log_scale) <= 0:
             raise ValueError("Reward distance scales must be positive")
@@ -255,6 +274,19 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
     def continuous_action_dim(self) -> int:
         return 4
 
+    def _safety_filtered_actions(self, actions):
+        """The parent advances sensing/targets using hover placeholders only.
+
+        Its legacy 2-D DWA/ORCA can replace hover by a grid displacement even
+        when two UAVs are safely separated in altitude. That would corrupt
+        positions AFTER the continuous controller integrated the flight state.
+        All pursuit motion and safety are handled once, in step_joint.
+        """
+        actions = np.asarray(actions, dtype=int)
+        if actions.shape != (self.cfg.n_uavs,) or np.any(actions != 8):
+            raise ValueError('Use continuous step_joint; parent actions must be hover placeholders')
+        return actions.copy()
+
     def obs_dim(self) -> int:
         return super().obs_dim() + 10 + 7*self.cfg.n_uavs + 5*max(self.cfg.building_state_capacity, self.cfg.building_count)
 
@@ -281,7 +313,9 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
             features[i, 21] = max(0.0, 1.0-self.t/max(c.search_steps, 1))
             if hasattr(self, 'track_memory'):
                 track = self.track_memory[i][0]
-                if track.initialized:
+                # Parent reset briefly builds planar tracks before rebuilding
+                # the 3-D filter. Do not read vz from that temporary 4-D state.
+                if track.initialized and len(track.mean) >= 6:
                     features[i, 7] = (track.mean[2]-self.altitudes[i])/c.max_altitude
                     features[i, 8:10] = track.mean[3:5]/max(c.target_speed, 1e-6)
                     features[i, 15] = track.mean[5]/max(c.target_vertical_speed, 1e-6)
@@ -371,9 +405,11 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
 
     def step_joint(self, actions: np.ndarray) -> dict:
         try:
-            from pursuit_rewards import geometry_features, shaped_rewards, obstacle_cost
+            from pursuit_rewards import geometry_features, shaped_rewards, obstacle_cost, clearance_costs
+            from pursuit_safety import safe_velocity_step, paths_conflict
         except ImportError:
-            from .pursuit_rewards import geometry_features, shaped_rewards, obstacle_cost
+            from .pursuit_rewards import geometry_features, shaped_rewards, obstacle_cost, clearance_costs
+            from .pursuit_safety import safe_velocity_step, paths_conflict
         actions = np.asarray(actions, dtype=float)
         active_before = ~self.disabled_uavs.copy()
         previous_geometry = geometry_features(self.quadrotor_states[:, :3],
@@ -397,38 +433,43 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         desired_yaw_rates = actions[:, 3] * c.max_reference_yaw_rate
         horizontal = np.linalg.norm(desired_velocities[:, :2], axis=1, keepdims=True)
         desired_velocities[:, :2] *= np.minimum(1.0, c.max_horizontal_velocity/np.maximum(horizontal, 1e-12))
-        feasible = np.ones(c.n_uavs, dtype=bool)
-        obstacle_positions = np.column_stack(
-            [self.obstacles.astype(float), self.obstacle_altitudes]
-        ) if len(self.obstacles) else np.empty((0, 3), dtype=float)
-        lower = np.array([0.2, 0.2, c.min_altitude])
-        upper = np.array([c.grid_size - 0.2, c.grid_size - 0.2, c.max_altitude])
-        interventions = 0
+        feasible = active_before.copy()
+        executed_velocities = np.zeros_like(desired_velocities)
+        candidates = previous_states.copy()
+        paths, reasons = {}, [[] for _ in range(c.n_uavs)]
         for i in range(c.n_uavs):
             if self.disabled_uavs[i]:
                 continue
-            try:
-                from pursuit_flight_controller import integrate_velocity_reference
-            except ImportError:
-                from .pursuit_flight_controller import integrate_velocity_reference
-            candidate = integrate_velocity_reference(previous_states[i], desired_velocities[i], desired_yaw_rates[i], dt, c)
-            unsafe = (
-                np.any(candidate[:3] < lower)
-                or np.any(candidate[:3] > upper)
-                or self._point_inside_building_prism(candidate[:3], margin=c.quadrotor_clearance)
-                or (
-                    len(obstacle_positions) > 0
-                    and np.min(np.linalg.norm(obstacle_positions - candidate[:3], axis=1))
-                    <= c.obstacle_radius
-                )
-            )
-            if unsafe:
-                candidate = previous_states[i].copy()
-                candidate[3:6] *= 0.25
-                candidate[10:13] *= 0.25
-                interventions += 1
-                feasible[i] = False
-            self.quadrotor_states[i] = candidate
+            candidates[i], executed_velocities[i], reasons[i], emergency, paths[i] = safe_velocity_step(
+                self, i, desired_velocities[i], desired_yaw_rates[i], dt)
+            feasible[i] = not emergency
+        # Plan from the same pre-step team state, then validate relative sweeps.
+        # Recheck after a stop because another UAV may have planned to cross its
+        # vacated position. At most n_uavs passes can add new emergency stops.
+        active_ids = list(paths)
+        for _ in range(c.n_uavs):
+            newly_stopped = False
+            for index, i in enumerate(active_ids):
+                for j in active_ids[index+1:]:
+                    if not paths_conflict(paths[i], paths[j], c.uav_collision_radius):
+                        continue
+                    for agent in (i, j):
+                        newly_stopped |= bool(np.any(paths[agent] != previous_states[agent, :3]))
+                        feasible[agent] = False
+                        candidates[agent] = previous_states[agent]
+                        candidates[agent, 3:6] = 0.
+                        candidates[agent, 10:13] = 0.
+                        paths[agent][:] = previous_states[agent, :3]
+                        executed_velocities[agent] = 0.
+                        reasons[agent] = sorted(set(reasons[agent]) | {'peer'})
+            if not newly_stopped:
+                break
+        self.quadrotor_states[:] = candidates
+        scales = np.array([c.max_horizontal_velocity, c.max_horizontal_velocity, c.max_vertical_velocity])
+        corrections = np.linalg.norm((desired_velocities-executed_velocities)/scales, axis=1)
+        corrected = active_before & ((corrections > 1e-6) | ~feasible)
+        interventions = int(np.count_nonzero(corrected))
+        active_count = max(int(np.count_nonzero(active_before)), 1)
 
         self.positions = self.quadrotor_states[:, :2].copy()
         self.altitudes = self.quadrotor_states[:, 2].copy()
@@ -443,10 +484,16 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         smoothness = c.reference_smoothness_weight * float(
             np.mean(np.sum((actions - self.previous_reference_actions) ** 2, axis=1))
         )
-        infeasible_cost = c.controller_rejection_penalty * float(np.count_nonzero(~feasible))
-        result["reward"] = float(result["reward"] - smoothness - infeasible_cost)
+        infeasible_cost = c.controller_rejection_penalty * float(np.count_nonzero(active_before & ~feasible))/active_count
+        correction_cost = c.safety_correction_weight * float(np.sum(np.minimum(corrections[active_before], 1.)))/active_count
+        result["reward"] = float(result["reward"] - smoothness - infeasible_cost - correction_cost)
         result["continuous_actions"] = actions.tolist()
         result["desired_velocities"] = desired_velocities.tolist()
+        result["executed_velocity_references"] = executed_velocities.tolist()
+        result["safety_correction_rate"] = interventions/active_count
+        result["safety_correction_magnitude"] = float(np.sum(corrections[active_before]))/active_count
+        result["safety_reasons"] = reasons
+        result["emergency_stop_rate"] = float(np.count_nonzero(active_before & ~feasible))/active_count
         result["desired_yaw_rates"] = desired_yaw_rates.tolist()
         result["quadrotor_states"] = self.quadrotor_states.tolist()
         result["initial_layout"] = self.initial_layout
@@ -454,7 +501,7 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         result["evader_safety_interventions"] = getattr(self, "evader_safety_interventions", 0)
         result["execution_mode"] = "velocity_yaw_rate"
         result["sensor_mode"] = "noisy_game_observation" if c.pursuit_target_observable else "lidar"
-        result["controller_feasible_rate"] = float(np.mean(feasible))
+        result["controller_feasible_rate"] = float(np.count_nonzero(feasible))/active_count
         result["body_angular_rates"] = self.quadrotor_states[:, 10:13].tolist()
         result["target_observation_ratio"] = float(np.mean(self.direct_visibility_mask()))
         if not c.pursuit_target_observable:
@@ -472,9 +519,12 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         current_geometry = geometry_features(self.quadrotor_states[:, :3],
             [*self.dynamic_targets[0], self.target_altitudes[0]], ~self.disabled_uavs, c)
         shaping, individual_progress = shaped_rewards(previous_geometry, current_geometry,
-            active_before, ~self.disabled_uavs, c)
+            active_before, ~self.disabled_uavs, c,
+            terminal=bool(result["capture_success"] or self.t >= c.search_steps or result.get("terminated", False)))
         shaping["obstacle_proximity"] = obstacle_cost(self.quadrotor_states[:, :3],
             active_before, self.buildings, self.building_heights, c)
+        shaping.update(clearance_costs(self.quadrotor_states[:, :3], active_before, c,
+                                      np.column_stack([self.obstacles, self.obstacle_altitudes])))
         result["reward"] = float(result["reward"] + sum(shaping.values()))
         result["individual_approach_progress"] = individual_progress.tolist()
         result["encirclement_score"] = current_geometry[2]
@@ -482,6 +532,7 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         result["reward_components"].update(shaping)
         result["reward_components"]["reference_smoothness"] = -smoothness
         result["reward_components"]["controller_rejection"] = -infeasible_cost
+        result["reward_components"]["safety_correction"] = -correction_cost
         self.previous_reference_actions = actions.copy()
         # The parent already produced the post-action, post-capture observation.
         # Only diagnostic rewards changed since then; avoid rebuilding its graph.

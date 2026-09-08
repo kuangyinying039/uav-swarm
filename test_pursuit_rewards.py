@@ -19,7 +19,7 @@ class RewardTests(unittest.TestCase):
         self.assertGreater(r['individual_approach'],0)
         self.assertGreater(progress[1],0)
         reverse,_ = shaped_rewards(b,a,self.active,self.active,self.c)
-        self.assertAlmostEqual(r['individual_approach'],-reverse['individual_approach'])
+        self.assertLess(reverse['individual_approach'], 0)
 
     def test_close_progress_stronger_and_no_singularity(self):
         close = np.log(2/1.5)
@@ -38,7 +38,7 @@ class RewardTests(unittest.TestCase):
         high=ring.copy(); high[:,2]=6
         self.assertGreater(score,self.features(high)[2])
         same,_=shaped_rewards(self.features(ring),self.features(ring),self.active,self.active,self.c)
-        self.assertEqual(same['encirclement_progress'],0)
+        self.assertLessEqual(same['encirclement_progress'],0)
 
     def test_obstacle_distance_uses_height_and_is_bounded(self):
         def cost(p):
@@ -51,4 +51,24 @@ class RewardTests(unittest.TestCase):
         a=self.features([[2,0,0],[8,0,0],[10,0,0]])
         b=self.features([[1,0,0],[8,0,0],[10,0,0]])
         _,progress=shaped_rewards(a,b,self.active,np.array([False,True,True]),self.c)
-        self.assertEqual(progress[0],0)
+        self.assertLessEqual(progress[0],0)
+
+    def test_discounted_potential_telescopes_at_success_and_timeout(self):
+        states = [self.features([[d,0,0],[d+2,1,0],[d+4,-1,0]]) for d in (8,6,7,3)]
+        for final in (states[-1], states[0]):
+            path = [*states[:-1], final]
+            total = 0.
+            for step, (a,b) in enumerate(zip(path,path[1:])):
+                reward,_ = shaped_rewards(a,b,self.active,self.active,self.c,terminal=step == len(path)-2)
+                total += self.c.reward_gamma**step*sum(reward.values())
+            initial = np.exp(-self.c.capture_radius*np.expm1(path[0][0])/self.c.approach_distance_scale)
+            expected = -(self.c.individual_approach_weight*initial.mean()+self.c.nearest_approach_weight*initial.max()+self.c.encirclement_progress_weight*path[0][2])
+            self.assertAlmostEqual(total,expected)
+
+    def test_boundary_cost_is_continuous_bounded_and_zero_away(self):
+        from pursuit_rewards import clearance_costs
+        def cost(x):
+            return clearance_costs(np.array([[x,8,5],[10,10,5],[15,15,5]]),self.active,self.c,[])['boundary_proximity']
+        self.assertLess(cost(.21),cost(.5))
+        self.assertEqual(cost(3),0.)
+        self.assertGreaterEqual(cost(.2),-self.c.boundary_proximity_weight)
