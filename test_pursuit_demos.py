@@ -40,6 +40,49 @@ class PursuitDemoTests(unittest.TestCase):
         trainer.actor_optim.step()
         self.assertFalse(torch.equal(before, actor.std_parameter))
 
+    def test_warm_start_exploration_can_be_set_conservatively(self):
+        trainer = self.trainer()
+        trainer.actor.set_std(0.08)
+        obs = torch.zeros((3, trainer.obs_dim))
+        _, log_std = trainer.actor(obs).chunk(2, -1)
+        torch.testing.assert_close(log_std.exp(), torch.full_like(log_std, 0.08))
+
+    def test_demo_weight_decays_to_nonzero_floor(self):
+        trainer = self.trainer()
+        trainer.cfg.episodes = 10
+        trainer.demo_episodes = [[{"unused": True}]]
+        trainer.demo_weight = 0.1
+        trainer.demo_weight_floor = 0.02
+        self.assertAlmostEqual(trainer.demo_loss_weight(0), 0.1)
+        self.assertAlmostEqual(trainer.demo_loss_weight(9), 0.02)
+
+    def test_auxiliary_batch_separates_original_and_correction_states(self):
+        trainer = self.trainer()
+        trainer.cfg.batch_size = 8
+        trainer.demo_episodes = [[{"source": "original"}]]
+        trainer.correction_episodes = [[{"source": "correction"}]]
+        trainer.correction_fraction = 0.75
+        with patch("train_pursuit_with_demos.cloning_loss", side_effect=[torch.tensor(2.0), torch.tensor(4.0)]) as loss:
+            value = trainer.pursuit_demo_loss(0)
+        self.assertEqual(loss.call_args_list[0].args[1], trainer.demo_episodes)
+        self.assertEqual(loss.call_args_list[0].args[2], 2)
+        self.assertEqual(loss.call_args_list[1].args[1], trainer.correction_episodes)
+        self.assertEqual(loss.call_args_list[1].args[2], 6)
+        self.assertAlmostEqual(float(value), 0.1 * 3.5)
+
+    def test_frozen_reference_policy_is_checkpointed(self):
+        trainer = self.trainer()
+        trainer.capture_reference_policy()
+        reference = {key: value.clone() for key, value in trainer.reference_actor.state_dict().items()}
+        self.assertTrue(all(not parameter.requires_grad for parameter in trainer.reference_actor.parameters()))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "reference.pt"
+            trainer.save_checkpoint(path, episode=0)
+            restored = self.trainer()
+            restored.load_checkpoint(path)
+            for key, value in reference.items():
+                torch.testing.assert_close(restored.reference_actor.state_dict()[key], value)
+
     def test_policy_likelihood_stable_before_ppo_update(self):
         from train_pursuit_with_demos import observation_tensors
         trainer = self.trainer(True)
@@ -93,6 +136,9 @@ class PursuitDemoTests(unittest.TestCase):
         teacher = BASELINES_3D["mpc"]()
         teacher.reset(env)
         trainer.demo_episodes = [[snapshot(env.observe_search(), teacher.actions(env), ~env.disabled_uavs)]]
+        trainer.reference_kl_weight = 0.05
+        trainer.capture_reference_policy()
+        reference_before = {key: value.clone() for key, value in trainer.reference_actor.state_dict().items()}
         history = trainer.train()
         self.assertEqual(len(history), 1)
         self.assertAlmostEqual(history[0]["reward"], sum(history[0]["reward_components"].values()))
@@ -101,6 +147,9 @@ class PursuitDemoTests(unittest.TestCase):
         self.assertLessEqual(history[0]['exact_policy_kl'], 1.5*trainer.cfg.target_kl)
         self.assertLess(history[0]['pre_update_logprob_error'], 2e-3)
         self.assertGreater(history[0]['ppo_accepted_steps'], 0)
+        self.assertGreaterEqual(history[0]['fixed_reference_kl'], 0.0)
+        for key, value in reference_before.items():
+            torch.testing.assert_close(trainer.reference_actor.state_dict()[key], value)
         obs = QuadrotorPursuitEnv(self.env_cfg).observe_search()
         before = trainer.action(obs)
         with tempfile.TemporaryDirectory() as folder:

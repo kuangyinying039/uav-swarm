@@ -7,6 +7,7 @@ The search environment and discrete search training path are left unchanged.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import asdict, replace
 import json
 import math
@@ -45,6 +46,15 @@ class PursuitActor(nn.Module):
         log_std = self.lower + (self.upper - self.lower) * torch.sigmoid(self.std_parameter)
         return torch.cat((means, log_std.expand_as(means)), dim=-1)
 
+    @torch.no_grad()
+    def set_std(self, std):
+        """Set exploration without depending on a checkpoint's old parameterization."""
+        log_std = math.log(float(std))
+        if not self.lower < log_std < self.upper:
+            raise ValueError("Policy standard deviation must lie strictly inside its bounds")
+        fraction = (log_std - self.lower) / (self.upper - self.lower)
+        self.std_parameter.fill_(math.log(fraction / (1.0 - fraction)))
+
 
 class PursuitDemoTrainer(MAPPOTrainer):
     def __init__(self, env_factory, cfg):
@@ -72,23 +82,53 @@ class PursuitDemoTrainer(MAPPOTrainer):
         output_head = mean_actor.head if cfg.use_gat else mean_actor.net[-1]
         nn.init.orthogonal_(output_head.weight, gain=0.01)
         nn.init.zeros_(output_head.bias)
-        self.actor = PursuitActor(mean_actor, self.action_dim, cfg.continuous_log_std_max).to(self.device)
+        self.actor = PursuitActor(
+            mean_actor, self.action_dim, cfg.continuous_log_std_max, cfg.continuous_initial_std
+        ).to(self.device)
         self.actors = nn.ModuleList([self.actor])
-        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr, eps=1e-5)
+        self.actor_base_lr = cfg.actor_lr if cfg.actor_lr is not None else cfg.lr
+        self.critic_base_lr = cfg.critic_lr if cfg.critic_lr is not None else cfg.lr
+        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=self.actor_base_lr, eps=1e-5)
         self.critic = nn.Sequential(nn.LayerNorm(self.state_dim), self.critic).to(self.device)
-        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr, eps=1e-5)
-        self.algorithm_name = "mappo_pursuit_safe_v3"
+        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=self.critic_base_lr, eps=1e-5)
+        self.algorithm_name = "mappo_pursuit_conservative_v4"
         self.environment_config = asdict(probe.cfg)
         self.demo_metadata = {}
         self.demo_episodes = []
+        self.correction_episodes = []
         self.demo_rng = np.random.default_rng(0)
         self.demo_weight = 0.1
+        self.demo_weight_floor = 0.02
+        self.correction_fraction = 0.5
+        self.reference_actor = None
+        self.reference_kl_weight = 0.0
         self.validation_seeds = []
         self.validation_interval = 50
         self.validation_records = []
         self.pursuit_history = []
         self.best_capture_score = (-1.0, -float("inf"), -float("inf"))
+        self.best_actor_state = None
+        self.safeguard_drop = 0.10
+        self.safeguard_patience = 2
+        self.safeguard_bad_validations = 0
+        self.safeguard_rollbacks = 0
         self.output_directory = None
+
+    def reset_actor_optimizer(self):
+        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=self.actor_base_lr, eps=1e-5)
+
+    def capture_reference_policy(self):
+        """Freeze the DAgger policy, not the previous PPO iterate."""
+        self.reference_actor = deepcopy(self.actor).to(self.device).eval()
+        for parameter in self.reference_actor.parameters():
+            parameter.requires_grad_(False)
+
+    def demo_loss_weight(self, episode):
+        if not (self.demo_episodes or self.correction_episodes):
+            return 0.0
+        progress = min(max(float(episode) / max(self.cfg.episodes - 1, 1), 0.0), 1.0)
+        floor = min(max(self.demo_weight_floor, 0.0), self.demo_weight)
+        return floor + (self.demo_weight - floor) * (1.0 - progress)
 
     def _make_env(self, episode):
         self.active_env = super()._make_env(episode)
@@ -138,9 +178,9 @@ class PursuitDemoTrainer(MAPPOTrainer):
             row["lidar_detection_ratio"] = float(np.mean(self.lidar_rates))
         row["target_observation_ratio"] = row.get("continuous_visibility_ratio")
         row["minimum_capture_gap"] = self.active_env.minimum_capture_gap()
-        row["demo_loss_weight"] = self.demo_weight * max(0.0, 1.0 - (row["episode"] - 1) / max(self.cfg.episodes // 2, 1))
-        if not self.demo_episodes:
-            row["demo_loss_weight"] = 0.0
+        row["demo_loss_weight"] = self.demo_loss_weight(row["episode"] - 1)
+        row["reference_kl_weight"] = self.reference_kl_weight if self.reference_actor is not None else 0.0
+        row["safeguard_rollbacks"] = self.safeguard_rollbacks
         row["reward_components"] = dict(self.reward_totals)
         row["closest_capture_gap"] = self.closest_capture_gap
         row["disabled_uavs_final"] = int(np.count_nonzero(self.active_env.disabled_uavs))
@@ -176,14 +216,45 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.validation_records.append({"episode": episode, **metrics})
         if score > self.best_capture_score:
             self.best_capture_score = score
+            self.best_actor_state = {
+                key: value.detach().cpu().clone() for key, value in self.actor.state_dict().items()
+            }
+            self.safeguard_bad_validations = 0
             self.save_checkpoint(self.output_directory / "best_capture.pt", episode=episode, history=self.pursuit_history)
+        elif metrics["capture_rate"] < self.best_capture_score[0] - self.safeguard_drop:
+            self.safeguard_bad_validations += 1
+            if self.best_actor_state is not None and self.safeguard_bad_validations >= self.safeguard_patience:
+                self.actor.load_state_dict(self.best_actor_state)
+                self.reset_actor_optimizer()
+                self.safeguard_rollbacks += 1
+                self.safeguard_bad_validations = 0
+                self.validation_records[-1]["actor_rollback"] = True
+                self.save_checkpoint(
+                    self.output_directory / "rollback_latest.pt", episode=episode, history=self.pursuit_history
+                )
+        else:
+            self.safeguard_bad_validations = 0
         (self.output_directory / "validation.json").write_text(json.dumps(self.validation_records, indent=2), encoding="utf-8")
 
     def pursuit_demo_loss(self, episode):
-        weight = self.demo_weight * max(0.0, 1.0 - episode / max(self.cfg.episodes // 2, 1))
-        if not self.demo_episodes or weight == 0:
+        weight = self.demo_loss_weight(episode)
+        if weight == 0:
             return 0.0
-        return weight * cloning_loss(self, self.demo_episodes, min(self.cfg.batch_size, 32), self.demo_rng)
+        batch_size = min(self.cfg.batch_size, 32)
+        if not self.correction_episodes:
+            return weight * cloning_loss(self, self.demo_episodes, batch_size, self.demo_rng)
+        correction_count = int(round(batch_size * self.correction_fraction))
+        if self.correction_fraction > 0:
+            correction_count = max(1, correction_count)
+        demo_count = batch_size - correction_count
+        losses, counts = [], []
+        if demo_count and self.demo_episodes:
+            losses.append(cloning_loss(self, self.demo_episodes, demo_count, self.demo_rng))
+            counts.append(demo_count)
+        if correction_count:
+            losses.append(cloning_loss(self, self.correction_episodes, correction_count, self.demo_rng))
+            counts.append(correction_count)
+        return weight * sum(loss * count for loss, count in zip(losses, counts)) / sum(counts)
 
     def save_checkpoint(self, path, env_config=None, episode=None, history=None):
         super().save_checkpoint(path, env_config or self.environment_config, episode,
@@ -192,6 +263,16 @@ class PursuitDemoTrainer(MAPPOTrainer):
         payload["demo_metadata"] = self.demo_metadata
         payload["best_capture_score"] = self.best_capture_score
         payload["validation_records"] = self.validation_records
+        payload["best_actor_state"] = self.best_actor_state
+        payload["reference_actor"] = None if self.reference_actor is None else self.reference_actor.state_dict()
+        payload["anti_forgetting"] = {
+            "demo_weight_floor": self.demo_weight_floor,
+            "correction_fraction": self.correction_fraction,
+            "reference_kl_weight": self.reference_kl_weight,
+            "safeguard_drop": self.safeguard_drop,
+            "safeguard_patience": self.safeguard_patience,
+            "safeguard_rollbacks": self.safeguard_rollbacks,
+        }
         torch.save(payload, path)
 
     def load_checkpoint(self, path):
@@ -201,7 +282,16 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.demo_metadata = payload.get("demo_metadata", {})
         self.best_capture_score = tuple(payload.get("best_capture_score", self.best_capture_score))
         self.validation_records = payload.get("validation_records", [])
+        self.best_actor_state = payload.get("best_actor_state")
         self.pursuit_history = list(self.restored_history)
+        settings = payload.get("anti_forgetting", {})
+        for key in ("demo_weight_floor", "correction_fraction", "reference_kl_weight",
+                    "safeguard_drop", "safeguard_patience", "safeguard_rollbacks"):
+            if key in settings:
+                setattr(self, key, settings[key])
+        if payload.get("reference_actor") is not None:
+            self.capture_reference_policy()
+            self.reference_actor.load_state_dict(payload["reference_actor"])
         return payload
 
     @torch.no_grad()
@@ -441,6 +531,7 @@ def main():
     parser.add_argument("mode", choices=["collect", "pretrain", "train", "evaluate"])
     parser.add_argument("--env-config", type=Path, help="JSON object of QuadrotorPursuitConfig overrides")
     parser.add_argument("--demos", type=Path, default=Path("outputs/pursuit_game_v2_demos.pt"))
+    parser.add_argument("--aux-demos", type=Path, help="DAgger corrections.pt used by PPO auxiliary replay")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--out", type=Path, default=Path("outputs/pursuit_game_v2_run"))
     parser.add_argument("--seed", type=int, default=11)
@@ -449,19 +540,31 @@ def main():
     parser.add_argument("--demo-attempts", type=int, default=100)
     parser.add_argument("--teacher", choices=sorted(BASELINES_3D), default="mpc")
     parser.add_argument("--bc-updates", type=int, default=1000)
-    parser.add_argument("--demo-weight", type=float, default=0.1, help="Auxiliary BC weight, decays to zero by halfway through RL")
+    parser.add_argument("--demo-weight", type=float, default=0.1, help="Initial auxiliary imitation weight")
+    parser.add_argument("--demo-weight-floor", type=float, default=0.02,
+                        help="Nonzero anti-forgetting imitation floor")
+    parser.add_argument("--correction-fraction", type=float, default=0.5,
+                        help="Fraction of auxiliary batches sampled from learner-visited DAgger corrections")
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--update-epochs", type=int, default=3)
-    parser.add_argument("--target-kl", type=float, default=0.01)
+    parser.add_argument("--lr", type=float, default=1e-4, help="Deprecated shared LR fallback")
+    parser.add_argument("--actor-lr", type=float, default=5e-5)
+    parser.add_argument("--critic-lr", type=float, default=1e-4)
+    parser.add_argument("--update-epochs", type=int, default=2)
+    parser.add_argument("--target-kl", type=float, default=0.0075)
+    parser.add_argument("--clip-eps", type=float, default=0.1)
+    parser.add_argument("--initial-policy-std", type=float, default=0.08)
+    parser.add_argument("--max-policy-std", type=float, default=0.20)
+    parser.add_argument("--reference-kl-weight", type=float, default=0.05)
     parser.add_argument("--no-gat", action="store_true")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1, help="Small graph batches usually benefit from a single CPU thread")
     parser.add_argument("--validation-interval", type=int, default=50)
-    parser.add_argument("--validation-episodes", type=int, default=5)
+    parser.add_argument("--validation-episodes", type=int, default=10)
     parser.add_argument("--validation-seed", type=int, default=4000000)
+    parser.add_argument("--safeguard-drop", type=float, default=0.10)
+    parser.add_argument("--safeguard-patience", type=int, default=2)
     parser.add_argument("--eval-seed", type=int, default=3000000)
     parser.add_argument("--eval-episodes", type=int, default=100)
     parser.add_argument("--methods", nargs="+", choices=["mappo", *BASELINES_3D], default=["mappo", "apf", "frpn", "mpc"])
@@ -470,8 +573,17 @@ def main():
     parser.add_argument("--correction-updates", type=int, default=500)
     parser.add_argument("--correction-seed", type=int, default=5000000)
     args = parser.parse_args()
-    if not (math.isfinite(args.lr) and args.lr > 0 and math.isfinite(args.target_kl) and args.target_kl > 0 and args.update_epochs > 0):
-        parser.error('lr, target-kl and update-epochs must be positive and finite')
+    positive = (args.lr, args.actor_lr, args.critic_lr, args.target_kl,
+                args.clip_eps, args.initial_policy_std, args.max_policy_std)
+    nonnegative = (args.demo_weight, args.demo_weight_floor, args.reference_kl_weight, args.safeguard_drop)
+    if not all(math.isfinite(value) and value > 0 for value in positive) or args.update_epochs < 1:
+        parser.error('learning rates, PPO bounds, policy stds, target-kl and update-epochs must be positive and finite')
+    if not all(math.isfinite(value) and value >= 0 for value in nonnegative):
+        parser.error('anti-forgetting weights and safeguard-drop must be finite and nonnegative')
+    if not 0 <= args.demo_weight_floor <= args.demo_weight or not 0 <= args.correction_fraction <= 1:
+        parser.error('Require 0 <= demo-weight-floor <= demo-weight and correction-fraction in [0, 1]')
+    if not 0.05 < args.initial_policy_std < args.max_policy_std or args.safeguard_patience < 1:
+        parser.error('Require 0.05 < initial-policy-std < max-policy-std and positive safeguard-patience')
     if args.mode == 'train' and not args.checkpoint and any((args.out/name).exists() for name in ('latest.pt', 'final.pt', 'history.json')):
         parser.error('Output already contains a run; choose a new --out directory or explicitly resume a v3 checkpoint')
     if args.correction_rounds < 0 or min(args.correction_episodes, args.correction_updates) < 1:
@@ -497,7 +609,10 @@ def main():
         return
     cfg = TrainConfig(episodes=args.episodes, gamma=env_cfg.reward_gamma, gae_lambda=0.97,
                       hidden_dim=args.hidden_dim, batch_size=args.batch_size, device=args.device,
-                      lr=args.lr, update_epochs=args.update_epochs, target_kl=args.target_kl, clip_eps=0.1,
+                      lr=args.lr, actor_lr=args.actor_lr, critic_lr=args.critic_lr,
+                      update_epochs=args.update_epochs, target_kl=args.target_kl, clip_eps=args.clip_eps,
+                      continuous_initial_std=args.initial_policy_std,
+                      continuous_log_std_max=math.log(args.max_policy_std),
                       entropy_coef=0.003, entropy_coef_end=0.001, adaptive_entropy=False,
                       use_gat=not args.no_gat, use_hetero_entities=not args.no_gat,
                       checkpoint_path=str(args.out / "latest.pt"))
@@ -511,12 +626,23 @@ def main():
         if args.mode == "train":
             cfg.episodes = args.episodes
             cfg.checkpoint_path = str(args.out / "latest.pt")
+            cfg.actor_lr = args.actor_lr
+            cfg.critic_lr = args.critic_lr
+            cfg.update_epochs = args.update_epochs
+            cfg.target_kl = args.target_kl
+            cfg.clip_eps = args.clip_eps
+            cfg.continuous_initial_std = args.initial_policy_std
+            cfg.continuous_log_std_max = math.log(args.max_policy_std)
     elif args.mode == "evaluate":
         parser.error("evaluate requires --checkpoint")
     factory = lambda episode=0: QuadrotorPursuitEnv(replace(env_cfg, seed=args.seed * 100000 + episode))
     trainer = PursuitDemoTrainer(factory, cfg)
     if args.checkpoint:
         trainer.load_checkpoint(args.checkpoint)
+        if args.mode == "train" and trainer.start_episode == 0 and trainer.reference_actor is None:
+            # BC/DAgger checkpoints contain an untrained exploration parameter.
+            trainer.actor.set_std(args.initial_policy_std)
+            trainer.reset_actor_optimizer()
     if args.mode == "evaluate":
         seeds = list(range(args.eval_seed, args.eval_seed + args.eval_episodes))
         metadata = getattr(trainer, "demo_metadata", {})
@@ -557,8 +683,37 @@ def main():
         if [r["seed"] for r in dataset["report"]] != trainer.demo_metadata["demo_seeds"]:
             parser.error("Resume requires the original demonstration dataset")
         trainer.demo_episodes = dataset["episodes"]
+        aux_path = args.aux_demos
+        automatic_aux = args.checkpoint.parent / "corrections.pt" if args.checkpoint else args.out / "corrections.pt"
+        if aux_path is None and automatic_aux.exists():
+            aux_path = automatic_aux
+        if aux_path is not None:
+            corrections = torch.load(aux_path, map_location="cpu", weights_only=False)
+            validate_demos(corrections, env_cfg)
+            correction_report = corrections.get("correction_report", [])
+            original_count = len(corrections["episodes"]) - len(correction_report)
+            if not correction_report or original_count < 0:
+                parser.error("--aux-demos must be a DAgger corrections.pt with correction_report")
+            if corrections.get("teacher") != dataset.get("teacher") or original_count != len(dataset["episodes"]):
+                parser.error("--aux-demos was not aggregated from the supplied original --demos dataset")
+            trainer.correction_episodes = corrections["episodes"][original_count:]
+            if not trainer.correction_episodes:
+                parser.error("--aux-demos does not contain learner-visited correction episodes")
+            trainer.demo_metadata["aux_demos"] = str(aux_path)
+            trainer.demo_metadata["aux_correction_episodes"] = len(trainer.correction_episodes)
     trainer.demo_weight = args.demo_weight
+    trainer.demo_weight_floor = args.demo_weight_floor
+    trainer.correction_fraction = args.correction_fraction
+    has_warm_start = trainer.demo_metadata.get("successful_episodes", 0) > 0
+    trainer.reference_kl_weight = args.reference_kl_weight if has_warm_start else 0.0
+    trainer.safeguard_drop = args.safeguard_drop
+    trainer.safeguard_patience = args.safeguard_patience
     trainer.demo_metadata["demo_weight"] = args.demo_weight
+    trainer.demo_metadata["demo_weight_floor"] = args.demo_weight_floor
+    trainer.demo_metadata["correction_fraction"] = args.correction_fraction
+    trainer.demo_metadata["reference_kl_weight"] = args.reference_kl_weight
+    if args.mode == "train" and trainer.reference_kl_weight > 0 and trainer.reference_actor is None:
+        trainer.capture_reference_policy()
     if args.checkpoint and trainer.demo_metadata.get("training_base_seed", args.seed) != args.seed:
         parser.error("Resume requires the original --seed")
     trainer.demo_metadata["training_base_seed"] = args.seed

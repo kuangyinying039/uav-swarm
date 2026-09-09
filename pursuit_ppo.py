@@ -101,16 +101,32 @@ def update_pursuit(trainer, rollout, episode):
         explained = 1.-(returns-old_values).var(unbiased=False)/return_variance.clamp_min(1e-8)
 
     progress = episode/max(cfg.episodes-1, 1)
-    lr = cfg.lr*(1.-progress*(1.-cfg.lr_end_factor))
+    actor_rate = trainer.actor_base_lr*(1.-progress*(1.-cfg.lr_end_factor))
+    critic_rate = trainer.critic_base_lr*(1.-progress*(1.-cfg.lr_end_factor))
     entropy_coef = cfg.entropy_coef+progress*(cfg.entropy_coef_end-cfg.entropy_coef)
-    for optimizer in (trainer.actor_optim, trainer.critic_optim):
-        for group in optimizer.param_groups:
-            group['lr'] = lr
+    for group in trainer.actor_optim.param_groups:
+        group['lr'] = actor_rate
+    for group in trainer.critic_optim.param_groups:
+        group['lr'] = critic_rate
 
     def policy_kl():
         return masked_mean(torch.distributions.kl_divergence(old_dist, distribution()).sum(-1), active)
 
-    metrics = {k: [] for k in ('policy_loss', 'value_loss', 'entropy', 'actor_grad_norm', 'critic_grad_norm', 'clip_fraction')}
+    def reference_kl(indices=None):
+        if trainer.reference_actor is None or trainer.reference_kl_weight <= 0:
+            return torch.zeros((), dtype=obs.dtype, device=device)
+        vectors = obs if indices is None else obs[indices]
+        edges = adjacency if indices is None else adjacency[indices]
+        entities = graph if indices is None or graph is None else {k: v[indices] for k, v in graph.items()}
+        with torch.no_grad():
+            ref_means, ref_log_std = trainer.reference_actor(vectors, edges, entities).chunk(2, -1)
+            ref_dist = torch.distributions.Normal(ref_means, ref_log_std.exp())
+        current_dist = distribution(indices)
+        mask = active if indices is None else active[indices]
+        return masked_mean(torch.distributions.kl_divergence(ref_dist, current_dist).sum(-1), mask)
+
+    metrics = {k: [] for k in ('policy_loss', 'value_loss', 'entropy', 'reference_kl',
+                                'actor_grad_norm', 'critic_grad_norm', 'clip_fraction')}
     rejected = 0
     accepted = 0
     stop_actor = False
@@ -138,7 +154,9 @@ def update_pursuit(trainer, rollout, episode):
                                       ratio.clamp(1.-cfg.clip_eps, 1.+cfg.clip_eps)*advantages[indices, None])
             policy_loss = -masked_mean(surrogate, active[indices])
             entropy = masked_mean(squashed_entropy(dist), active[indices])
-            loss = policy_loss-entropy_coef*entropy+trainer.pursuit_demo_loss(episode)
+            fixed_reference_kl = reference_kl(indices)
+            loss = (policy_loss - entropy_coef*entropy + trainer.pursuit_demo_loss(episode)
+                    + trainer.reference_kl_weight*fixed_reference_kl)
             trainer.actor_optim.zero_grad(set_to_none=True)
             loss.backward()
             actor_grad = nn.utils.clip_grad_norm_(trainer.actor.parameters(), cfg.max_grad_norm)
@@ -150,6 +168,7 @@ def update_pursuit(trainer, rollout, episode):
             stop_actor = not success or last_kl >= cfg.target_kl
             metrics['policy_loss'].append(policy_loss.item())
             metrics['entropy'].append(entropy.item())
+            metrics['reference_kl'].append(fixed_reference_kl.item())
             metrics['actor_grad_norm'].append(float(actor_grad))
             metrics['clip_fraction'].append(float(masked_mean(((ratio-1.).abs() > cfg.clip_eps).float(), active[indices])))
     with torch.no_grad():
@@ -157,7 +176,9 @@ def update_pursuit(trainer, rollout, episode):
         saturation = masked_mean((final_dist.mean.tanh().abs() > .95).float().mean(-1), active)
         std = final_dist.stddev.mean().item()
     return {**{k: float(np.mean(v)) if v else 0. for k, v in metrics.items()},
-            'learning_rate': trainer.actor_optim.param_groups[0]['lr'], 'entropy_coef': entropy_coef,
+            'learning_rate': actor_rate, 'actor_learning_rate': actor_rate,
+            'critic_learning_rate': critic_rate, 'entropy_coef': entropy_coef,
             'approx_kl': last_kl, 'exact_policy_kl': last_kl, 'pre_update_logprob_error': parity,
             'ppo_early_stop': float(stop_actor), 'ppo_backtracks': rejected, 'ppo_accepted_steps': accepted,
-            'action_mean_saturation': float(saturation), 'policy_std': std, 'explained_variance': float(explained)}
+            'action_mean_saturation': float(saturation), 'policy_std': std,
+            'fixed_reference_kl': reference_kl().detach().item(), 'explained_variance': float(explained)}

@@ -45,6 +45,8 @@ class TrainConfig:
     gae_lambda: float = 0.95
     clip_eps: float = 0.20
     lr: float = 3e-4
+    actor_lr: float | None = None
+    critic_lr: float | None = None
     lr_end_factor: float = 0.10
     hidden_dim: int = 128
     update_epochs: int = 5
@@ -55,6 +57,7 @@ class TrainConfig:
     adaptive_entropy: bool = True
     uncertainty_entropy_gain: float = 1.0
     continuous_log_std_max: float = -0.5
+    continuous_initial_std: float = 0.4
     max_grad_norm: float = 0.5
     normalize_advantages: bool = True
     normalize_returns: bool = False

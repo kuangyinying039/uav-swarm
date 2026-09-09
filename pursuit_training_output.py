@@ -11,6 +11,7 @@ import numpy as np
 FIELDS = (
     "safety_correction_rate", "safety_correction_magnitude", "emergency_stop_rate", "safety_reason_counts",
     "exact_policy_kl", "pre_update_logprob_error", "ppo_backtracks", "ppo_accepted_steps", "action_mean_saturation", "policy_std",
+    "reference_kl", "fixed_reference_kl", "reference_kl_weight", "safeguard_rollbacks",
     "reward_components", "closest_capture_gap", "disabled_uavs_final",
     "episode", "capture_success", "capture_time", "steps", "reward",
     "minimum_capture_gap", "collisions", "uav_collisions", "obstacle_conflicts",
@@ -19,7 +20,8 @@ FIELDS = (
     "first_onboard_contact_time", "target_loss_count", "target_reacquisition_count",
     "continuous_visibility_ratio", "track_position_rmse", "track_velocity_rmse",
     "valid_track_rate", "track_communication_bytes", "policy_loss", "value_loss",
-    "entropy", "learning_rate", "actor_grad_norm", "critic_grad_norm", "entropy_coef",
+    "entropy", "learning_rate", "actor_learning_rate", "critic_learning_rate",
+    "actor_grad_norm", "critic_grad_norm", "entropy_coef",
     "approx_kl", "ppo_early_stop", "clip_fraction", "explained_variance", "demo_loss_weight",
     "environment_seconds", "ppo_update_seconds", "lidar_detection_ratio", "target_observation_ratio",
 )
