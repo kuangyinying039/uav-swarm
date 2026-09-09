@@ -172,8 +172,9 @@ def pursuit_graph_from_flat_observation(observation, cfg):
                 velocity / target_speed, min(np.linalg.norm(relative) / cfg.grid_size, 1.0), 1.0,
             ]
             graph["target_mask"][agent, 0] = True
-        peer_rows = vectors[agent, peer_start:building_start].reshape(n_agents, PEER_DIM)
-        peer_rows = peer_rows.copy()
+        peer_rows = vectors[agent, peer_start:building_start].reshape(n_agents, PEER_DIM).copy()
+        # Legacy flat context normalized all xyz deltas by grid size; the new
+        # schema uses altitude scale for z.
         peer_rows[:, 2] *= cfg.grid_size / z_scale
         graph["peer_nodes"][agent] = peer_rows
         graph["peer_mask"][agent] = peer_rows[:, -1] > 0.5

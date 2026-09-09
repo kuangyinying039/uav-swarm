@@ -83,6 +83,31 @@ class PursuitDemoTests(unittest.TestCase):
             for key, value in reference.items():
                 torch.testing.assert_close(restored.reference_actor.state_dict()[key], value)
 
+    def test_validation_rollback_restores_actor_and_reduces_learning_rate(self):
+        trainer = self.trainer()
+        best = {key: value.detach().cpu().clone() for key, value in trainer.actor.state_dict().items()}
+        trainer.best_actor_state = best
+        trainer.best_capture_score = (0.5, -3.0, -10.0)
+        trainer.safeguard_patience = 1
+        trainer.actor_base_lr = 5e-5
+        trainer.min_actor_lr = 1e-5
+        with torch.no_grad():
+            next(trainer.actor.parameters()).add_(1.0)
+        validation = {
+            "summary": {"mappo": {"capture_rate": 0.0, "mean_censored_steps": 3.0,
+                                      "mean_return": -60.0}}
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            trainer.output_directory = Path(folder)
+            trainer.validation_seeds = [91]
+            with patch("train_pursuit_with_demos.evaluate", return_value=validation):
+                trainer.validate_capture(50)
+        for key, value in best.items():
+            torch.testing.assert_close(trainer.actor.state_dict()[key].cpu(), value)
+        self.assertEqual(trainer.actor_base_lr, 2.5e-5)
+        self.assertEqual(trainer.validation_records[-1]["actor_lr_before_rollback"], 5e-5)
+        self.assertEqual(trainer.validation_records[-1]["actor_lr_after_rollback"], 2.5e-5)
+
     def test_policy_likelihood_stable_before_ppo_update(self):
         from train_pursuit_with_demos import observation_tensors
         trainer = self.trainer(True)

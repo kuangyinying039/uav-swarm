@@ -6,7 +6,8 @@ import torch
 from marl_trainers import GraphActor, GraphAttentionEncoder, TrainConfig
 from pursuit_graph_encoder import (
     BUILDING_DIM, PEER_DIM, SELF_DIM, TARGET_DIM,
-    PursuitGraphActor, PursuitGraphAttentionBlock, pursuit_graph_observation,
+    PursuitGraphActor, PursuitGraphAttentionBlock, pursuit_graph_from_flat_observation,
+    pursuit_graph_observation,
 )
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from train_pursuit_with_demos import PursuitDemoTrainer
@@ -70,6 +71,17 @@ class PursuitGraphTests(unittest.TestCase):
         self.assertEqual(graph["self_nodes"].shape[-1], SELF_DIM)
         self.assertEqual(graph["target_nodes"].shape[-1], TARGET_DIM)
         self.assertEqual(graph["peer_nodes"].shape[-1], PEER_DIM)
+
+    def test_legacy_flat_demo_can_be_upgraded_without_truth(self):
+        env = self.environment(2)
+        observation = env.agent_observation_vectors()
+        before_truth = env.dynamic_targets.copy()
+        graph = pursuit_graph_from_flat_observation(observation, env.cfg)
+        env.dynamic_targets += 4.0
+        repeated = pursuit_graph_from_flat_observation(observation, env.cfg)
+        np.testing.assert_array_equal(graph["target_nodes"], repeated["target_nodes"])
+        self.assertFalse(np.array_equal(before_truth, env.dynamic_targets))
+        self.assertEqual(int(graph["building_mask"].sum(axis=1)[0]), 2)
 
     def test_search_encoder_and_flat_pursuit_path_remain_separate(self):
         search_actor = GraphActor(43, 9, hidden_dim=16, heads=1, layers=1)

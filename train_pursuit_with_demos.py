@@ -403,6 +403,19 @@ def validate_demos(dataset, env_cfg):
     dataset["pursuit_graph_version"] = PURSUIT_GRAPH_VERSION
 
 
+def load_correction_replay(path, original, env_cfg):
+    """Load and causally upgrade a corrections file, validating its lineage."""
+    corrections = torch.load(path, map_location="cpu", weights_only=False)
+    validate_demos(corrections, env_cfg)
+    report = corrections.get("correction_report", [])
+    original_count = len(corrections["episodes"]) - len(report)
+    if not report or original_count < 0:
+        raise ValueError("corrections.pt must contain a nonempty correction_report")
+    if corrections.get("teacher") != original.get("teacher") or original_count != len(original["episodes"]):
+        raise ValueError("corrections.pt was not aggregated from the supplied original demonstrations")
+    return corrections, corrections["episodes"][original_count:]
+
+
 def cloning_loss(trainer, episodes, batch_size, rng):
     # Episode-balanced sampling avoids weighting slow successes more heavily.
     selected = [episodes[int(rng.integers(len(episodes)))] for _ in range(batch_size)]
@@ -447,7 +460,7 @@ def aggregate_corrections(trainer, env_cfg, dataset, rounds, episodes_per_round,
     Teacher and learner use the same existing observation interface.
     """
     aggregate = list(dataset["episodes"])
-    report = []
+    report = list(dataset.get("correction_report", []))
     for iteration in range(rounds):
         beta = 0.5 * (1.0 - iteration / max(rounds - 1, 1))
         for index in range(episodes_per_round):
@@ -715,7 +728,20 @@ def main():
         validate_demos(dataset, env_cfg)
         trainer.demo_metadata = {"teacher": dataset["teacher"], "demo_seeds": [r["seed"] for r in dataset["report"]],
                                  "successful_episodes": len(dataset["episodes"]), "bc_updates": args.bc_updates}
-        losses = pretrain(trainer, dataset["episodes"], args.bc_updates, args.batch_size, args.seed)
+        pretrain_dataset = dataset
+        if args.aux_demos is not None:
+            try:
+                pretrain_dataset, _ = load_correction_replay(args.aux_demos, dataset, env_cfg)
+            except ValueError as error:
+                parser.error(str(error))
+            trainer.demo_metadata["correction_seeds"] = [
+                row["seed"] for row in pretrain_dataset.get("correction_report", [])
+            ]
+            trainer.demo_metadata["aux_demos"] = str(args.aux_demos)
+            trainer.demo_metadata["aux_correction_episodes"] = len(
+                pretrain_dataset.get("correction_report", [])
+            )
+        losses = pretrain(trainer, pretrain_dataset["episodes"], args.bc_updates, args.batch_size, args.seed)
         (args.out / "bc_losses.json").write_text(json.dumps(losses), encoding="utf-8")
         trainer.save_checkpoint(args.out / "pretrained.pt", episode=0)
     if args.mode == "pretrain":
@@ -725,7 +751,7 @@ def main():
             correction_seeds = set(range(args.correction_seed, args.correction_seed + args.correction_rounds * args.correction_episodes))
             if correction_seeds.intersection(trainer.demo_metadata.get("demo_seeds", [])):
                 parser.error("Correction seeds must differ from original demonstration seeds")
-            aggregate_corrections(trainer, env_cfg, dataset, args.correction_rounds,
+            aggregate_corrections(trainer, env_cfg, pretrain_dataset, args.correction_rounds,
                                   args.correction_episodes, args.correction_updates,
                                   args.batch_size, args.correction_seed, args.out)
         print("Initialization complete. Evaluate pretrained.pt and corrected.pt (if generated) before PPO.")
@@ -741,15 +767,10 @@ def main():
         if aux_path is None and automatic_aux.exists():
             aux_path = automatic_aux
         if aux_path is not None:
-            corrections = torch.load(aux_path, map_location="cpu", weights_only=False)
-            validate_demos(corrections, env_cfg)
-            correction_report = corrections.get("correction_report", [])
-            original_count = len(corrections["episodes"]) - len(correction_report)
-            if not correction_report or original_count < 0:
-                parser.error("--aux-demos must be a DAgger corrections.pt with correction_report")
-            if corrections.get("teacher") != dataset.get("teacher") or original_count != len(dataset["episodes"]):
-                parser.error("--aux-demos was not aggregated from the supplied original --demos dataset")
-            trainer.correction_episodes = corrections["episodes"][original_count:]
+            try:
+                corrections, trainer.correction_episodes = load_correction_replay(aux_path, dataset, env_cfg)
+            except ValueError as error:
+                parser.error(str(error))
             if not trainer.correction_episodes:
                 parser.error("--aux-demos does not contain learner-visited correction episodes")
             trainer.demo_metadata["aux_demos"] = str(aux_path)
