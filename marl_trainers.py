@@ -454,7 +454,7 @@ def tensorize_heterogeneous_graph(graph: dict, device=None) -> dict:
             device=device,
         )
         for key, value in graph.items()
-        if key.endswith("_nodes") or key.endswith("_mask")
+        if key.endswith("_nodes") or key.endswith("_mask") or key == "uav_xyz"
     }
 
 

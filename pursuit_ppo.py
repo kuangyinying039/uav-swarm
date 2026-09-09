@@ -12,6 +12,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+PURSUIT_DISABLED_INDEX = 20
+
 
 def masked_mean(values, active):
     return (values*active).sum()/active.sum().clamp_min(1.)
@@ -72,7 +74,11 @@ def update_pursuit(trainer, rollout, episode):
     old_values = torch.stack([r[8] for r in rollout]).detach().reshape(-1)
     rewards = torch.tensor([r[9] for r in rollout], dtype=torch.float32, device=device)
     terminated = torch.tensor([r[11] for r in rollout], dtype=torch.float32, device=device)
-    active = (obs[..., 20] < .5).to(obs.dtype)  # v2 pursuit disabled-UAV channel
+    if graph is not None and "active_mask" in graph:
+        active = graph["active_mask"].to(obs.dtype)
+    else:
+        # Flat-MLP compatibility path; observation v2 keeps this named channel.
+        active = (obs[..., PURSUIT_DISABLED_INDEX] < .5).to(obs.dtype)
 
     def distribution(indices=None):
         vectors = obs if indices is None else obs[indices]

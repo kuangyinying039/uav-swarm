@@ -19,8 +19,11 @@ import torch
 from torch import nn
 
 from marl_trainers import (
-    MAPPOTrainer, TrainConfig, GraphActor, FlatMLP, seed_everything,
+    MAPPOTrainer, TrainConfig, FlatMLP, seed_everything,
     tensorize_heterogeneous_graph,
+)
+from pursuit_graph_encoder import (
+    PURSUIT_GRAPH_VERSION, PursuitGraphActor, pursuit_graph_from_flat_observation,
 )
 from pursuit_baselines_3d import BASELINES_3D
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
@@ -72,8 +75,8 @@ class PursuitDemoTrainer(MAPPOTrainer):
         cfg = replace(cfg, dropout=0.0)
         super().__init__(env_factory, cfg)
         mean_actor = (
-            GraphActor(self.obs_dim, self.action_dim, cfg.hidden_dim, cfg.gat_heads,
-                       cfg.gat_layers, cfg.dropout)
+            PursuitGraphActor(self.obs_dim, self.action_dim, cfg.hidden_dim, cfg.gat_heads,
+                              cfg.gat_layers, cfg.dropout, probe.cfg.grid_size)
             if cfg.use_gat else FlatMLP(self.obs_dim, self.action_dim, cfg.hidden_dim)
         )
         # Official MAPPO uses a small (0.01) orthogonal action-head gain.
@@ -91,7 +94,7 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=self.actor_base_lr, eps=1e-5)
         self.critic = nn.Sequential(nn.LayerNorm(self.state_dim), self.critic).to(self.device)
         self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=self.critic_base_lr, eps=1e-5)
-        self.algorithm_name = "mappo_pursuit_conservative_v4"
+        self.algorithm_name = "mappo_pursuit_3d_graph_v5"
         self.environment_config = asdict(probe.cfg)
         self.demo_metadata = {}
         self.demo_episodes = []
@@ -112,6 +115,7 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.safeguard_patience = 2
         self.safeguard_bad_validations = 0
         self.safeguard_rollbacks = 0
+        self.min_actor_lr = 1e-5
         self.output_directory = None
 
     def reset_actor_optimizer(self):
@@ -224,11 +228,16 @@ class PursuitDemoTrainer(MAPPOTrainer):
         elif metrics["capture_rate"] < self.best_capture_score[0] - self.safeguard_drop:
             self.safeguard_bad_validations += 1
             if self.best_actor_state is not None and self.safeguard_bad_validations >= self.safeguard_patience:
+                old_actor_lr = self.actor_base_lr
                 self.actor.load_state_dict(self.best_actor_state)
+                self.actor_base_lr = max(self.actor_base_lr * 0.5, self.min_actor_lr)
                 self.reset_actor_optimizer()
                 self.safeguard_rollbacks += 1
                 self.safeguard_bad_validations = 0
                 self.validation_records[-1]["actor_rollback"] = True
+                self.validation_records[-1]["rollback_reason"] = "capture_rate_degradation"
+                self.validation_records[-1]["actor_lr_before_rollback"] = old_actor_lr
+                self.validation_records[-1]["actor_lr_after_rollback"] = self.actor_base_lr
                 self.save_checkpoint(
                     self.output_directory / "rollback_latest.pt", episode=episode, history=self.pursuit_history
                 )
@@ -272,12 +281,20 @@ class PursuitDemoTrainer(MAPPOTrainer):
             "safeguard_drop": self.safeguard_drop,
             "safeguard_patience": self.safeguard_patience,
             "safeguard_rollbacks": self.safeguard_rollbacks,
+            "min_actor_lr": self.min_actor_lr,
+            "actor_base_lr": self.actor_base_lr,
         }
+        payload["pursuit_graph_version"] = PURSUIT_GRAPH_VERSION
         torch.save(payload, path)
 
     def load_checkpoint(self, path):
         recorded = torch.load(path, map_location='cpu', weights_only=False)
         load_environment_config(recorded['env_config'])
+        if self.cfg.use_gat and recorded.get("pursuit_graph_version") != PURSUIT_GRAPH_VERSION:
+            raise ValueError(
+                "Checkpoint uses the legacy search HGAT and cannot initialize PursuitGraphActor. "
+                "Re-run pretrain/DAgger with the current code; old demo states can be upgraded in memory."
+            )
         payload = super().load_checkpoint(path)
         self.demo_metadata = payload.get("demo_metadata", {})
         self.best_capture_score = tuple(payload.get("best_capture_score", self.best_capture_score))
@@ -286,7 +303,8 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.pursuit_history = list(self.restored_history)
         settings = payload.get("anti_forgetting", {})
         for key in ("demo_weight_floor", "correction_fraction", "reference_kl_weight",
-                    "safeguard_drop", "safeguard_patience", "safeguard_rollbacks"):
+                    "safeguard_drop", "safeguard_patience", "safeguard_rollbacks",
+                    "min_actor_lr", "actor_base_lr"):
             if key in settings:
                 setattr(self, key, settings[key])
         if payload.get("reference_actor") is not None:
@@ -349,7 +367,8 @@ def collect_demos(env_cfg, first_seed, wanted, attempts, teacher_name, progress_
         if progress_path is not None:
             progress_path = Path(progress_path)
             progress_path.parent.mkdir(parents=True, exist_ok=True)
-            partial = {"env_config": asdict(env_cfg), "teacher": teacher_name, "episodes": episodes, "report": report}
+            partial = {"env_config": asdict(env_cfg), "teacher": teacher_name, "episodes": episodes,
+                       "report": report, "pursuit_graph_version": PURSUIT_GRAPH_VERSION}
             torch.save(partial, progress_path)
             progress_path.with_suffix(".json").write_text(json.dumps({k: v for k, v in partial.items() if k != "episodes"}, indent=2), encoding="utf-8")
         print(f"[demonstrations] seed={seed} success={success} kept={len(episodes)}/{wanted}", flush=True)
@@ -358,7 +377,8 @@ def collect_demos(env_cfg, first_seed, wanted, attempts, teacher_name, progress_
     if len(episodes) < wanted:
         raise RuntimeError(f"Only {len(episodes)}/{wanted} successful demonstrations in {attempts} attempts; "
                            "increase --demo-attempts or inspect the teacher under this configuration")
-    return {"env_config": asdict(env_cfg), "teacher": teacher_name, "episodes": episodes, "report": report}
+    return {"env_config": asdict(env_cfg), "teacher": teacher_name, "episodes": episodes,
+            "report": report, "pursuit_graph_version": PURSUIT_GRAPH_VERSION}
 
 
 def validate_demos(dataset, env_cfg):
@@ -371,6 +391,16 @@ def validate_demos(dataset, env_cfg):
         raise ValueError("Demonstration environment differs from training; regenerate demos with the same config")
     if not dataset["episodes"] or any(not ep for ep in dataset["episodes"]):
         raise ValueError("Empty demonstration dataset")
+    # Legacy snapshots contain the same causal flat track/peer/building data,
+    # so upgrade their graph without consulting environment ground truth.
+    for episode in dataset["episodes"]:
+        for row in episode:
+            if not isinstance(row, dict) or "agent_observations" not in row:
+                continue
+            graph = row.get("hetero_graph", {})
+            if graph.get("self_nodes") is None or graph.get("uav_xyz") is None:
+                row["hetero_graph"] = pursuit_graph_from_flat_observation(row["agent_observations"], env_cfg)
+    dataset["pursuit_graph_version"] = PURSUIT_GRAPH_VERSION
 
 
 def cloning_loss(trainer, episodes, batch_size, rng):
@@ -446,7 +476,8 @@ def aggregate_corrections(trainer, env_cfg, dataset, rounds, episodes_per_round,
         pretrain(trainer, aggregate, updates, batch_size, first_seed + iteration)
         # Persist each completed round; these are supervised correction labels.
         torch.save({"env_config": asdict(env_cfg), "teacher": dataset["teacher"],
-                    "episodes": aggregate, "correction_report": report}, out / "corrections.pt")
+                    "episodes": aggregate, "correction_report": report,
+                    "pursuit_graph_version": PURSUIT_GRAPH_VERSION}, out / "corrections.pt")
         trainer.demo_metadata["correction_seeds"] = [r["seed"] for r in report]
         trainer.save_checkpoint(out / "corrected.pt", episode=0)
     return aggregate
@@ -529,6 +560,7 @@ def load_environment_config(recorded):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["collect", "pretrain", "train", "evaluate"])
+    parser.add_argument("--training-profile", choices=["auto", "plain", "warmstart"], default="auto")
     parser.add_argument("--env-config", type=Path, help="JSON object of QuadrotorPursuitConfig overrides")
     parser.add_argument("--demos", type=Path, default=Path("outputs/pursuit_game_v2_demos.pt"))
     parser.add_argument("--aux-demos", type=Path, help="DAgger corrections.pt used by PPO auxiliary replay")
@@ -540,8 +572,8 @@ def main():
     parser.add_argument("--demo-attempts", type=int, default=100)
     parser.add_argument("--teacher", choices=sorted(BASELINES_3D), default="mpc")
     parser.add_argument("--bc-updates", type=int, default=1000)
-    parser.add_argument("--demo-weight", type=float, default=0.1, help="Initial auxiliary imitation weight")
-    parser.add_argument("--demo-weight-floor", type=float, default=0.02,
+    parser.add_argument("--demo-weight", type=float, help="Initial auxiliary imitation weight")
+    parser.add_argument("--demo-weight-floor", type=float,
                         help="Nonzero anti-forgetting imitation floor")
     parser.add_argument("--correction-fraction", type=float, default=0.5,
                         help="Fraction of auxiliary batches sampled from learner-visited DAgger corrections")
@@ -549,14 +581,14 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4, help="Deprecated shared LR fallback")
-    parser.add_argument("--actor-lr", type=float, default=5e-5)
-    parser.add_argument("--critic-lr", type=float, default=1e-4)
-    parser.add_argument("--update-epochs", type=int, default=2)
-    parser.add_argument("--target-kl", type=float, default=0.0075)
-    parser.add_argument("--clip-eps", type=float, default=0.1)
-    parser.add_argument("--initial-policy-std", type=float, default=0.08)
-    parser.add_argument("--max-policy-std", type=float, default=0.20)
-    parser.add_argument("--reference-kl-weight", type=float, default=0.05)
+    parser.add_argument("--actor-lr", type=float)
+    parser.add_argument("--critic-lr", type=float)
+    parser.add_argument("--update-epochs", type=int)
+    parser.add_argument("--target-kl", type=float)
+    parser.add_argument("--clip-eps", type=float)
+    parser.add_argument("--initial-policy-std", type=float)
+    parser.add_argument("--max-policy-std", type=float)
+    parser.add_argument("--reference-kl-weight", type=float)
     parser.add_argument("--no-gat", action="store_true")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1, help="Small graph batches usually benefit from a single CPU thread")
@@ -565,6 +597,7 @@ def main():
     parser.add_argument("--validation-seed", type=int, default=4000000)
     parser.add_argument("--safeguard-drop", type=float, default=0.10)
     parser.add_argument("--safeguard-patience", type=int, default=2)
+    parser.add_argument("--min-actor-lr", type=float, default=1e-5)
     parser.add_argument("--eval-seed", type=int, default=3000000)
     parser.add_argument("--eval-episodes", type=int, default=100)
     parser.add_argument("--methods", nargs="+", choices=["mappo", *BASELINES_3D], default=["mappo", "apf", "frpn", "mpc"])
@@ -573,8 +606,28 @@ def main():
     parser.add_argument("--correction-updates", type=int, default=500)
     parser.add_argument("--correction-seed", type=int, default=5000000)
     args = parser.parse_args()
+    preview = (torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+               if args.checkpoint else {})
+    checkpoint_warmstart = preview.get("demo_metadata", {}).get("successful_episodes", 0) > 0
+    resolved_profile = args.training_profile
+    if resolved_profile == "auto":
+        resolved_profile = "warmstart" if (
+            checkpoint_warmstart or (not args.checkpoint and args.bc_updates > 0 and args.mode in ("pretrain", "train"))
+        ) else "plain"
+    profile = {
+        "plain": dict(actor_lr=1e-4, critic_lr=1e-4, update_epochs=3, target_kl=0.01,
+                      clip_eps=0.10, initial_policy_std=0.20, max_policy_std=0.40,
+                      demo_weight=0.0, demo_weight_floor=0.0, reference_kl_weight=0.0),
+        "warmstart": dict(actor_lr=5e-5, critic_lr=1e-4, update_epochs=2, target_kl=0.0075,
+                          clip_eps=0.10, initial_policy_std=0.08, max_policy_std=0.20,
+                          demo_weight=0.03, demo_weight_floor=0.01, reference_kl_weight=0.05),
+    }[resolved_profile]
+    for name, value in profile.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    args.training_profile = resolved_profile
     positive = (args.lr, args.actor_lr, args.critic_lr, args.target_kl,
-                args.clip_eps, args.initial_policy_std, args.max_policy_std)
+                args.clip_eps, args.initial_policy_std, args.max_policy_std, args.min_actor_lr)
     nonnegative = (args.demo_weight, args.demo_weight_floor, args.reference_kl_weight, args.safeguard_drop)
     if not all(math.isfinite(value) and value > 0 for value in positive) or args.update_epochs < 1:
         parser.error('learning rates, PPO bounds, policy stds, target-kl and update-epochs must be positive and finite')
@@ -708,10 +761,12 @@ def main():
     trainer.reference_kl_weight = args.reference_kl_weight if has_warm_start else 0.0
     trainer.safeguard_drop = args.safeguard_drop
     trainer.safeguard_patience = args.safeguard_patience
+    trainer.min_actor_lr = args.min_actor_lr
     trainer.demo_metadata["demo_weight"] = args.demo_weight
     trainer.demo_metadata["demo_weight_floor"] = args.demo_weight_floor
     trainer.demo_metadata["correction_fraction"] = args.correction_fraction
     trainer.demo_metadata["reference_kl_weight"] = args.reference_kl_weight
+    trainer.demo_metadata["training_profile"] = args.training_profile
     if args.mode == "train" and trainer.reference_kl_weight > 0 and trainer.reference_actor is None:
         trainer.capture_reference_policy()
     if args.checkpoint and trainer.demo_metadata.get("training_base_seed", args.seed) != args.seed:

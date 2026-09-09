@@ -327,6 +327,16 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
                     features[i, 17:19] = [distance <= c.tracking_radius, 1.]
         return features
 
+    def observe_search(self) -> dict:
+        """Replace the completed parent graph with policy-causal 3-D entities."""
+        try:
+            from pursuit_graph_encoder import pursuit_graph_observation
+        except ImportError:
+            from .pursuit_graph_encoder import pursuit_graph_observation
+        obs = super().observe_search()
+        obs["hetero_graph"] = pursuit_graph_observation(self)
+        return obs
+
     def agent_observation_vectors(self) -> np.ndarray:
         base = super().agent_observation_vectors()
         if not hasattr(self, "quadrotor_states"):
