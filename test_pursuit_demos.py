@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from dataclasses import asdict
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,8 +13,10 @@ from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from pursuit_baselines_3d import BASELINES_3D
 from train_pursuit_with_demos import (
     PursuitDemoTrainer, collect_demos, pretrain, snapshot, validate_demos, evaluate,
+    ensure_disjoint_seed_banks, load_seed_bank, seed_for_episode,
 )
 from pursuit_training_output import write_pursuit_outputs
+from build_mpc_solvable_seed_bank import main as build_seed_bank
 
 
 class PursuitDemoTests(unittest.TestCase):
@@ -27,6 +30,46 @@ class PursuitDemoTests(unittest.TestCase):
                                   TrainConfig(episodes=1, gamma=self.env_cfg.reward_gamma, hidden_dim=16, batch_size=3, update_epochs=1,
                                               use_gat=gat, use_hetero_entities=gat, gat_heads=1,
                                               gat_layers=1, device="cpu"))
+
+    def test_seed_bank_visits_each_scenario_once_per_reshuffled_cycle(self):
+        bank = list(range(701, 711))
+        first = [seed_for_episode(bank, episode, 11) for episode in range(10)]
+        second = [seed_for_episode(bank, episode, 11) for episode in range(10, 20)]
+        self.assertEqual(set(first), set(bank))
+        self.assertEqual(set(second), set(bank))
+        self.assertEqual(first, [seed_for_episode(bank, episode, 11) for episode in range(10)])
+        self.assertNotEqual(first, second)
+
+    def test_seed_files_reject_duplicates_and_split_overlap(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "seeds.txt"
+            path.write_text("7\n8\n7\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                load_seed_bank(path)
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            ensure_disjoint_seed_banks({"training": [7, 8], "validation": [8, 9]})
+
+    def test_mpc_success_bank_builder_writes_disjoint_splits(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            source, output = folder / "candidates.json", folder / "bank"
+            rows = [
+                {"method": "mpc", "seed": seed, "captured": 1,
+                 "capture_time": seed - 690, "initial_layout": "ring"}
+                for seed in range(701, 706)
+            ]
+            rows.append({"method": "mpc", "seed": 799, "captured": 0,
+                         "capture_time": None, "initial_layout": "ring"})
+            source.write_text(json.dumps({"rows": rows, "env_config": {}}), encoding="utf-8")
+            argv = ["build_mpc_solvable_seed_bank.py", "--input", str(source),
+                    "--out", str(output), "--train", "1", "--validation", "1", "--test", "3"]
+            with patch("sys.argv", argv):
+                build_seed_bank()
+            groups = [set(load_seed_bank(output / f"{name}_seeds.txt"))
+                      for name in ("train", "validation", "test")]
+            self.assertEqual([len(group) for group in groups], [1, 1, 3])
+            self.assertFalse(groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2])
+            self.assertTrue((output / "manifest.json").exists())
 
     def test_exploration_has_gradient_and_changes(self):
         trainer = self.trainer()
@@ -82,6 +125,18 @@ class PursuitDemoTests(unittest.TestCase):
             restored.load_checkpoint(path)
             for key, value in reference.items():
                 torch.testing.assert_close(restored.reference_actor.state_dict()[key], value)
+
+    def test_seed_banks_are_checkpointed(self):
+        trainer = self.trainer()
+        trainer.train_seed_bank = [701, 702]
+        trainer.validation_seed_bank = [801]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "seed_bank.pt"
+            trainer.save_checkpoint(path, episode=0)
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            self.assertEqual(payload["train_seed_bank"], [701, 702])
+            self.assertEqual(payload["validation_seed_bank"], [801])
+            self.assertEqual(payload["seed_bank_version"], 1)
 
     def test_validation_rollback_restores_actor_and_reduces_learning_rate(self):
         trainer = self.trainer()

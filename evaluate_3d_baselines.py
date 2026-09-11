@@ -94,11 +94,34 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--methods", nargs="+", choices=sorted(BASELINES_3D), default=["apf", "frpn", "mpc"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[23, 37, 51, 71, 89])
+    parser.add_argument("--seeds-file", type=Path,
+                        help="Whitespace-delimited integer seeds; replaces --seeds")
+    parser.add_argument("--seed-start", type=int,
+                        help="First seed in a contiguous candidate range")
+    parser.add_argument("--seed-count", type=int,
+                        help="Number of seeds in --seed-start range")
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--workers", type=int, default=1, help="Parallel independent episodes.")
     parser.add_argument("--out", type=Path, default=Path("outputs/three_dimensional_baseline_difficulty.json"))
     parser.add_argument("--env-config", type=Path, help="Same calibration overrides as training")
     args = parser.parse_args()
+    if (args.seed_start is None) != (args.seed_count is None):
+        parser.error("Use --seed-start and --seed-count together")
+    if args.seeds_file and args.seed_start is not None:
+        parser.error("Use either --seeds-file or --seed-start/--seed-count")
+    if args.seed_start is not None:
+        if args.seed_count < 1:
+            parser.error("--seed-count must be positive")
+        args.seeds = list(range(args.seed_start, args.seed_start + args.seed_count))
+    if args.seeds_file:
+        try:
+            args.seeds = [int(token) for token in args.seeds_file.read_text(encoding="utf-8-sig").split()]
+        except (OSError, ValueError) as error:
+            parser.error(f"Cannot read integer seeds from {args.seeds_file}: {error}")
+        if not args.seeds:
+            parser.error(f"Seed file is empty: {args.seeds_file}")
+        if len(args.seeds) != len(set(args.seeds)):
+            parser.error(f"Seed file contains duplicates: {args.seeds_file}")
     jobs = [(method, seed) for method in args.methods for seed in args.seeds]
     started_at = time.perf_counter()
 
