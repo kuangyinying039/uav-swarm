@@ -14,6 +14,7 @@ from pursuit_baselines_3d import BASELINES_3D
 from train_pursuit_with_demos import (
     PursuitDemoTrainer, collect_demos, pretrain, snapshot, validate_demos, evaluate,
     ensure_disjoint_seed_banks, load_seed_bank, seed_for_episode,
+    load_evaluation_environment_config,
 )
 from pursuit_training_output import write_pursuit_outputs
 from build_mpc_solvable_seed_bank import main as build_seed_bank
@@ -30,6 +31,21 @@ class PursuitDemoTests(unittest.TestCase):
                                   TrainConfig(episodes=1, gamma=self.env_cfg.reward_gamma, hidden_dim=16, batch_size=3, update_epochs=1,
                                               use_gat=gat, use_hetero_entities=gat, gat_heads=1,
                                               gat_layers=1, device="cpu"))
+
+    def test_evaluation_environment_override_preserves_checkpoint_dimensions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "evaluation.json"
+            settings = asdict(self.env_cfg)
+            settings.update(pursuit_target_observable=False,
+                            handoff_formation_min_distance=6.0,
+                            handoff_formation_max_distance=8.0)
+            path.write_text(json.dumps(settings), encoding="utf-8")
+            evaluation_cfg = load_evaluation_environment_config(path, self.env_cfg)
+            self.assertFalse(evaluation_cfg.pursuit_target_observable)
+            settings["building_state_capacity"] = 6
+            path.write_text(json.dumps(settings), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "dimensions"):
+                load_evaluation_environment_config(path, self.env_cfg)
 
     def test_seed_bank_visits_each_scenario_once_per_reshuffled_cycle(self):
         bank = list(range(701, 711))

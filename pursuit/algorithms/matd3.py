@@ -52,10 +52,12 @@ def update_matd3(trainer, batch, update_actor):
         noise = torch.randn_like(next_means) * cfg.target_noise
         noise = noise.clamp(-cfg.noise_clip, cfg.noise_clip)
         next_actions = (next_means.tanh() + noise).clamp(-1.0, 1.0)
+        next_actions = next_actions * batch["next_active"].unsqueeze(-1)
         next_q1, next_q2 = trainer.critic_target(batch["next_state"], flatten_actions(next_actions))
         target_q = batch["reward"] + cfg.gamma * (1.0 - batch["terminated"]) * torch.min(next_q1, next_q2)
 
-    q1, q2 = trainer.critic(batch["state"], flatten_actions(batch["actions"]))
+    executed_actions = batch["actions"] * batch["active"].unsqueeze(-1)
+    q1, q2 = trainer.critic(batch["state"], flatten_actions(executed_actions))
     critic_loss = ((q1 - target_q).square() + (q2 - target_q).square()).mean()
     trainer.critic_optim.zero_grad(set_to_none=True)
     critic_loss.backward()
@@ -75,6 +77,7 @@ def update_matd3(trainer, batch, update_actor):
         return stats
 
     proposed = trainer.actor(batch["obs"], batch["adjacency"], batch["graph"]).tanh()
+    proposed = proposed * batch["active"].unsqueeze(-1)
     actor_loss = -trainer.critic.q1_only(batch["state"], flatten_actions(proposed)).mean()
     trainer.actor_optim.zero_grad(set_to_none=True)
     actor_loss.backward()

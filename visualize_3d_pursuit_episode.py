@@ -3,6 +3,8 @@ import argparse
 from dataclasses import asdict
 import json
 from pathlib import Path
+
+from artifact_paths import artifact_path, default_output
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from pursuit_baselines_3d import BASELINES_3D
 from marl_trainers import capture_env_frame
@@ -16,7 +18,7 @@ def main():
     parser.add_argument('--steps', type=int, default=100)
     parser.add_argument('--method', choices=sorted(BASELINES_3D), default='mpc')
     parser.add_argument('--env-config', type=Path)
-    parser.add_argument('--out-dir', type=Path, default=Path('outputs/visualization_3d'))
+    parser.add_argument('--out-dir', type=artifact_path, default=default_output('visualization_3d'))
     args = parser.parse_args()
     if args.steps < 1:
         parser.error('steps must be positive')

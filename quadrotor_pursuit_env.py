@@ -219,11 +219,16 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         self._lidar_mask_scan = -1
         self._lidar_detections = np.zeros((cfg.n_uavs, cfg.n_targets), dtype=bool)
         self._lidar_opening_scan = True
+        self._visible_steps = 0
 
     def direct_visibility_mask(self):
         if self.cfg.pursuit_target_observable:
             return np.broadcast_to((~self.disabled_uavs)[:, None], (self.cfg.n_uavs, self.cfg.n_targets)).copy()
-        return self._lidar_detections & (~self.disabled_uavs)[:, None]
+        try:
+            from pursuit_lidar import lidar_visibility
+        except ImportError:
+            from .pursuit_lidar import lidar_visibility
+        return lidar_visibility(self)
 
     def _measurement_visibility_mask(self):
         if self.cfg.pursuit_target_observable:
@@ -273,12 +278,12 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         return truth + self._lidar_rng.normal(0.0, sigma, 3), float(sigma*sigma)
 
     def _initialize_handoff_triangle_formation(self):
-        # Override the inherited near-target triangle with randomized starts.
-        try:
-            from pursuit_scenarios import initialize_formation
-        except ImportError:
-            from .pursuit_scenarios import initialize_formation
-        initialize_formation(self)
+        super()._initialize_handoff_triangle_formation()
+        self.initial_layout = "one_side_triangle"
+        target = np.r_[self.dynamic_targets[0], self.target_altitudes[0]]
+        self.initial_distances = np.linalg.norm(
+            np.column_stack([self.positions, self.altitudes]) - target, axis=1
+        ).tolist()
 
     def _game_escape_direction(self, target_index):
         try:
@@ -546,7 +551,12 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         result["body_angular_rates"] = self.quadrotor_states[:, 10:13].tolist()
         result["target_observation_ratio"] = float(np.mean(self.direct_visibility_mask()))
         if not c.pursuit_target_observable:
-            result["lidar_detection_ratio"] = result["target_observation_ratio"]
+            result["lidar_detection_ratio"] = float(np.mean(self._lidar_detections))
+        visible = self.direct_visibility_mask()
+        result["target_visibility_rate"] = float(np.mean(np.any(visible, axis=0)))
+        result["target_visible_uav_fraction"] = float(np.mean(visible))
+        self._visible_steps += int(np.any(visible))
+        result["target_visibility_uptime"] = self._visible_steps / max(self.t, 1)
         result["continuous_safety_interventions"] = int(interventions)
         result["safety_intervention_rate"] = max(
             float(result.get("safety_intervention_rate", 0.0)),

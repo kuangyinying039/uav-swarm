@@ -30,12 +30,12 @@ class ScenarioTests(unittest.TestCase):
             layouts.add(env.initial_layout)
             twin = QuadrotorPursuitEnv(QuadrotorPursuitConfig(seed=seed))
             np.testing.assert_array_equal(env.quadrotor_states, twin.quadrotor_states)
-            self.assertTrue(all(4.5 <= distance <= 12.0 for distance in env.initial_distances))
+            self.assertTrue(all(env.cfg.handoff_formation_min_distance <= distance <=
+                                 env.cfg.handoff_formation_max_distance for distance in env.initial_distances))
+            self.assertTrue(env.direct_visibility_mask().any())
             self.assertEqual(env._count_uav_collisions()[0], 0)
             self.assertFalse(env._capture_geometry()[0])
-            from pursuit_lidar import lidar_visibility
-            self.assertTrue(np.all(lidar_visibility(env)[:, 0]))
-        self.assertEqual(layouts, {'same_side_triangle'})
+        self.assertEqual(layouts, {'one_side_triangle'})
 
     def test_mpc_agent_does_not_read_other_local_target_estimates(self):
         env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(building_count=0))

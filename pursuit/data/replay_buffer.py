@@ -59,6 +59,7 @@ class JointReplayBuffer:
         self.reward = np.empty(self.capacity, dtype=np.float32)
         self.terminated = np.empty(self.capacity, dtype=np.float32)
         self.active = np.empty((self.capacity, n_agents), dtype=np.float32)
+        self.next_active = np.empty_like(self.active)
         self.graph = _allocate_graph(self.capacity, row["hetero_graph"])
         self.next_graph = _allocate_graph(self.capacity, row["next_hetero_graph"])
         self._ready = True
@@ -76,6 +77,7 @@ class JointReplayBuffer:
         self.reward[index] = row["reward"]
         self.terminated[index] = float(row["terminated"])
         self.active[index] = np.asarray(row["active"], dtype=np.float32)
+        self.next_active[index] = np.asarray(row["next_active"], dtype=np.float32)
         _write_graph(self.graph, index, row["hetero_graph"])
         _write_graph(self.next_graph, index, row["next_hetero_graph"])
         self.cursor = (self.cursor + 1) % self.capacity
@@ -104,6 +106,7 @@ class JointReplayBuffer:
             reward=self.reward[indices],
             terminated=self.terminated[indices],
             active=self.active[indices],
+            next_active=self.next_active[indices],
             device=device,
         )
 
@@ -112,7 +115,7 @@ class JointReplayBuffer:
 
 
 def pack_batch(observations, next_observations, adjacency, next_adjacency, graph, next_graph,
-               state, next_state, actions, reward, terminated, active, device):
+               state, next_state, actions, reward, terminated, active, next_active, device):
     return {
         "obs": torch.as_tensor(observations, dtype=torch.float32, device=device),
         "next_obs": torch.as_tensor(next_observations, dtype=torch.float32, device=device),
@@ -126,6 +129,7 @@ def pack_batch(observations, next_observations, adjacency, next_adjacency, graph
         "reward": torch.as_tensor(reward, dtype=torch.float32, device=device),
         "terminated": torch.as_tensor(terminated, dtype=torch.float32, device=device),
         "active": torch.as_tensor(active, dtype=torch.float32, device=device),
+        "next_active": torch.as_tensor(next_active, dtype=torch.float32, device=device),
     }
 
 

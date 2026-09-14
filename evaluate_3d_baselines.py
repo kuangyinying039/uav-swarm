@@ -11,12 +11,15 @@ import time
 
 import numpy as np
 
+from artifact_paths import artifact_path, default_output
+
 try:
-from pursuit_baselines_3d import BASELINES_3D
-from pursuit_lidar import accumulate_visibility, finalize_visibility
-from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
+    from pursuit_baselines_3d import BASELINES_3D
+    from pursuit_lidar import accumulate_visibility, finalize_visibility
+    from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 except ImportError:
     from .pursuit_baselines_3d import BASELINES_3D
+    from .pursuit_lidar import accumulate_visibility, finalize_visibility
     from .quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 
 
@@ -102,7 +105,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--methods", nargs="+", choices=sorted(BASELINES_3D), default=["apf", "frpn", "mpc"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[23, 37, 51, 71, 89])
-    parser.add_argument("--seeds-file", type=Path,
+    parser.add_argument("--seeds-file", type=artifact_path,
                         help="Whitespace-delimited integer seeds; replaces --seeds")
     parser.add_argument("--seed-start", type=int,
                         help="First seed in a contiguous candidate range")
@@ -110,7 +113,8 @@ def main() -> None:
                         help="Number of seeds in --seed-start range")
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--workers", type=int, default=1, help="Parallel independent episodes.")
-    parser.add_argument("--out", type=Path, default=Path("outputs/three_dimensional_baseline_difficulty.json"))
+    parser.add_argument("--out", type=artifact_path,
+                        default=default_output("three_dimensional_baseline_difficulty.json"))
     parser.add_argument("--env-config", type=Path, help="Same calibration overrides as training")
     args = parser.parse_args()
     if (args.seed_start is None) != (args.seed_count is None):

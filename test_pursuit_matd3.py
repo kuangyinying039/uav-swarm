@@ -35,7 +35,8 @@ class PursuitMatd3Tests(unittest.TestCase):
             episodes=1, device="cpu", utd=1, policy_delay=2,
         )
         values.update(overrides)
-        return Matd3Trainer(lambda episode=0: QuadrotorPursuitEnv(self.env_cfg), Matd3Config(**values), seed=4)
+        cfg = Matd3Config(**values)
+        return Matd3Trainer(lambda episode=0: QuadrotorPursuitEnv(self.env_cfg), cfg, seed=4)
 
     def test_mpc_plan_matches_actions(self):
         env = QuadrotorPursuitEnv(self.env_cfg)
@@ -81,6 +82,7 @@ class PursuitMatd3Tests(unittest.TestCase):
         batch = mix_batches(prior, online, 6, 0.5, "cpu")
         self.assertEqual(tuple(batch["actions"].shape), (6, env.cfg.n_uavs, 4))
         self.assertEqual(tuple(batch["state"].shape[0:1]), (6,))
+        self.assertEqual(tuple(batch["next_active"].shape), (6, env.cfg.n_uavs))
 
     def test_matd3_update_and_bc_actor_load(self):
         mappo = PursuitDemoTrainer(

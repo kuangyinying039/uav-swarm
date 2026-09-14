@@ -22,6 +22,7 @@ from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from train_pursuit_with_demos import (
     ensure_disjoint_seed_banks,
     load_environment_config,
+    load_evaluation_environment_config,
     load_seed_bank,
     seed_for_episode,
 )
@@ -31,6 +32,8 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["collect-transitions", "train", "evaluate"])
     parser.add_argument("--env-config", type=Path, default=SOURCE_ROOT / "configs/pursuit_v2/learning_start.json")
+    parser.add_argument("--eval-env-config", type=Path,
+                        help="Evaluate a checkpoint in a different, dimension-compatible environment")
     parser.add_argument("--out", type=artifact_path, default=default_output("pursuit_matd3_run"))
     parser.add_argument("--dataset", type=artifact_path, default=default_output("pursuit_transition_dataset_v2.pt"))
     parser.add_argument("--prior", type=artifact_path, help="v2 transition dataset used as prior replay")
@@ -108,18 +111,14 @@ def config_from_args(args, env_cfg, recorded=None):
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.eval_env_config and args.mode != "evaluate":
+        parser.error("--eval-env-config is only valid for evaluate")
     try:
         train_bank = load_seed_bank(args.train_seeds_file)
         validation_bank = load_seed_bank(args.validation_seeds_file)
         eval_bank = load_seed_bank(args.eval_seeds_file)
     except ValueError as error:
         parser.error(str(error))
-    if args.prior_fraction is None:
-        args.prior_fraction = 0.5 if args.prior else 0.0
-    if not 0.0 <= args.prior_fraction <= 1.0:
-        parser.error("--prior-fraction must be in [0, 1]")
-    if args.prior_fraction > 0 and args.prior is None and args.mode == "train":
-        parser.error("--prior-fraction > 0 requires --prior")
     if min(args.episodes, args.batch_size, args.rollouts, args.eval_episodes, args.warmup_steps, args.replay_size) < 1:
         parser.error("counts must be positive")
     seed_everything(args.seed)
@@ -146,6 +145,12 @@ def main():
         if "env_config" in actor_init_payload:
             env_cfg = load_environment_config(actor_init_payload["env_config"])
         recorded = actor_init_payload.get("train_config", {})
+    if args.prior_fraction is None:
+        args.prior_fraction = float(recorded.get("prior_fraction", 0.5 if args.prior else 0.0))
+    if not 0.0 <= args.prior_fraction <= 1.0:
+        parser.error("--prior-fraction must be in [0, 1]")
+    if args.prior_fraction > 0 and args.prior is None and args.mode == "train":
+        parser.error("--prior-fraction > 0 requires --prior, including when resuming a checkpoint")
     cfg = config_from_args(args, env_cfg, recorded)
     factory = lambda episode=0: QuadrotorPursuitEnv(
         replace(env_cfg, seed=seed_for_episode(train_bank, episode, args.seed))
@@ -171,7 +176,13 @@ def main():
         if used.intersection(seeds):
             parser.error("Evaluation seeds overlap training")
         trainer.actor.eval()
-        result = evaluate_methods(lambda obs, env: trainer.deterministic_action(obs), env_cfg, seeds, args.methods)
+        evaluation_cfg = (
+            load_evaluation_environment_config(args.eval_env_config, env_cfg)
+            if args.eval_env_config else env_cfg
+        )
+        result = evaluate_methods(
+            lambda obs, env: trainer.deterministic_action(obs), evaluation_cfg, seeds, args.methods
+        )
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / "evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         write_evaluation_chart(args.out / "evaluation.svg", result)

@@ -219,6 +219,7 @@ class Matd3Trainer:
             total_reward = 0.0
             collisions = 0
             correction = []
+            visibility = []
             components = {}
             closest = float(env.minimum_capture_gap())
             last_stats = {}
@@ -237,6 +238,7 @@ class Matd3Trainer:
                 total_reward += float(result["reward"])
                 collisions += int(result.get("collisions", 0))
                 correction.append(float(result.get("safety_correction_rate", 0.0)))
+                visibility.append(float(result.get("target_visibility_rate", 0.0)))
                 closest = min(closest, float(result.get("minimum_capture_gap", closest)))
                 accumulate_visibility(visibility_totals, result)
                 for key, value in result["reward_components"].items():
@@ -257,6 +259,7 @@ class Matd3Trainer:
                 "minimum_capture_gap": env.minimum_capture_gap(),
                 "closest_capture_gap": closest,
                 "safety_correction_rate": float(np.mean(correction)) if correction else 0.0,
+                "target_visibility_rate": float(np.mean(visibility)) if visibility else 0.0,
                 "reward_components": components,
                 **finalize_visibility(visibility_totals, step + 1),
                 "controller_feasible_rate": float(result.get("controller_feasible_rate", 1.0)),

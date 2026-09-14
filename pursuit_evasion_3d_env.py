@@ -108,7 +108,7 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
         self._initialize_3d_tracking_state()
 
     def _initialize_handoff_triangle_formation(self) -> None:
-        """Place three pursuers 4--6 m around the handed-off target.
+        """Place a visible three-UAV triangle on one side of the target.
 
         Candidate search respects map bounds and building prisms. UAV 0 is
         selected from candidates with direct 3-D LOS and is pointed toward the
@@ -118,7 +118,8 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
         target = np.array([*self.dynamic_targets[0], self.target_altitudes[0]], dtype=float)
         radii = np.linspace(c.handoff_formation_min_distance + 0.25,
                             c.handoff_formation_max_distance - 0.25, 4)
-        angle_offsets = np.linspace(-np.pi / 3.0, np.pi / 3.0, 13)
+        angle_offsets = (0.0, -np.pi / 18.0, np.pi / 18.0,
+                         -np.pi / 9.0, np.pi / 9.0)
 
         def candidates(expected_angle: float):
             for radius in radii:
@@ -157,13 +158,14 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
             raise RuntimeError("Unable to construct a visible 3-D handoff formation.")
         selected = [anchor]
         anchor_angle = float(np.arctan2(anchor[1] - target[1], anchor[0] - target[0]))
-        for agent in (1, 2):
-            expected = anchor_angle + agent * 2.0 * np.pi / 3.0
+        for agent, offset in ((1, -np.pi / 5.0), (2, np.pi / 5.0)):
+            expected = anchor_angle + offset
             point = next(
                 (
                     candidate
                     for candidate in candidates(expected)
-                    if all(np.linalg.norm(candidate - other) >= 2.0 * 0.45 for other in selected)
+                    if self.has_line_of_sight_3d(candidate, target)
+                    and all(np.linalg.norm(candidate - other) >= 2.0 * 0.45 for other in selected)
                 ),
                 None,
             )
@@ -171,9 +173,10 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
                 point = next(
                     (
                         candidate
-                        for angle in np.linspace(expected - np.pi, expected + np.pi, 73)
+                        for angle in np.linspace(expected - np.pi / 8.0, expected + np.pi / 8.0, 17)
                         for candidate in candidates(float(angle))
-                        if all(np.linalg.norm(candidate - other) >= 2.0 * 0.45 for other in selected)
+                        if self.has_line_of_sight_3d(candidate, target)
+                        and all(np.linalg.norm(candidate - other) >= 2.0 * 0.45 for other in selected)
                     ),
                     None,
                 )

@@ -97,7 +97,6 @@ class VelocityLidarTests(unittest.TestCase):
         env = QuadrotorPursuitEnv(self.config(lidar_detection_probability=0, handoff_initial_track=False))
         for _ in range(3):
             result = env.step_joint(np.zeros((3, 4)))
-            self.assertFalse(env.direct_visibility_mask().any())
             self.assertEqual(result['lidar_detection_ratio'], 0)
             self.assertFalse(any(track.initialized for tracks in env.track_memory for track in tracks))
 
@@ -117,7 +116,8 @@ class VelocityLidarTests(unittest.TestCase):
         self.assertTrue(np.any(env.last_direct_detection_step > stamps))
 
     def test_game_observation_is_noisy_and_independent_of_lidar(self):
-        cfg = QuadrotorPursuitConfig(building_count=0, lidar_detection_probability=0, pursuit_target_observable=True)
+        cfg = QuadrotorPursuitConfig(building_count=0, lidar_detection_probability=0,
+                                     pursuit_target_observable=True)
         env = QuadrotorPursuitEnv(cfg)
         for _ in range(3):
             result = env.step_joint(np.zeros((cfg.n_uavs, 4)))

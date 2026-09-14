@@ -145,7 +145,7 @@ def validate_transition_dataset(dataset, env_cfg):
     required = (
         "agent_observations", "comm_adjacency", "hetero_graph", "state", "actions", "reward",
         "next_agent_observations", "next_comm_adjacency", "next_hetero_graph", "next_state",
-        "terminated", "truncated", "active",
+        "terminated", "truncated", "active", "next_active",
     )
     for episode in dataset["episodes"]:
         for row in episode:

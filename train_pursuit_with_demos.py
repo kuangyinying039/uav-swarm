@@ -713,6 +713,7 @@ def evaluate(trainer, env_cfg, seeds, methods):
             obs, total, components = env.observe_search(), 0.0, {}
             collisions, safety, feasible = 0, 0, 0.0
             correction, emergency = 0., 0.
+            visibility = 0.0
             closest_capture_gap = float(env.minimum_capture_gap())
             visibility_totals = {}
             for step in range(env.cfg.search_steps):
@@ -725,6 +726,7 @@ def evaluate(trainer, env_cfg, seeds, methods):
                 feasible += float(result.get("controller_feasible_rate", 0.0))
                 correction += float(result.get('safety_correction_rate', 0.))
                 emergency += float(result.get('emergency_stop_rate', 0.))
+                visibility += float(result.get("target_visibility_rate", 0.0))
                 closest_capture_gap = min(
                     closest_capture_gap, float(result.get("minimum_capture_gap", env.minimum_capture_gap()))
                 )
@@ -745,6 +747,7 @@ def evaluate(trainer, env_cfg, seeds, methods):
                          "controller_feasible_rate": feasible / (step + 1),
                          "safety_correction_rate": correction / (step + 1),
                          "emergency_stop_rate": emergency / (step + 1),
+                         "target_visibility_rate": visibility / (step + 1),
                          "closest_capture_gap": closest_capture_gap,
                          "final_capture_gap": env.minimum_capture_gap(),
                          **finalize_visibility(visibility_totals, step + 1)})
@@ -768,7 +771,8 @@ def evaluate(trainer, env_cfg, seeds, methods):
                            "mean_team_visibility_ratio": float(np.mean([r["team_visibility_ratio"] for r in group])),
                            "mean_uav_visibility_ratio": float(np.mean([r["uav_visibility_ratio"] for r in group])),
                            "mean_building_occlusion_ratio": float(np.mean([r["building_occlusion_ratio"] for r in group])),
-                           "mean_n_uavs_seeing_target": float(np.mean([r["mean_n_uavs_seeing_target"] for r in group]))}
+                           "mean_n_uavs_seeing_target": float(np.mean([r["mean_n_uavs_seeing_target"] for r in group])),
+                           "mean_target_visibility_rate": float(np.mean([r["target_visibility_rate"] for r in group]))}
     return {"env_config": asdict(env_cfg), "rows": rows, "summary": summary}
 
 
@@ -791,11 +795,49 @@ def load_environment_config(recorded):
     return QuadrotorPursuitConfig(**recorded)
 
 
+def load_evaluation_environment_config(path, checkpoint_cfg):
+    """Use a new scenario for evaluation only when checkpoint tensor shapes match."""
+    evaluation_cfg = QuadrotorPursuitConfig(**json.loads(path.read_text(encoding="utf-8")))
+    evaluation_cfg.building_state_capacity = max(
+        evaluation_cfg.building_state_capacity, evaluation_cfg.building_count
+    )
+    contract_fields = (
+        "task_mode", "action_mode", "scenario_version",
+        "policy_observation_version", "execution_reward_version", "capture_mode",
+    )
+    changed_contracts = [
+        field for field in contract_fields
+        if getattr(evaluation_cfg, field) != getattr(checkpoint_cfg, field)
+    ]
+    if changed_contracts:
+        raise ValueError(f"Evaluation environment changes checkpoint contracts: {changed_contracts}")
+    checkpoint_env = QuadrotorPursuitEnv(checkpoint_cfg)
+    evaluation_env = QuadrotorPursuitEnv(evaluation_cfg)
+    checkpoint_shape = (
+        checkpoint_cfg.n_uavs, checkpoint_cfg.n_targets,
+        checkpoint_env.obs_dim(), checkpoint_env.state_dim(),
+        checkpoint_env.continuous_action_dim(),
+    )
+    evaluation_shape = (
+        evaluation_cfg.n_uavs, evaluation_cfg.n_targets,
+        evaluation_env.obs_dim(), evaluation_env.state_dim(),
+        evaluation_env.continuous_action_dim(),
+    )
+    if evaluation_shape != checkpoint_shape:
+        raise ValueError(
+            f"Evaluation environment changes checkpoint input/action dimensions: "
+            f"checkpoint={checkpoint_shape}, evaluation={evaluation_shape}"
+        )
+    return evaluation_cfg
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["collect", "pretrain", "train", "evaluate"])
     parser.add_argument("--training-profile", choices=["auto", "plain", "warmstart"], default="auto")
     parser.add_argument("--env-config", type=Path, help="JSON object of QuadrotorPursuitConfig overrides")
+    parser.add_argument("--eval-env-config", type=Path,
+                        help="Evaluate a checkpoint in a different, dimension-compatible environment")
     parser.add_argument("--demos", type=artifact_path,
                         default=default_output("pursuit_game_v2_demos.pt"))
     parser.add_argument("--aux-demos", type=artifact_path,
@@ -856,6 +898,8 @@ def main():
     parser.add_argument("--dagger-validation-seed", type=int)
     parser.add_argument("--dagger-validation-episodes", type=int)
     args = parser.parse_args()
+    if args.eval_env_config and args.mode != "evaluate":
+        parser.error("--eval-env-config is only valid for evaluate")
     try:
         explicit_aux_path = resolve_auxiliary_path(args.aux_demos, args.no_aux_demos)
         requested_train_bank = load_seed_bank(args.train_seeds_file)
@@ -974,7 +1018,11 @@ def main():
         used.update(metadata.get("validation_seeds", []))
         if used.intersection(seeds):
             parser.error("Evaluation seeds overlap demonstration or training seeds")
-        result = evaluate(trainer, env_cfg, seeds, args.methods)
+        evaluation_cfg = (
+            load_evaluation_environment_config(args.eval_env_config, env_cfg)
+            if args.eval_env_config else env_cfg
+        )
+        result = evaluate(trainer, evaluation_cfg, seeds, args.methods)
         (args.out / "evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         write_evaluation_chart(args.out / "evaluation.svg", result)
         print(json.dumps(result["summary"], indent=2))
