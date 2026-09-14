@@ -1,4 +1,6 @@
 import unittest
+import json
+from pathlib import Path
 import numpy as np
 from quadrotor_pursuit_env import QuadrotorPursuitEnv, QuadrotorPursuitConfig
 from pursuit_scenarios import velocity_step
@@ -36,6 +38,20 @@ class ScenarioTests(unittest.TestCase):
             self.assertEqual(env._count_uav_collisions()[0], 0)
             self.assertFalse(env._capture_geometry()[0])
         self.assertEqual(layouts, {'one_side_triangle'})
+
+    def test_five_building_evaluation_seeds_have_visible_starts(self):
+        path = Path(__file__).parent / "configs/pursuit_v2/previous_models_current_radar.json"
+        overrides = json.loads(path.read_text(encoding="utf-8"))
+        for seed in range(7000000, 7000020):
+            with self.subTest(seed=seed):
+                cfg = QuadrotorPursuitConfig(**overrides, seed=seed)
+                env = QuadrotorPursuitEnv(cfg)
+                self.assertEqual(env.initial_layout, "one_side_triangle")
+                self.assertTrue(all(cfg.handoff_formation_min_distance <= distance <=
+                                    cfg.handoff_formation_max_distance for distance in env.initial_distances))
+                self.assertTrue(env.direct_visibility_mask().all())
+                self.assertEqual(env._count_uav_collisions()[0], 0)
+                self.assertFalse(env._capture_geometry()[0])
 
     def test_mpc_agent_does_not_read_other_local_target_estimates(self):
         env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(building_count=0))

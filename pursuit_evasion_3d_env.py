@@ -103,7 +103,33 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
             -c.obstacle_vertical_speed, c.obstacle_vertical_speed, size=len(self.obstacles)
         )
         if c.handoff_triangle_formation and c.n_uavs == 3 and c.n_targets >= 1:
-            self._initialize_handoff_triangle_formation()
+            # A dense building layout can leave the sampled target with no
+            # feasible same-side triangle. Resample that initial target before
+            # giving up; the buildings and seed remain unchanged.
+            last_error = None
+            for attempt in range(128):
+                if attempt:
+                    candidate = np.r_[
+                        self.rng.uniform(0.5, c.grid_size - 0.5, size=2),
+                        np.clip(c.initial_altitude + self.rng.uniform(-1.5, 1.5),
+                                c.min_altitude, c.max_altitude),
+                    ]
+                    if self._point_inside_building_prism(candidate, margin=0.2):
+                        continue
+                    self.dynamic_targets[0] = candidate[:2]
+                    self.target_altitudes[0] = candidate[2]
+                try:
+                    self._initialize_handoff_triangle_formation()
+                except RuntimeError as error:
+                    last_error = error
+                    continue
+                if attempt:
+                    self.target_grid = self._target_occupancy()
+                break
+            else:
+                raise RuntimeError(
+                    "Unable to sample a visible collision-free 3-D handoff triangle"
+                ) from last_error
         self._use_3d_tracking = True
         self._initialize_3d_tracking_state()
 
