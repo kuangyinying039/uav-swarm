@@ -29,12 +29,13 @@ class PursuitMatd3Tests(unittest.TestCase):
         self.env_cfg = QuadrotorPursuitConfig(seed=4, building_count=0, search_steps=3)
 
     def trainer(self, **overrides):
-        cfg = Matd3Config(
+        values = dict(
             gamma=self.env_cfg.reward_gamma, hidden_dim=16, critic_hidden=16, critic_layers=2,
             gat_heads=1, gat_layers=1, batch_size=4, replay_size=32, warmup_steps=2,
-            episodes=1, device="cpu", utd=1, policy_delay=2, **overrides,
+            episodes=1, device="cpu", utd=1, policy_delay=2,
         )
-        return Matd3Trainer(lambda episode=0: QuadrotorPursuitEnv(self.env_cfg), cfg, seed=4)
+        values.update(overrides)
+        return Matd3Trainer(lambda episode=0: QuadrotorPursuitEnv(self.env_cfg), Matd3Config(**values), seed=4)
 
     def test_mpc_plan_matches_actions(self):
         env = QuadrotorPursuitEnv(self.env_cfg)
