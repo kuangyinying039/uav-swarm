@@ -15,6 +15,7 @@ from pursuit.data.replay_buffer import JointReplayBuffer, mix_batches
 from pursuit.data.transition_dataset import flatten_transitions, make_transition
 from pursuit.models.twin_critic import TwinCentralizedQ
 from pursuit_graph_encoder import PURSUIT_GRAPH_VERSION, PursuitGraphActor
+from pursuit_lidar import accumulate_visibility, finalize_visibility
 from pursuit_training_output import clean_history_row, write_reward_capture_chart
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 
@@ -221,6 +222,7 @@ class Matd3Trainer:
             components = {}
             closest = float(env.minimum_capture_gap())
             last_stats = {}
+            visibility_totals = {}
             for step in range(env.cfg.search_steps):
                 active = ~env.disabled_uavs
                 if self.env_steps < self.cfg.warmup_steps:
@@ -236,6 +238,7 @@ class Matd3Trainer:
                 collisions += int(result.get("collisions", 0))
                 correction.append(float(result.get("safety_correction_rate", 0.0)))
                 closest = min(closest, float(result.get("minimum_capture_gap", closest)))
+                accumulate_visibility(visibility_totals, result)
                 for key, value in result["reward_components"].items():
                     if key in ("pursuit", "estimation"):
                         continue
@@ -255,6 +258,7 @@ class Matd3Trainer:
                 "closest_capture_gap": closest,
                 "safety_correction_rate": float(np.mean(correction)) if correction else 0.0,
                 "reward_components": components,
+                **finalize_visibility(visibility_totals, step + 1),
                 "controller_feasible_rate": float(result.get("controller_feasible_rate", 1.0)),
                 "critic_loss": last_stats.get("critic_loss"),
                 "actor_loss": last_stats.get("actor_loss"),

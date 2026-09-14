@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 import numpy as np
 
 from pursuit_baselines_3d import BASELINES_3D
+from pursuit_lidar import accumulate_visibility, finalize_visibility
 from quadrotor_pursuit_env import QuadrotorPursuitEnv
 
 
@@ -24,6 +25,7 @@ def evaluate_policy(action_fn, env_cfg, seeds, method_name="matd3"):
         closest_capture_gap = float(env.minimum_capture_gap())
         max_uavs_in_capture = _uavs_in_capture(env)
         max_encirclement = 0.0
+        visibility_totals = {}
         for step in range(env.cfg.search_steps):
             action = action_fn(obs, env)
             result = env.step_joint(action)
@@ -39,6 +41,7 @@ def evaluate_policy(action_fn, env_cfg, seeds, method_name="matd3"):
             )
             max_uavs_in_capture = max(max_uavs_in_capture, _uavs_in_capture(env))
             max_encirclement = max(max_encirclement, float(result.get("encirclement_score", 0.0)))
+            accumulate_visibility(visibility_totals, result)
             if (step + 1) % 100 == 0:
                 print(f"[evaluation] {method_name} seed={seed} step={step+1}", flush=True)
             for key, value in result["reward_components"].items():
@@ -68,6 +71,9 @@ def evaluate_policy(action_fn, env_cfg, seeds, method_name="matd3"):
             "final_uavs_in_capture": _uavs_in_capture(env),
             "max_encirclement_score": max_encirclement,
             "final_encirclement_score": float(result.get("encirclement_score", 0.0)),
+            **finalize_visibility(visibility_totals, step + 1),
+            "final_team_visible": bool(result.get("team_visible", False)),
+            "final_n_uavs_seeing_target": int(result.get("n_uavs_seeing_target", 0)),
         })
         print(
             f"[evaluation] {method_name} seed={seed} captured={rows[-1]['captured']} steps={step+1}",
@@ -121,6 +127,10 @@ def summarize(rows, methods):
             "mean_safety_correction_rate": float(np.mean([row["safety_correction_rate"] for row in group])),
             "mean_emergency_stop_rate": float(np.mean([row["emergency_stop_rate"] for row in group])),
             "mean_max_uavs_in_capture": float(np.mean([row["max_uavs_in_capture"] for row in group])),
+            "mean_team_visibility_ratio": float(np.mean([row["team_visibility_ratio"] for row in group])),
+            "mean_uav_visibility_ratio": float(np.mean([row["uav_visibility_ratio"] for row in group])),
+            "mean_building_occlusion_ratio": float(np.mean([row["building_occlusion_ratio"] for row in group])),
+            "mean_n_uavs_seeing_target": float(np.mean([row["mean_n_uavs_seeing_target"] for row in group])),
             "near_miss_0_5m_failures": float(
                 np.mean([
                     (not row["captured"]) and row["closest_capture_gap"] <= 0.5

@@ -82,3 +82,16 @@ def shaped_rewards(previous, current, active_before, active_after, cfg, terminal
         "target_proximity": 0.0,
         "encirclement_progress": cfg.encirclement_progress_weight * (cfg.reward_gamma*enclosure-old_enclosure),
     }, progress
+
+
+def visibility_potential(team_visible, uav_visibility_ratio):
+    return float(team_visible) + 0.5 * float(uav_visibility_ratio)
+
+
+def visibility_shaping(previous, current, cfg, terminal=False):
+    """Potential on team/per-UAV geometric lidar visibility; zero at terminals."""
+    old_potential = visibility_potential(*previous)
+    new_potential = 0.0 if terminal else visibility_potential(*current)
+    return {
+        "visibility_progress": cfg.visibility_progress_weight * (cfg.reward_gamma * new_potential - old_potential)
+    }

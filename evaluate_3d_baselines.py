@@ -12,8 +12,9 @@ import time
 import numpy as np
 
 try:
-    from pursuit_baselines_3d import BASELINES_3D
-    from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
+from pursuit_baselines_3d import BASELINES_3D
+from pursuit_lidar import accumulate_visibility, finalize_visibility
+from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 except ImportError:
     from .pursuit_baselines_3d import BASELINES_3D
     from .quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
@@ -30,6 +31,7 @@ def run_episode(method: str, seed: int, args) -> dict:
     initial_distance = float(np.mean(np.linalg.norm(env.quadrotor_states[:, :3] - initial_target, axis=1)))
     totals = dict(reward=0.0, visible=0.0, lost=0.0, reacquired=0.0, collisions=0.0,
                   interventions=0.0, feasible=0.0, path_length=0.0, correction=0.0, emergency=0.0)
+    visibility_totals = {}
     result = {}
     executed = 0
     for step in range(args.steps):
@@ -45,6 +47,7 @@ def run_episode(method: str, seed: int, args) -> dict:
         totals['correction'] += float(result.get('safety_correction_rate', 0.))
         totals['emergency'] += float(result.get('emergency_stop_rate', 0.))
         totals["path_length"] += float(result.get("step_path_length", 0.0))
+        accumulate_visibility(visibility_totals, result)
         if result.get("terminated") or result.get("truncated"):
             break
     captured = bool(result.get("capture_success", 0.0))
@@ -58,6 +61,7 @@ def run_episode(method: str, seed: int, args) -> dict:
         "initial_layout": env.initial_layout,
         "evader_safety_interventions": getattr(env, "evader_safety_interventions", 0),
         "visibility_ratio": totals["visible"] / max(executed, 1),
+        **finalize_visibility(visibility_totals, executed),
         "target_loss_count": totals["lost"],
         "reacquisition_count": totals["reacquired"],
         "collision_count": totals["collisions"],
@@ -81,6 +85,10 @@ def summarize(rows: list[dict]) -> dict:
             "mean_capture_time_success_only": float(np.mean(captured_times)) if captured_times else None,
             "mean_censored_time": float(np.mean([row["censored_time"] for row in group])),
             "mean_visibility_ratio": float(np.mean([row["visibility_ratio"] for row in group])),
+            "mean_team_visibility_ratio": float(np.mean([row["team_visibility_ratio"] for row in group])),
+            "mean_uav_visibility_ratio": float(np.mean([row["uav_visibility_ratio"] for row in group])),
+            "mean_building_occlusion_ratio": float(np.mean([row["building_occlusion_ratio"] for row in group])),
+            "mean_n_uavs_seeing_target": float(np.mean([row["mean_n_uavs_seeing_target"] for row in group])),
             "mean_safety_interventions": float(np.mean([row["safety_interventions"] for row in group])),
             "mean_controller_feasible_rate": float(np.mean([row["controller_feasible_rate"] for row in group])),
             "mean_safety_correction_rate": float(np.mean([row["safety_correction_rate"] for row in group])),

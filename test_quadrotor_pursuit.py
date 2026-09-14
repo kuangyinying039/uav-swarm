@@ -106,13 +106,19 @@ class QuadrotorPursuitTests(unittest.TestCase):
             np.testing.assert_allclose(after, before, atol=1e-12)
 
     def test_randomized_start_distance_and_observability(self):
+        from pursuit_lidar import lidar_visibility
         for seed in (23, 37, 51, 71, 89):
             env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(seed=seed, lidar_detection_probability=1))
             target = np.array([*env.dynamic_targets[0], env.target_altitudes[0]])
             distance = np.linalg.norm(env.quadrotor_states[:, :3] - target, axis=1)
-            self.assertTrue(np.all(distance >= env.cfg.initial_distance_min - 1e-9))
-            self.assertTrue(np.all(distance <= env.cfg.initial_distance_max + 1e-9))
+            self.assertEqual(env.initial_layout, "same_side_triangle")
+            self.assertTrue(np.all(distance >= 4.5))
+            self.assertTrue(np.all(distance <= env.cfg.lidar_target_detection_range))
+            self.assertTrue(np.all(lidar_visibility(env)[:, 0]))
             self.assertTrue(bool(np.any(env.direct_visibility_mask()[:, 0])))
+            captured, count, _ = env._capture_geometry()
+            self.assertFalse(captured)
+            self.assertEqual(count, 0)
 
     def test_final_collision_logic_uses_three_dimensional_distance(self):
         env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(seed=12, building_count=0, n_obstacles=0))
@@ -153,6 +159,27 @@ class QuadrotorPursuitTests(unittest.TestCase):
             env.step_joint(action)
         displacement = np.linalg.norm(env.quadrotor_states[:, :3] - initial, axis=1)
         self.assertGreater(float(np.mean(displacement)), 0.05)
+
+    def test_buildings_occlude_and_visibility_metrics_are_reported(self):
+        from pursuit_lidar import lidar_visibility, visibility_metrics
+        env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(seed=21, building_count=2, lidar_detection_probability=1))
+        self.assertTrue(np.all(lidar_visibility(env)[:, 0]))
+        env.buildings, env.building_heights = [(10.4, 9.0, 10.6, 11.0)], [10.0]
+        env.quadrotor_states[0, :3] = [10.0, 10.0, 5.0]
+        env.quadrotor_states[0, 6:10] = [1.0, 0.0, 0.0, 0.0]
+        env.positions[0], env.altitudes[0] = [10.0, 10.0], 5.0
+        env.dynamic_targets[0], env.target_altitudes[0] = [11.0, 10.0], 5.0
+        self.assertFalse(lidar_visibility(env)[0, 0])
+        metrics = visibility_metrics(env)
+        self.assertIn("uav_visibility_ratio", metrics)
+        result = env.step_joint(np.zeros((env.cfg.n_uavs, 4)))
+        self.assertIn("team_visible", result)
+        self.assertIn("uav_visibility_ratio", result)
+        self.assertIn("building_occlusion_ratio", result)
+        self.assertIn("visibility_progress", result["reward_components"])
+        captured, count, _ = env._capture_geometry()
+        self.assertEqual(env.cfg.capture_mode, "single_distance")
+        self.assertEqual(env.cfg.capture_required_uavs, 1)
 
 
 if __name__ == "__main__":

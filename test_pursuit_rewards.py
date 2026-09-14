@@ -72,3 +72,17 @@ class RewardTests(unittest.TestCase):
         self.assertLess(cost(.21),cost(.5))
         self.assertEqual(cost(3),0.)
         self.assertGreaterEqual(cost(.2),-self.c.boundary_proximity_weight)
+
+    def test_visibility_potential_telescopes_at_terminal(self):
+        from pursuit_rewards import visibility_shaping
+        path = [(True, 1.0), (True, 2/3), (False, 0.0), (True, 1.0)]
+        total = 0.
+        for step, (a, b) in enumerate(zip(path, path[1:])):
+            reward = visibility_shaping(a, b, self.c, terminal=step == len(path)-2)
+            total += self.c.reward_gamma**step * reward["visibility_progress"]
+        initial = 1.0 + 0.5 * 1.0
+        self.assertAlmostEqual(total, -self.c.visibility_progress_weight * initial)
+
+
+if __name__ == '__main__':
+    unittest.main()

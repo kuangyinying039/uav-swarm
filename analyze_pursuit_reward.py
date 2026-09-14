@@ -18,7 +18,7 @@ from train_pursuit_with_demos import PursuitDemoTrainer, deterministic_action, l
 
 AUDIT_COMPONENTS = (
     "capture", "timeout", "time", "individual_approach", "nearest_approach",
-    "encirclement_progress", "obstacle_proximity", "boundary_proximity",
+    "encirclement_progress", "visibility_progress", "obstacle_proximity", "boundary_proximity",
     "peer_proximity", "reference_smoothness", "controller_rejection",
     "safety_correction",
 )

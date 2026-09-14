@@ -1,5 +1,8 @@
 {
-  "scenario_version": 2,
+  "scenario_version": 3,
+  "execution_reward_version": 4,
+  "pursuit_target_observable": false,
+  "evader_policy": "occlusion",
   "max_horizontal_acceleration": 1.8,
   "max_vertical_acceleration": 1.5
 }

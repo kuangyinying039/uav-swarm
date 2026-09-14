@@ -16,7 +16,10 @@ class VelocityLidarTests(unittest.TestCase):
         self.assertFalse(hasattr(cfg, 'nmpc_samples'))
         self.assertEqual(cfg.lidar_model, 'mid360')
         self.assertEqual((cfg.lidar_vertical_min_deg, cfg.lidar_vertical_max_deg), (-7, 52))
-        self.assertTrue(cfg.pursuit_target_observable)
+        self.assertFalse(cfg.pursuit_target_observable)
+        self.assertEqual(cfg.evader_policy, 'occlusion')
+        self.assertEqual(cfg.scenario_version, 3)
+        self.assertEqual(cfg.execution_reward_version, 4)
 
     def test_response_lag_acceleration_limit_and_reset(self):
         cfg = self.config()
@@ -114,7 +117,7 @@ class VelocityLidarTests(unittest.TestCase):
         self.assertTrue(np.any(env.last_direct_detection_step > stamps))
 
     def test_game_observation_is_noisy_and_independent_of_lidar(self):
-        cfg = QuadrotorPursuitConfig(building_count=0, lidar_detection_probability=0)
+        cfg = QuadrotorPursuitConfig(building_count=0, lidar_detection_probability=0, pursuit_target_observable=True)
         env = QuadrotorPursuitEnv(cfg)
         for _ in range(3):
             result = env.step_joint(np.zeros((cfg.n_uavs, 4)))
@@ -130,7 +133,7 @@ class VelocityLidarTests(unittest.TestCase):
         self.assertIsNone(env._target_measurement(0, 0)[0])
 
     def test_game_evader_moves_away_from_nearby_pursuers(self):
-        env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(building_count=0))
+        env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(building_count=0, pursuit_target_observable=True))
         env.dynamic_targets[0], env.target_altitudes[0] = [10, 10], 5
         env.positions[:] = [[8, 9], [8, 10], [8, 11]]
         env.altitudes[:] = 5

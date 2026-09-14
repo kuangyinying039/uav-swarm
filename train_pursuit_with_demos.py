@@ -27,6 +27,7 @@ from pursuit_graph_encoder import (
     PURSUIT_GRAPH_VERSION, PursuitGraphActor, pursuit_graph_from_flat_observation,
 )
 from pursuit_baselines_3d import BASELINES_3D
+from pursuit_lidar import accumulate_visibility, finalize_visibility
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from pursuit_training_output import clean_history_row, write_pursuit_outputs, write_evaluation_chart, write_reward_capture_chart
 from pursuit_ppo import update_pursuit
@@ -199,11 +200,15 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.reward_totals = {}
         self.closest_capture_gap = float("inf")
         self.lidar_rates = []
+        self.visibility_totals = {}
+        self.visibility_steps = 0
         original_step = self.active_env.step_joint
         def timed_step(actions):
             started = time.perf_counter()
             result = original_step(actions)
             self.environment_seconds += time.perf_counter() - started
+            accumulate_visibility(self.visibility_totals, result)
+            self.visibility_steps += 1
             for key, value in result.get("reward_components", {}).items():
                 if key not in ("pursuit", "estimation"):
                     self.reward_totals[key] = self.reward_totals.get(key, 0.0) + float(value)
@@ -237,6 +242,7 @@ class PursuitDemoTrainer(MAPPOTrainer):
         if self.lidar_rates:
             row["lidar_detection_ratio"] = float(np.mean(self.lidar_rates))
         row["target_observation_ratio"] = row.get("continuous_visibility_ratio")
+        row.update(finalize_visibility(self.visibility_totals, self.visibility_steps))
         row["minimum_capture_gap"] = self.active_env.minimum_capture_gap()
         row["demo_loss_weight"] = self.demo_loss_weight(row["episode"] - 1)
         row["reference_kl_weight"] = self.reference_kl_weight if self.reference_actor is not None else 0.0
@@ -708,6 +714,7 @@ def evaluate(trainer, env_cfg, seeds, methods):
             collisions, safety, feasible = 0, 0, 0.0
             correction, emergency = 0., 0.
             closest_capture_gap = float(env.minimum_capture_gap())
+            visibility_totals = {}
             for step in range(env.cfg.search_steps):
                 action = deterministic_action(trainer, obs) if policy is None else policy.actions(env)
                 result = env.step_joint(action)
@@ -721,6 +728,7 @@ def evaluate(trainer, env_cfg, seeds, methods):
                 closest_capture_gap = min(
                     closest_capture_gap, float(result.get("minimum_capture_gap", env.minimum_capture_gap()))
                 )
+                accumulate_visibility(visibility_totals, result)
                 if (step + 1) % 100 == 0:
                     print(f"[evaluation] {method} seed={seed} step={step+1}", flush=True)
                 for key, value in result["reward_components"].items():
@@ -738,7 +746,8 @@ def evaluate(trainer, env_cfg, seeds, methods):
                          "safety_correction_rate": correction / (step + 1),
                          "emergency_stop_rate": emergency / (step + 1),
                          "closest_capture_gap": closest_capture_gap,
-                         "final_capture_gap": env.minimum_capture_gap()})
+                         "final_capture_gap": env.minimum_capture_gap(),
+                         **finalize_visibility(visibility_totals, step + 1)})
             print(f"[evaluation] {method} seed={seed} captured={rows[-1]['captured']} steps={step+1}", flush=True)
     trainer.actor.train()
     summary = {}
@@ -755,7 +764,11 @@ def evaluate(trainer, env_cfg, seeds, methods):
                            "mean_safety_interventions": float(np.mean([r["safety_interventions"] for r in group])),
                            "mean_controller_feasible_rate": float(np.mean([r["controller_feasible_rate"] for r in group])),
                            "mean_safety_correction_rate": float(np.mean([r["safety_correction_rate"] for r in group])),
-                           "mean_emergency_stop_rate": float(np.mean([r["emergency_stop_rate"] for r in group]))}
+                           "mean_emergency_stop_rate": float(np.mean([r["emergency_stop_rate"] for r in group])),
+                           "mean_team_visibility_ratio": float(np.mean([r["team_visibility_ratio"] for r in group])),
+                           "mean_uav_visibility_ratio": float(np.mean([r["uav_visibility_ratio"] for r in group])),
+                           "mean_building_occlusion_ratio": float(np.mean([r["building_occlusion_ratio"] for r in group])),
+                           "mean_n_uavs_seeing_target": float(np.mean([r["mean_n_uavs_seeing_target"] for r in group]))}
     return {"env_config": asdict(env_cfg), "rows": rows, "summary": summary}
 
 
@@ -765,14 +778,16 @@ def load_environment_config(recorded):
         raise ValueError("Capture rule changed to 3-D distance; recollect demonstrations and retrain")
     if recorded.get("policy_observation_version") != 2:
         raise ValueError("Pursuit observation v2 adds target height/velocity and deadline; recollect demonstrations and retrain into a new directory")
-    if recorded.get("scenario_version") != 2:
-        raise ValueError("Scenario v2 changes initialization and evader dynamics; recollect demonstrations and retrain into a new directory")
+    if recorded.get("scenario_version") != 3:
+        raise ValueError("Scenario v3 uses same-side triangle lidar starts; recollect demonstrations and retrain into a new directory")
     if recorded.get("task_mode") != "pursuit_quadrotor_3d" or any(
             key in recorded for key in ("execution_mode", "sensor_mode", "nmpc_horizon")):
         raise ValueError("Old NMPC/FOV demonstrations or checkpoint are incompatible. "
                          "Recollect with the current velocity/MID-360 environment into a new file.")
-    if recorded.get('execution_reward_version') != 3:
-        raise ValueError('Safety execution and rewards changed to v3; recollect demos and retrain in a new directory')
+    if recorded.get("execution_reward_version") != 4:
+        raise ValueError("Safety execution and rewards changed to v4 lidar visibility shaping; recollect demos and retrain in a new directory")
+    if recorded.get("pursuit_target_observable", False):
+        raise ValueError("Pursuit is limited-FOV MID-360 lidar, not globally observable; recollect demonstrations")
     return QuadrotorPursuitConfig(**recorded)
 
 
