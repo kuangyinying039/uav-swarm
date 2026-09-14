@@ -1,8 +1,9 @@
-"""Pursuit-only demonstration warm start and on-policy MAPPO fine tuning.
+"""Frozen on-policy MAPPO pursuit baseline (BC / retention / DAgger reproduction).
 
-Successful teacher trajectories provide optional behavior-cloning initialization.
-Teacher transitions are used only for supervised learning, never as PPO data.
-The search environment and discrete search training path are left unchanged.
+Do not extend this file with off-policy MATD3. New pursuit RL lives in
+``train_pursuit_matd3.py`` and the ``pursuit/`` package. Successful teacher
+trajectories here remain BC-only; they are never PPO data. The cooperative
+search environment and discrete search trainers are left unchanged.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ from pursuit_baselines_3d import BASELINES_3D
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from pursuit_training_output import clean_history_row, write_pursuit_outputs, write_evaluation_chart, write_reward_capture_chart
 from pursuit_ppo import update_pursuit
+from artifact_paths import artifact_path, default_output
 
 
 SEED_BANK_VERSION = 1
@@ -779,12 +781,15 @@ def main():
     parser.add_argument("mode", choices=["collect", "pretrain", "train", "evaluate"])
     parser.add_argument("--training-profile", choices=["auto", "plain", "warmstart"], default="auto")
     parser.add_argument("--env-config", type=Path, help="JSON object of QuadrotorPursuitConfig overrides")
-    parser.add_argument("--demos", type=Path, default=Path("outputs/pursuit_game_v2_demos.pt"))
-    parser.add_argument("--aux-demos", type=Path, help="DAgger corrections.pt used by PPO auxiliary replay")
+    parser.add_argument("--demos", type=artifact_path,
+                        default=default_output("pursuit_game_v2_demos.pt"))
+    parser.add_argument("--aux-demos", type=artifact_path,
+                        help="DAgger corrections.pt used by PPO auxiliary replay")
     parser.add_argument("--no-aux-demos", action="store_true",
                         help="Guarantee that no DAgger correction replay is loaded")
-    parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--out", type=Path, default=Path("outputs/pursuit_game_v2_run"))
+    parser.add_argument("--checkpoint", type=artifact_path)
+    parser.add_argument("--out", type=artifact_path,
+                        default=default_output("pursuit_game_v2_run"))
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--demo-seed", type=int, default=2000000)
     parser.add_argument("--demo-successes", type=int, default=10)
@@ -814,16 +819,16 @@ def main():
     parser.add_argument("--validation-interval", type=int, default=50)
     parser.add_argument("--validation-episodes", type=int, default=10)
     parser.add_argument("--validation-seed", type=int, default=4000000)
-    parser.add_argument("--train-seeds-file", type=Path,
+    parser.add_argument("--train-seeds-file", type=artifact_path,
                         help="MPC-solvable training seeds, one integer per line")
-    parser.add_argument("--validation-seeds-file", type=Path,
+    parser.add_argument("--validation-seeds-file", type=artifact_path,
                         help="Held-out validation seeds, one integer per line")
     parser.add_argument("--safeguard-drop", type=float, default=0.10)
     parser.add_argument("--safeguard-patience", type=int, default=2)
     parser.add_argument("--min-actor-lr", type=float, default=1e-5)
     parser.add_argument("--eval-seed", type=int, default=3000000)
     parser.add_argument("--eval-episodes", type=int, default=100)
-    parser.add_argument("--eval-seeds-file", type=Path,
+    parser.add_argument("--eval-seeds-file", type=artifact_path,
                         help="Held-out evaluation seeds, one integer per line")
     parser.add_argument("--methods", nargs="+", choices=["mappo", *BASELINES_3D], default=["mappo", "apf", "frpn", "mpc"])
     parser.add_argument("--correction-rounds", type=int, default=0)

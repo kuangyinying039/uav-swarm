@@ -198,27 +198,39 @@ class CooperativeGuidanceMPC3D:
             clearance = min(clearance, float(np.linalg.norm(point - closest)))
         return clearance
 
-    def actions(self, env) -> np.ndarray:
+    def plan(self, env) -> dict:
+        """Return proposed actions plus interceptor/flanker labels for offline datasets.
+
+        ``actions`` is identical to the historical ``actions()`` contract.
+        """
         if not hasattr(self, "previous_velocity"):
             self.reset(env)
         c = env.cfg
         dt = float(getattr(env, "current_decision_dt", c.decision_dt))
         positions = env.quadrotor_states[:, :3]
         tracks = [_local_track(env, i) for i in range(c.n_uavs)]
+        n_uavs = c.n_uavs
         actions = []
+        teacher_role = np.zeros(n_uavs, dtype=np.int64)
+        teacher_goal = np.zeros((n_uavs, 3), dtype=np.float32)
+        predicted_target = np.zeros((n_uavs, 3), dtype=np.float32)
+        candidate_velocity = np.zeros((n_uavs, 11, 3), dtype=np.float32)
+        selected_velocity = np.zeros((n_uavs, 3), dtype=np.float32)
         for i, state in enumerate(env.quadrotor_states):
             target_position, target_velocity = tracks[i]
             visible_peers = np.flatnonzero(env.policy_peer_mask(i))
             interceptor = int(visible_peers[np.argmin(np.linalg.norm(positions[visible_peers]-target_position, axis=1))])
             flankers = [agent for agent in visible_peers if agent != interceptor]
-            predicted_target = target_position + target_velocity * (self.horizon * dt)
+            predicted = target_position + target_velocity * (self.horizon * dt)
             if i == interceptor:
-                goal = predicted_target
+                goal = predicted
+                teacher_role[i] = 0
             else:
                 flank_rank = flankers.index(i)
                 evader_heading = math.atan2(target_velocity[1], target_velocity[0]) if np.linalg.norm(target_velocity[:2]) > 1e-6 else 0.0
                 angle = evader_heading + math.pi / 2.0 + flank_rank * math.pi
-                goal = predicted_target + self.flank_radius * np.array([math.cos(angle), math.sin(angle), 0.25])
+                goal = predicted + self.flank_radius * np.array([math.cos(angle), math.sin(angle), 0.25])
+                teacher_role[i] = 1
 
             direct = _unit(goal - state[:3])
             tangent = _unit(np.array([-direct[1], direct[0], 0.0]))
@@ -249,7 +261,21 @@ class CooperativeGuidanceMPC3D:
                     best_cost, best_velocity = cost, velocity
             self.previous_velocity[i] = best_velocity
             actions.append(_reference_action(env, i, best_velocity))
-        return np.asarray(actions)
+            teacher_goal[i] = goal
+            predicted_target[i] = predicted
+            candidate_velocity[i] = np.stack(candidates[:11])
+            selected_velocity[i] = best_velocity
+        return {
+            "actions": np.asarray(actions),
+            "teacher_role": teacher_role,
+            "teacher_goal": teacher_goal,
+            "predicted_target": predicted_target,
+            "candidate_velocity": candidate_velocity,
+            "selected_velocity": selected_velocity,
+        }
+
+    def actions(self, env) -> np.ndarray:
+        return self.plan(env)["actions"]
 
 
 BASELINES_3D = {
