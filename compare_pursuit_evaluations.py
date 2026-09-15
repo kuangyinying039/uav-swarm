@@ -14,9 +14,11 @@ from artifact_paths import artifact_path, default_output
 FIELDS = (
     "label", "episodes", "capture_rate", "capture_ci_low", "capture_ci_high",
     "mean_success_steps", "mean_censored_steps", "mean_team_visibility_ratio",
-    "mean_target_visibility_rate", "mean_uav_visibility_ratio", "mean_building_occlusion_ratio",
+    "mean_uav_visibility_ratio", "mean_building_occlusion_ratio",
     "mean_n_uavs_seeing_target", "mean_return", "mean_safety_interventions",
-    "mean_safety_correction_rate", "mean_emergency_stop_rate",
+    "mean_safety_correction_rate", "mean_safety_correction_magnitude",
+    "p90_safety_interventions", "safety_intervention_free_episode_rate",
+    "mean_emergency_stop_rate",
 )
 
 

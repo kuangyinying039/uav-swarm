@@ -21,7 +21,7 @@ def evaluate_policy(action_fn, env_cfg, seeds, method_name="matd3"):
         env = QuadrotorPursuitEnv(replace(env_cfg, seed=seed))
         obs, total, components = env.observe_search(), 0.0, {}
         collisions, safety, feasible = 0, 0, 0.0
-        correction, emergency = 0.0, 0.0
+        correction, correction_magnitude, emergency = 0.0, 0.0, 0.0
         visibility = 0.0
         closest_capture_gap = float(env.minimum_capture_gap())
         max_uavs_in_capture = _uavs_in_capture(env)
@@ -36,6 +36,7 @@ def evaluate_policy(action_fn, env_cfg, seeds, method_name="matd3"):
             safety += int(result.get("continuous_safety_interventions", 0))
             feasible += float(result.get("controller_feasible_rate", 0.0))
             correction += float(result.get("safety_correction_rate", 0.0))
+            correction_magnitude += float(result.get("safety_correction_magnitude", 0.0))
             emergency += float(result.get("emergency_stop_rate", 0.0))
             visibility += float(result.get("target_visibility_rate", 0.0))
             closest_capture_gap = min(
@@ -66,6 +67,8 @@ def evaluate_policy(action_fn, env_cfg, seeds, method_name="matd3"):
             "safety_interventions": safety,
             "controller_feasible_rate": feasible / (step + 1),
             "safety_correction_rate": correction / (step + 1),
+            "safety_correction_magnitude": correction_magnitude / (step + 1),
+            "safety_intervention_free": bool(safety == 0),
             "emergency_stop_rate": emergency / (step + 1),
             "target_visibility_rate": visibility / (step + 1),
             "closest_capture_gap": closest_capture_gap,
@@ -128,6 +131,13 @@ def summarize(rows, methods):
             "mean_safety_interventions": float(np.mean([row["safety_interventions"] for row in group])),
             "mean_controller_feasible_rate": float(np.mean([row["controller_feasible_rate"] for row in group])),
             "mean_safety_correction_rate": float(np.mean([row["safety_correction_rate"] for row in group])),
+            "mean_safety_correction_magnitude": float(
+                np.mean([row["safety_correction_magnitude"] for row in group])
+            ),
+            "p90_safety_interventions": float(np.percentile([row["safety_interventions"] for row in group], 90)),
+            "safety_intervention_free_episode_rate": float(
+                np.mean([row["safety_intervention_free"] for row in group])
+            ),
             "mean_emergency_stop_rate": float(np.mean([row["emergency_stop_rate"] for row in group])),
             "mean_target_visibility_rate": float(np.mean([row["target_visibility_rate"] for row in group])),
             "mean_max_uavs_in_capture": float(np.mean([row["max_uavs_in_capture"] for row in group])),

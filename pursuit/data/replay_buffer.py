@@ -138,9 +138,13 @@ def mix_batches(prior, online, batch_size, prior_fraction, device):
     if not 0.0 <= prior_fraction <= 1.0:
         raise ValueError("prior_fraction must be in [0, 1]")
     if prior_fraction == 0:
-        return online.sample(batch_size, device)
+        batch = online.sample(batch_size, device)
+        batch["is_prior"] = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        return batch
     if prior_fraction == 1:
-        return prior.sample(batch_size, device)
+        batch = prior.sample(batch_size, device)
+        batch["is_prior"] = torch.ones(batch_size, dtype=torch.bool, device=device)
+        return batch
     n_prior = int(round(batch_size * prior_fraction))
     n_prior = min(max(n_prior, 1), batch_size - 1) if 0 < prior_fraction < 1 else n_prior
     n_online = batch_size - n_prior
@@ -155,4 +159,8 @@ def mix_batches(prior, online, batch_size, prior_fraction, device):
             }
         else:
             merged[key] = torch.cat((prior_batch[key], online_batch[key]), dim=0)
+    merged["is_prior"] = torch.cat((
+        torch.ones(n_prior, dtype=torch.bool, device=device),
+        torch.zeros(n_online, dtype=torch.bool, device=device),
+    ))
     return merged

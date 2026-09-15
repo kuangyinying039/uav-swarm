@@ -26,7 +26,9 @@ FIELDS = (
     "environment_seconds", "ppo_update_seconds", "lidar_detection_ratio", "target_observation_ratio",
     "team_visibility_ratio", "uav_visibility_ratio", "building_occlusion_ratio",
     "mean_n_uavs_seeing_target",
-    "critic_loss", "actor_loss", "q1_mean", "q2_mean", "replay_size", "prior_size",
+    "critic_loss", "actor_loss", "actor_rl_loss", "demo_bc_loss", "demo_bc_weight",
+    "q1_mean", "q2_mean", "target_q_mean", "td_abs_mean", "q_disagreement",
+    "prior_batch_fraction", "replay_size", "prior_size",
     "env_steps", "matd3_updates", "exploration_std", "utd",
 )
 

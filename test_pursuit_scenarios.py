@@ -53,6 +53,34 @@ class ScenarioTests(unittest.TestCase):
                 self.assertEqual(env._count_uav_collisions()[0], 0)
                 self.assertFalse(env._capture_geometry()[0])
 
+    def test_radar5_benchmark_profiles_keep_contract_and_raise_difficulty(self):
+        root = Path(__file__).parent / "configs/pursuit_v2"
+        names = ("radar5_benchmark_nominal.json", "radar5_benchmark_medium.json",
+                 "radar5_benchmark_hard.json")
+        configs = [QuadrotorPursuitConfig(**json.loads((root / name).read_text(encoding="utf-8")))
+                   for name in names]
+        reference = configs[0]
+        reference_env = QuadrotorPursuitEnv(reference)
+        reference_shape = (reference_env.obs_dim(), reference_env.state_dim(),
+                           reference_env.continuous_action_dim())
+        for cfg in configs:
+            self.assertEqual((cfg.capture_mode, cfg.target_diameter, cfg.capture_required_uavs,
+                              cfg.capture_hold_steps, cfg.n_uavs, cfg.building_state_capacity),
+                             (reference.capture_mode, reference.target_diameter,
+                              reference.capture_required_uavs, reference.capture_hold_steps,
+                              reference.n_uavs, reference.building_state_capacity))
+            for seed in range(3):
+                env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(**{**cfg.__dict__, "seed": seed}))
+                self.assertTrue(env.direct_visibility_mask().all())
+                self.assertEqual((env.obs_dim(), env.state_dim(), env.continuous_action_dim()),
+                                 reference_shape)
+        self.assertLess(configs[0].target_speed, configs[1].target_speed)
+        self.assertLess(configs[1].target_speed, configs[2].target_speed)
+        self.assertLess(configs[0].handoff_formation_min_distance,
+                        configs[1].handoff_formation_min_distance)
+        self.assertLess(configs[1].handoff_formation_min_distance,
+                        configs[2].handoff_formation_min_distance)
+
     def test_mpc_agent_does_not_read_other_local_target_estimates(self):
         env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(building_count=0))
         before = CooperativeGuidanceMPC3D().actions(env)[0]

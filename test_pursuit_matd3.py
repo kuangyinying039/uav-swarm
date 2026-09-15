@@ -83,6 +83,7 @@ class PursuitMatd3Tests(unittest.TestCase):
         self.assertEqual(tuple(batch["actions"].shape), (6, env.cfg.n_uavs, 4))
         self.assertEqual(tuple(batch["state"].shape[0:1]), (6,))
         self.assertEqual(tuple(batch["next_active"].shape), (6, env.cfg.n_uavs))
+        self.assertEqual(int(batch["is_prior"].sum()), 3)
 
     def test_matd3_update_and_bc_actor_load(self):
         mappo = PursuitDemoTrainer(
@@ -113,6 +114,26 @@ class PursuitMatd3Tests(unittest.TestCase):
         self.assertTrue(np.isfinite(stats["critic_loss"]))
         self.assertTrue(stats["updated_actor"])
 
+    def test_demo_bc_regularizer_is_explicit_and_reports_drift(self):
+        trainer = self.trainer(demo_bc_weight=1.0, demo_bc_final_weight=0.25,
+                               demo_bc_decay_steps=10, prior_fraction=0.5)
+        env = QuadrotorPursuitEnv(self.env_cfg)
+        teacher = CooperativeGuidanceMPC3D()
+        teacher.reset(env)
+        obs = env.observe_search()
+        action, labels = teacher_step(teacher, env)
+        result = env.step_joint(action)
+        row = make_transition(obs, action, result, labels, np.ones(env.cfg.n_uavs, dtype=bool),
+                              ~env.disabled_uavs)
+        for _ in range(8):
+            trainer.prior_replay.add(row)
+            trainer.online_replay.add(row)
+        trainer.env_steps = 5
+        stats = update_matd3(trainer, trainer._sample_batch(), update_actor=True)
+        self.assertIsNotNone(stats["demo_bc_loss"])
+        self.assertAlmostEqual(stats["demo_bc_weight"], 0.625)
+        self.assertAlmostEqual(stats["prior_batch_fraction"], 0.5)
+
     def test_short_train_and_eval(self):
         trainer = self.trainer(episodes=1, warmup_steps=1, batch_size=2, replay_size=16)
         history = trainer.train(np.random.default_rng(4))
@@ -124,7 +145,16 @@ class PursuitMatd3Tests(unittest.TestCase):
         )
         self.assertEqual(result["summary"]["matd3"]["episodes"], 1)
         self.assertIn("near_miss_0_5m_failures", result["summary"]["matd3"])
+        self.assertIn("mean_safety_correction_magnitude", result["summary"]["matd3"])
+        self.assertIn("safety_intervention_free_episode_rate", result["summary"]["matd3"])
         self.assertIn("max_uavs_in_capture", result["rows"][0])
+
+    def test_flat_matd3_actor_ablation(self):
+        trainer = self.trainer(use_gat=False)
+        self.assertEqual(trainer.algorithm_name, "matd3")
+        env = QuadrotorPursuitEnv(self.env_cfg)
+        action = trainer.deterministic_action(env.observe_search())
+        self.assertEqual(action.shape, (env.cfg.n_uavs, 4))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from marl_trainers import tensorize_heterogeneous_graph
+from marl_trainers import FlatMLP, tensorize_heterogeneous_graph
 from pursuit.algorithms.matd3 import Matd3Config, update_matd3
 from pursuit.data.replay_buffer import JointReplayBuffer, mix_batches
 from pursuit.data.transition_dataset import flatten_transitions, make_transition
@@ -59,6 +59,10 @@ class Matd3Trainer:
             raise ValueError("MATD3 gamma must equal environment reward_gamma")
         if cfg.utd < 1 or cfg.policy_delay < 1:
             raise ValueError("UTD and policy delay must be positive")
+        if cfg.warmup_policy not in ("random", "actor"):
+            raise ValueError("warmup_policy must be 'random' or 'actor'")
+        if cfg.demo_bc_weight < 0 or cfg.demo_bc_final_weight < 0:
+            raise ValueError("demo BC weights must be non-negative")
         self.env_factory = env_factory
         self.cfg = cfg
         self.device = resolve_device(cfg.device)
@@ -67,12 +71,17 @@ class Matd3Trainer:
         self.state_dim = probe.state_dim()
         self.action_dim = int(probe.continuous_action_dim())
         self.environment_config = asdict(probe.cfg)
-        self.actor = PursuitGraphActor(
-            self.obs_dim, self.action_dim, cfg.hidden_dim, cfg.gat_heads, cfg.gat_layers,
-            dropout=0.0, spatial_scale=probe.cfg.grid_size,
-        ).to(self.device)
-        nn.init.orthogonal_(self.actor.head.weight, gain=0.01)
-        nn.init.zeros_(self.actor.head.bias)
+        if cfg.use_gat:
+            self.actor = PursuitGraphActor(
+                self.obs_dim, self.action_dim, cfg.hidden_dim, cfg.gat_heads, cfg.gat_layers,
+                dropout=0.0, spatial_scale=probe.cfg.grid_size,
+            ).to(self.device)
+            output_layer = self.actor.head
+        else:
+            self.actor = FlatMLP(self.obs_dim, self.action_dim, cfg.hidden_dim).to(self.device)
+            output_layer = self.actor.net[-1]
+        nn.init.orthogonal_(output_layer.weight, gain=0.01)
+        nn.init.zeros_(output_layer.bias)
         self.actor_target = deepcopy(self.actor).to(self.device).eval()
         for parameter in self.actor_target.parameters():
             parameter.requires_grad_(False)
@@ -97,7 +106,7 @@ class Matd3Trainer:
         self.train_seed_bank = []
         self.validation_seed_bank = []
         self.demo_metadata = {}
-        self.algorithm_name = "hgat_matd3"
+        self.algorithm_name = "hgat_matd3" if cfg.use_gat else "matd3"
 
     def load_actor_weights(self, state_dict):
         self.actor.load_state_dict(state_dict)
@@ -125,6 +134,7 @@ class Matd3Trainer:
         return np.clip(action + noise, -1.0, 1.0).astype(np.float32)
 
     def save_checkpoint(self, path, episode=None):
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "format_version": 1,
             "algorithm": self.algorithm_name,
@@ -147,7 +157,7 @@ class Matd3Trainer:
             "validation_records": self.validation_records,
             "best_capture_score": self.best_capture_score,
             "best_actor_state": self.best_actor_state,
-            "pursuit_graph_version": PURSUIT_GRAPH_VERSION,
+            "pursuit_graph_version": PURSUIT_GRAPH_VERSION if self.cfg.use_gat else None,
             "train_seed_bank": list(self.train_seed_bank),
             "validation_seed_bank": list(self.validation_seed_bank),
             "demo_metadata": self.demo_metadata,
@@ -158,7 +168,7 @@ class Matd3Trainer:
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if payload.get("algorithm") != self.algorithm_name:
             raise ValueError(f"Expected {self.algorithm_name}, got {payload.get('algorithm')!r}")
-        if payload.get("pursuit_graph_version") != PURSUIT_GRAPH_VERSION:
+        if self.cfg.use_gat and payload.get("pursuit_graph_version") != PURSUIT_GRAPH_VERSION:
             raise ValueError("Checkpoint actor graph version does not match PursuitGraphActor")
         for name, expected in (
             ("obs_dim", self.obs_dim),
@@ -226,7 +236,7 @@ class Matd3Trainer:
             visibility_totals = {}
             for step in range(env.cfg.search_steps):
                 active = ~env.disabled_uavs
-                if self.env_steps < self.cfg.warmup_steps:
+                if self.env_steps < self.cfg.warmup_steps and self.cfg.warmup_policy == "random":
                     action = rng.uniform(-1.0, 1.0, size=(self.n_agents, self.action_dim)).astype(np.float32)
                 else:
                     action = self.explore_action(obs, rng)
@@ -235,6 +245,15 @@ class Matd3Trainer:
                 self.online_replay.add(row)
                 self.env_steps += 1
                 last_stats = self._maybe_update() or last_stats
+                if (
+                    self.output_directory
+                    and self.cfg.step_checkpoint_interval > 0
+                    and self.env_steps % self.cfg.step_checkpoint_interval == 0
+                ):
+                    self.save_checkpoint(
+                        self.output_directory / "checkpoints" / f"step_{self.env_steps:09d}.pt",
+                        episode=episode,
+                    )
                 total_reward += float(result["reward"])
                 collisions += int(result.get("collisions", 0))
                 correction.append(float(result.get("safety_correction_rate", 0.0)))
@@ -265,8 +284,15 @@ class Matd3Trainer:
                 "controller_feasible_rate": float(result.get("controller_feasible_rate", 1.0)),
                 "critic_loss": last_stats.get("critic_loss"),
                 "actor_loss": last_stats.get("actor_loss"),
+                "actor_rl_loss": last_stats.get("actor_rl_loss"),
+                "demo_bc_loss": last_stats.get("demo_bc_loss"),
+                "demo_bc_weight": last_stats.get("demo_bc_weight"),
                 "q1_mean": last_stats.get("q1_mean"),
                 "q2_mean": last_stats.get("q2_mean"),
+                "target_q_mean": last_stats.get("target_q_mean"),
+                "td_abs_mean": last_stats.get("td_abs_mean"),
+                "q_disagreement": last_stats.get("q_disagreement"),
+                "prior_batch_fraction": last_stats.get("prior_batch_fraction"),
                 "replay_size": len(self.online_replay),
                 "prior_size": len(self.prior_replay),
                 "env_steps": self.env_steps,
@@ -304,7 +330,7 @@ class Matd3Trainer:
         self.actor.train()
         metrics = result["summary"]["matd3"]
         score = (metrics["capture_rate"], -metrics["mean_censored_steps"], metrics["mean_return"])
-        self.validation_records.append({"episode": episode, **metrics})
+        self.validation_records.append({"episode": episode, "env_steps": self.env_steps, **metrics})
         if score > self.best_capture_score:
             self.best_capture_score = score
             self.best_actor_state = {key: value.detach().cpu().clone() for key, value in self.actor.state_dict().items()}

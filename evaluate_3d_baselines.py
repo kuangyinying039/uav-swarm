@@ -33,7 +33,8 @@ def run_episode(method: str, seed: int, args) -> dict:
     initial_target = np.array([*env.dynamic_targets[0], env.target_altitudes[0]])
     initial_distance = float(np.mean(np.linalg.norm(env.quadrotor_states[:, :3] - initial_target, axis=1)))
     totals = dict(reward=0.0, visible=0.0, lost=0.0, reacquired=0.0, collisions=0.0,
-                  interventions=0.0, feasible=0.0, path_length=0.0, correction=0.0, emergency=0.0)
+                  interventions=0.0, feasible=0.0, path_length=0.0, correction=0.0,
+                  correction_magnitude=0.0, emergency=0.0)
     visibility_totals = {}
     result = {}
     executed = 0
@@ -48,6 +49,7 @@ def run_episode(method: str, seed: int, args) -> dict:
         totals["interventions"] += float(result.get("continuous_safety_interventions", 0.0))
         totals["feasible"] += float(result.get("controller_feasible_rate", 0.0))
         totals['correction'] += float(result.get('safety_correction_rate', 0.))
+        totals['correction_magnitude'] += float(result.get('safety_correction_magnitude', 0.))
         totals['emergency'] += float(result.get('emergency_stop_rate', 0.))
         totals["path_length"] += float(result.get("step_path_length", 0.0))
         accumulate_visibility(visibility_totals, result)
@@ -71,6 +73,8 @@ def run_episode(method: str, seed: int, args) -> dict:
         "safety_interventions": totals["interventions"],
         "controller_feasible_rate": totals["feasible"] / max(executed, 1),
         "safety_correction_rate": totals['correction'] / max(executed, 1),
+        "safety_correction_magnitude": totals['correction_magnitude'] / max(executed, 1),
+        "safety_intervention_free": bool(totals["interventions"] == 0),
         "emergency_stop_rate": totals['emergency'] / max(executed, 1),
         "path_length": totals["path_length"],
         "return": totals["reward"],
@@ -95,6 +99,15 @@ def summarize(rows: list[dict]) -> dict:
             "mean_safety_interventions": float(np.mean([row["safety_interventions"] for row in group])),
             "mean_controller_feasible_rate": float(np.mean([row["controller_feasible_rate"] for row in group])),
             "mean_safety_correction_rate": float(np.mean([row["safety_correction_rate"] for row in group])),
+            "mean_safety_correction_magnitude": float(
+                np.mean([row["safety_correction_magnitude"] for row in group])
+            ),
+            "p90_safety_interventions": float(
+                np.percentile([row["safety_interventions"] for row in group], 90)
+            ),
+            "safety_intervention_free_episode_rate": float(
+                np.mean([row["safety_intervention_free"] for row in group])
+            ),
             "mean_emergency_stop_rate": float(np.mean([row["emergency_stop_rate"] for row in group])),
             "mean_return": float(np.mean([row["return"] for row in group])),
         }

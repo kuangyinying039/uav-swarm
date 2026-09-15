@@ -13,7 +13,7 @@ from artifact_paths import SOURCE_ROOT, artifact_path, default_output
 from marl_trainers import seed_everything
 from pursuit.algorithms.matd3 import Matd3Config
 from pursuit.data.transition_dataset import collect_teacher_transitions, json_sidecar, load_transition_dataset
-from pursuit.eval import evaluate_methods
+from pursuit.eval import evaluate_methods, evaluate_policy
 from pursuit.trainers.matd3_trainer import Matd3Trainer, mean_actor_state_from_checkpoint
 from pursuit_baselines_3d import BASELINES_3D
 from pursuit_graph_encoder import PURSUIT_GRAPH_VERSION
@@ -46,6 +46,8 @@ def build_parser():
     parser.add_argument("--episodes", type=int, default=3000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--no-gat", action="store_true", default=None,
+                        help="Use a per-UAV MLP actor for the MATD3 representation ablation")
     parser.add_argument("--critic-hidden", type=int, default=256)
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
@@ -56,9 +58,18 @@ def build_parser():
     parser.add_argument("--exploration-std", type=float, default=0.12)
     parser.add_argument("--replay-size", type=int, default=500_000)
     parser.add_argument("--warmup-steps", type=int, default=8_000)
+    parser.add_argument(
+        "--warmup-policy", choices=["random", "actor"], default=None,
+        help="Use actor for warmup when preserving a BC/DAgger initialization",
+    )
     parser.add_argument("--utd", type=int, default=1)
     parser.add_argument("--prior-fraction", type=float, default=None,
                         help="Offline share of each batch; default 0.5 if --prior is set, else 0")
+    parser.add_argument("--demo-bc-weight", type=float,
+                        help="BC penalty on prior rows during actor updates; zero is pure MATD3")
+    parser.add_argument("--demo-bc-final-weight", type=float,
+                        help="Final BC weight after linear decay")
+    parser.add_argument("--demo-bc-decay-steps", type=int)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--validation-interval", type=int, default=50)
@@ -72,6 +83,8 @@ def build_parser():
     parser.add_argument("--methods", nargs="+", default=["matd3"],
                         choices=["matd3", "apf", "frpn", "mpc"])
     parser.add_argument("--checkpoint-interval", type=int, default=50)
+    parser.add_argument("--step-checkpoint-interval", type=int,
+                        help="Also save checkpoints every N environment steps; zero disables")
     return parser
 
 
@@ -79,6 +92,11 @@ def config_from_args(args, env_cfg, recorded=None):
     values = asdict(Matd3Config())
     if recorded:
         values.update({key: recorded[key] for key in values if key in recorded})
+    def selected(argument, key):
+        value = getattr(args, argument)
+        return values[key] if value is None else value
+
+    use_gat = values["use_gat"] if args.no_gat is None else not args.no_gat
     values.update(
         gamma=env_cfg.reward_gamma,
         actor_lr=args.actor_lr,
@@ -91,14 +109,20 @@ def config_from_args(args, env_cfg, recorded=None):
         batch_size=args.batch_size,
         replay_size=args.replay_size,
         warmup_steps=args.warmup_steps,
+        warmup_policy=selected("warmup_policy", "warmup_policy"),
         hidden_dim=args.hidden_dim,
+        use_gat=use_gat,
         critic_hidden=args.critic_hidden,
         utd=args.utd,
         prior_fraction=args.prior_fraction,
+        demo_bc_weight=selected("demo_bc_weight", "demo_bc_weight"),
+        demo_bc_final_weight=selected("demo_bc_final_weight", "demo_bc_final_weight"),
+        demo_bc_decay_steps=selected("demo_bc_decay_steps", "demo_bc_decay_steps"),
         device=args.device,
         episodes=args.episodes,
         checkpoint_interval=args.checkpoint_interval,
         validation_interval=args.validation_interval,
+        step_checkpoint_interval=selected("step_checkpoint_interval", "step_checkpoint_interval"),
     )
     if recorded:
         # Network widths must match the checkpoint; keep those even if CLI differs.
@@ -145,6 +169,8 @@ def main():
         if "env_config" in actor_init_payload:
             env_cfg = load_environment_config(actor_init_payload["env_config"])
         recorded = actor_init_payload.get("train_config", {})
+    if args.actor_init and args.no_gat:
+        parser.error("--actor-init contains an HGAT actor and cannot be combined with --no-gat")
     if args.prior_fraction is None:
         args.prior_fraction = float(recorded.get("prior_fraction", 0.5 if args.prior else 0.0))
     if not 0.0 <= args.prior_fraction <= 1.0:
@@ -152,6 +178,12 @@ def main():
     if args.prior_fraction > 0 and args.prior is None and args.mode == "train":
         parser.error("--prior-fraction > 0 requires --prior, including when resuming a checkpoint")
     cfg = config_from_args(args, env_cfg, recorded)
+    if min(cfg.demo_bc_weight, cfg.demo_bc_final_weight) < 0 or cfg.demo_bc_decay_steps < 1:
+        parser.error("demo BC weights must be non-negative and decay steps must be positive")
+    if cfg.step_checkpoint_interval < 0:
+        parser.error("--step-checkpoint-interval must be non-negative")
+    if (cfg.demo_bc_weight > 0 or cfg.demo_bc_final_weight > 0) and args.prior is None:
+        parser.error("demo BC regularization requires --prior")
     factory = lambda episode=0: QuadrotorPursuitEnv(
         replace(env_cfg, seed=seed_for_episode(train_bank, episode, args.seed))
     )
@@ -167,6 +199,12 @@ def main():
         trainer.demo_metadata["actor_init_algorithm"] = init.get("algorithm")
     if args.prior:
         trainer.load_prior(load_transition_dataset(args.prior, env_cfg))
+    trainer.demo_metadata["training_variant"] = (
+        "matd3_mlp"
+        if not cfg.use_gat
+        else "hgat_matd3_demo_bc" if cfg.demo_bc_weight > 0
+        else "hgat_matd3"
+    )
 
     if args.mode == "evaluate":
         if not args.checkpoint and not args.actor_init:
@@ -210,6 +248,10 @@ def main():
         except ValueError as error:
             parser.error(str(error))
     rng = np.random.default_rng(args.seed)
+    if trainer.start_episode == 0 and not trainer.history:
+        trainer.save_checkpoint(args.out / "initial.pt", episode=0)
+        if trainer.validation_seeds:
+            trainer.validate(0, evaluate_policy)
     history = trainer.train(rng)
     write_pursuit_outputs(args.out, history, [])
     print(json.dumps({"episodes": len(history), "env_steps": trainer.env_steps, "updates": trainer.total_updates}, indent=2))
