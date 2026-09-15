@@ -5,9 +5,9 @@ from __future__ import annotations
 import sys
 from lxml import etree
 from pptx import Presentation
+
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
-PNS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 
 
 etree.register_namespace("m", M)
@@ -63,13 +63,13 @@ def frac(num, den):
     return node
 
 
-def dmath(*inner):
+def dmath(*inner, beg="(", end=")"):
     node = etree.Element(me("d"))
     dpr = etree.SubElement(node, me("dPr"))
-    beg = etree.SubElement(dpr, me("begChr"))
-    beg.set(f"{{{M}}}val", "(")
-    end = etree.SubElement(dpr, me("endChr"))
-    end.set(f"{{{M}}}val", ")")
+    b = etree.SubElement(dpr, me("begChr"))
+    b.set(f"{{{M}}}val", beg)
+    e = etree.SubElement(dpr, me("endChr"))
+    e.set(f"{{{M}}}val", end)
     node.append(kids("e", inner))
     return node
 
@@ -80,6 +80,17 @@ def func(name, *args):
     fname = etree.SubElement(node, me("fName"))
     fname.append(kids("e", [r(name, "p")]))
     node.append(kids("e", args))
+    return node
+
+
+def nary(chr_val, subsc, supsc, *inner):
+    node = etree.Element(me("nary"))
+    pr = etree.SubElement(node, me("naryPr"))
+    ch = etree.SubElement(pr, me("chr"))
+    ch.set(f"{{{M}}}val", chr_val)
+    node.append(kids("sub", subsc if isinstance(subsc, (list, tuple)) else [subsc]))
+    node.append(kids("sup", supsc if isinstance(supsc, (list, tuple)) else [supsc]))
+    node.append(kids("e", inner))
     return node
 
 
@@ -134,6 +145,25 @@ def eq_link():
     ])
 
 
+def eq_ni():
+    return om([
+        sub(r("𝒩"), r("i")),
+        dmath(r("t")),
+        r(" = ", "p"),
+        dmath(
+            r("j ", "p"),
+            r("≠ ", "p"),
+            r("i ", "p"),
+            r("| ", "p"),
+            sub(r("A"), [r("i"), r(",", "p"), r("j"), r(",", "p"), r("t")]),
+            r(" = ", "p"),
+            r("1", "p"),
+            beg="{ ",
+            end=" }",
+        ),
+    ])
+
+
 def eq_p():
     return om([
         sub(r("P"), [r("i"), r(",", "p"), r("t")]),
@@ -147,6 +177,56 @@ def eq_p():
                 func("exp", r("−", "p"), sub(r("L"), [r("i"), r(",", "p"), r("t")]), r("(x)", "p")),
             ],
         ),
+    ])
+
+
+def eq_l():
+    return om([
+        sub(r("L"), [r("i"), r(",", "p"), r("t")]),
+        r("(x)", "p"),
+        r(" = ", "p"),
+        sub(r("L"), [r("i"), r(",", "p"), r("t"), r("−", "p"), r("1", "p")]),
+        r("(x)", "p"),
+        r(" + ", "p"),
+        sub(r("ℓ"), [r("i"), r(",", "p"), r("t")]),
+        r("(x)", "p"),
+        r(" − ", "p"),
+        sub(r("L"), r("0")),
+    ])
+
+
+def eq_e():
+    return om([
+        sub(r("E"), [r("i"), r(",", "p"), r("t")]),
+        r("(x)", "p"),
+        r(" = ", "p"),
+        func(
+            "exp",
+            r("−", "p"),
+            sub(r("k"), r("q")),
+            r("|", "p"),
+            sub(r("L"), [r("i"), r(",", "p"), r("t")]),
+            r("(x)|", "p"),
+        ),
+    ])
+
+
+def eq_rfield():
+    return om([
+        sub(r("R"), [r("i"), r(",", "p"), r("t")]),
+        r("(x)", "p"),
+        r(" = ", "p"),
+        dmath(r("1", "p"), r(" − ", "p"), r("α", "i")),
+        sub(r("R"), [r("i"), r(",", "p"), r("t"), r("−", "p"), r("1", "p")]),
+        r("(x)", "p"),
+        r(" + ", "p"),
+        r("α", "i"),
+        r(" + ", "p"),
+        r("β", "i"),
+        r(" ", "p"),
+        r("Δ", "p"),
+        sub(r("R"), [r("i"), r(",", "p"), r("t")]),
+        r("(x)", "p"),
     ])
 
 
@@ -208,7 +288,7 @@ def eq_att():
     ])
 
 
-def eq_r():
+def eq_reward():
     return om([
         sub(r("r"), r("t")),
         r(" = ", "p"),
@@ -223,14 +303,171 @@ def eq_r():
     ])
 
 
+def eq_dt():
+    return om([
+        sub(r("D"), r("t")),
+        r(" = ", "p"),
+        frac(
+            [r("|", "p"), r("𝒯", "i"), sub(r(""), r("found")), r("|", "p")],
+            [sub(r("N"), r("tgt"))],
+        ),
+    ])
+
+
+def eq_ct():
+    return om([
+        sub(r("C"), r("t")),
+        r(" = ", "p"),
+        frac([r("1", "p")], [r("|", "p"), r("𝒳", "i"), r("|", "p")]),
+        nary("∑", r("x", "i"), r("𝒳", "i"), r("|", "p"), r("2", "p"), sub(r("P"), r("t")), r("(x)", "p"), r(" − ", "p"), r("1", "p"), r("|", "p")),
+    ])
+
+
+def eq_t80():
+    return om([
+        sub(r("T"), r("80")),
+        r(" = ", "p"),
+        r("min", "p"),
+        dmath(r("t ", "p"), r("| ", "p"), sub(r("D"), r("t")), r(" ≥ ", "p"), r("0.8", "p"), beg="{ ", end=" }"),
+    ])
+
+
+def eq_clip():
+    return om([
+        sup(r("L"), [r("CLIP", "p")]),
+        dmath(r("θ")),
+        r(" = ", "p"),
+        r("Ê", "p"),
+        dmath(
+            r("min", "p"),
+            dmath(
+                sub(r("ρ"), r("t")),
+                dmath(r("θ")),
+                sub(r("Â"), r("t")),
+                r(" , ", "p"),
+                r("clip", "p"),
+                dmath(
+                    sub(r("ρ"), r("t")),
+                    dmath(r("θ")),
+                    r(" , ", "p"),
+                    r("1", "p"),
+                    r(" − ", "p"),
+                    r("ε", "i"),
+                    r(" , ", "p"),
+                    r("1", "p"),
+                    r(" + ", "p"),
+                    r("ε", "i"),
+                ),
+                sub(r("Â"), r("t")),
+            ),
+        ),
+    ])
+
+
+def eq_rho():
+    return om([
+        sub(r("ρ"), r("t")),
+        dmath(r("θ")),
+        r(" = ", "p"),
+        frac(
+            [sub(r("π"), r("θ")), dmath(sub(r("a"), r("t")), r(" | ", "p"), sub(r("o"), r("t")))],
+            [sub(r("π"), [r("θ", "i"), r("old", "p")]), dmath(sub(r("a"), r("t")), r(" | ", "p"), sub(r("o"), r("t")))],
+        ),
+    ])
+
+
+def eq_gae():
+    return om([
+        sub(r("Â"), r("t")),
+        r(" = ", "p"),
+        nary(
+            "∑",
+            r("l", "i"),
+            r("H", "i"),
+            sup(dmath(r("γλ", "i")), r("l")),
+            sub(r("δ"), [r("t"), r("+", "p"), r("l")]),
+        ),
+    ])
+
+
+def eq_delta():
+    return om([
+        sub(r("δ"), r("t")),
+        r(" = ", "p"),
+        sub(r("r"), r("t")),
+        r(" + ", "p"),
+        r("γ", "i"),
+        r("V", "p"),
+        dmath(sub(r("s"), [r("t"), r("+", "p"), r("1", "p")])),
+        r(" − ", "p"),
+        r("V", "p"),
+        dmath(sub(r("s"), r("t"))),
+    ])
+
+
+def eq_front():
+    return om([
+        r("q", "i"),
+        dmath(r("x")),
+        r(" = ", "p"),
+        r("E", "i"),
+        dmath(r("x")),
+        r(" + ", "p"),
+        r("0.15", "p"),
+        r(" ", "p"),
+        r("P", "i"),
+        dmath(r("x")),
+        r(" + ", "p"),
+        r("0.65", "p"),
+        r(" ", "p"),
+        r("R", "i"),
+        dmath(r("x")),
+    ])
+
+
+def eq_decpomdp():
+    return om([
+        r("𝒢", "i"),
+        r(" = ", "p"),
+        dmath(
+            r("𝒩", "i"),
+            r(" , ", "p"),
+            r("𝒮", "i"),
+            r(" , ", "p"),
+            dmath(sub(r("𝒜"), r("i"))),
+            r(" , ", "p"),
+            r("P", "p"),
+            r(" , ", "p"),
+            r("R", "p"),
+            r(" , ", "p"),
+            dmath(sub(r("𝒪"), r("i"))),
+            r(" , ", "p"),
+            r("γ", "i"),
+        ),
+    ])
+
+
 EQS = {
     "EQMOTION": eq_motion,
     "EQLINK": eq_link,
+    "EQNI": eq_ni,
     "EQP": eq_p,
+    "EQL": eq_l,
+    "EQE": eq_e,
+    "EQRFIELD": eq_rfield,
     "EQW": eq_w,
     "EQJSTAR": eq_jstar,
     "EQATT": eq_att,
-    "EQREWARD": eq_r,
+    "EQREWARD": eq_reward,
+    "EQDT": eq_dt,
+    "EQCT": eq_ct,
+    "EQT80": eq_t80,
+    "EQCLIP": eq_clip,
+    "EQRHO": eq_rho,
+    "EQGAE": eq_gae,
+    "EQDELTA": eq_delta,
+    "EQFRONT": eq_front,
+    "EQDEC": eq_decpomdp,
 }
 
 
@@ -253,10 +490,6 @@ def replace_placeholder(sld, key, builder):
     return found
 
 
-def ensure_math_ns(sld):
-    sld.set("{http://www.w3.org/2000/xmlns/}m", M)
-
-
 def main(path):
     prs = Presentation(path)
     total = 0
@@ -265,8 +498,8 @@ def main(path):
             total += replace_placeholder(slide._element, key, builder)
     prs.save(path)
     print(f"injected {total} OMML equations into {path}")
-    if total < 7:
-        print("WARNING: expected at least 7 equation placeholders", file=sys.stderr)
+    if total < 18:
+        print("WARNING: expected at least 18 equation placeholders", file=sys.stderr)
         sys.exit(1)
 
 
