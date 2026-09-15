@@ -36,7 +36,7 @@ def main():
         from train_pursuit_with_demos import load_environment_config, load_evaluation_environment_config
 
         payload = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-        expected = 'mappo' if args.method == 'mappo' else 'hgat_matd3'
+        expected = 'mappo_pursuit_3d_graph_v5' if args.method == 'mappo' else 'hgat_matd3'
         if payload.get('algorithm') != expected:
             parser.error(f"{args.checkpoint} contains {payload.get('algorithm')!r}, expected {expected!r}")
         checkpoint_cfg = load_environment_config(payload['env_config'])
