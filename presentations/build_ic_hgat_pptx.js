@@ -8,7 +8,8 @@ const PptxGenJS = require("pptxgenjs");
 const path = require("path");
 
 const A = "/tmp/ppt-work/assets";
-const P = path.join(A, "photos");
+const EQ = path.join(__dirname, "eq");
+const FONT = "Times New Roman";
 
 const BLUE = "2F5597";
 const BLUE_DK = "1E3F73";
@@ -49,6 +50,7 @@ const AR = {
   "photo_wf.png": 4.05 / 2.15,
   "photo_mr.png": 4.05 / 2.15,
 };
+Object.assign(AR, require(path.join(EQ, "ar.json")));
 
 function contain(slide, file, box) {
   const name = path.basename(file);
@@ -69,11 +71,27 @@ function contain(slide, file, box) {
   slide.addImage({ path: file, x, y, w, h });
 }
 
-function eqBox(slide, token, x, y, w, h, fs) {
-  slide.addText(token, {
-    x, y, w, h,
-    fontFace: "Cambria Math", fontSize: fs || 18, color: DARK,
-    align: "center", valign: "middle", margin: 0,
+function cover(slide, file, box) {
+  slide.addImage({
+    path: file,
+    x: box.x,
+    y: box.y,
+    w: box.w,
+    h: box.h,
+    sizing: { type: "cover", w: box.w, h: box.h },
+  });
+}
+
+function eqImg(slide, name, box) {
+  slide.addShape(pres.shapes.ROUNDED_RECTANGLE, {
+    x: box.x, y: box.y, w: box.w, h: box.h,
+    fill: { color: "F4EFE4" }, rectRadius: 0.05,
+  });
+  contain(slide, path.join(EQ, name + ".png"), {
+    x: box.x + 0.08,
+    y: box.y + 0.04,
+    w: box.w - 0.16,
+    h: box.h - 0.08,
   });
 }
 
@@ -87,14 +105,14 @@ function header(slide, section, subtitle) {
   contain(slide, path.join(A, "hust.png"), { x: 12.38, y: 0.06, w: 0.82, h: 0.54 });
   slide.addText(section, {
     x: 0.38, y: 0.08, w: 11.7, h: 0.48,
-    fontFace: "Calibri", fontSize: 26, bold: true, color: BLUE, margin: 0, valign: "middle",
+    fontFace: "Times New Roman", fontSize: 26, bold: true, color: BLUE, margin: 0, valign: "middle",
   });
   slide.addShape(pres.shapes.RECTANGLE, {
     x: 0, y: 0.62, w: 13.333, h: 0.52, fill: { color: BLUE },
   });
   slide.addText(subtitle, {
     x: 0.38, y: 0.64, w: 12.5, h: 0.48,
-    fontFace: "Calibri", fontSize: 20, bold: true, color: WHITE, margin: 0, valign: "middle",
+    fontFace: "Times New Roman", fontSize: 20, bold: true, color: WHITE, margin: 0, valign: "middle",
   });
 }
 
@@ -104,11 +122,11 @@ function footer(slide, n) {
   });
   slide.addText("CAC 2026  ·  IC-HGAT-MAPPO  ·  Dec-POMDP / CTDE / HGAT / MAPPO", {
     x: 0.38, y: 7.10, w: 11.9, h: 0.28,
-    fontFace: "Calibri", fontSize: 11, color: MUTED, margin: 0, valign: "middle",
+    fontFace: "Times New Roman", fontSize: 11, color: MUTED, margin: 0, valign: "middle",
   });
   slide.addText(String(n), {
     x: 12.40, y: 7.08, w: 0.70, h: 0.30,
-    fontFace: "Calibri", fontSize: 13, bold: true, color: BLUE, align: "right", margin: 0,
+    fontFace: "Times New Roman", fontSize: 13, bold: true, color: BLUE, align: "right", margin: 0,
   });
 }
 
@@ -204,24 +222,24 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   contain(s, path.join(A, "caa.png"), { x: 5.55, y: 0.28, w: 1.95, h: 1.10 });
   s.addText("Chinese Automation Congress  ·  CAC 2026", {
     x: 7.55, y: 0.42, w: 5.3, h: 0.80,
-    fontFace: "Calibri", fontSize: 18, color: BLUE, bold: true, margin: 0, valign: "middle",
+    fontFace: "Times New Roman", fontSize: 18, color: BLUE, bold: true, margin: 0, valign: "middle",
   });
   s.addShape(pres.shapes.RECTANGLE, { x: 0, y: 1.55, w: 13.333, h: 3.35, fill: { color: BLUE } });
   s.addText("A Heterogeneous Graph-Attention MAPPO Algorithm\nfor Cooperative Multi-UAV Search\nunder Intermittent Communication Constraints", {
     x: 0.45, y: 1.65, w: 12.4, h: 3.15,
-    fontFace: "Calibri", fontSize: 30, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 30, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
   });
   s.addText("Yinying Kuang, Zhaowei Liang, Yongran Zhi, Huijin Fan*, Lei Liu*, Bo Wang*", {
     x: 0.5, y: 5.05, w: 12.3, h: 0.50,
-    fontFace: "Calibri", fontSize: 18, color: DARK, align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 18, color: DARK, align: "center", valign: "middle", margin: 0,
   });
   s.addText("Huazhong University of Science and Technology\nWuhan Second Ship Design and Research Institute", {
     x: 0.5, y: 5.55, w: 12.3, h: 0.78,
-    fontFace: "Calibri", fontSize: 17, color: MUTED, align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 17, color: MUTED, align: "center", valign: "middle", margin: 0,
   });
   s.addText("CAC 2026  ·  Beijing  ·  October 2026", {
     x: 0.5, y: 6.32, w: 12.3, h: 0.36,
-    fontFace: "Calibri", fontSize: 17, color: BLUE, align: "center", bold: true, valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 17, color: BLUE, align: "center", bold: true, valign: "middle", margin: 0,
   });
   const chips = ["Dec-POMDP", "Intermittent links", "P / E / R memory", "History-aware source", "HGAT + MAPPO / CTDE"];
   chips.forEach((c, i) => {
@@ -231,7 +249,7 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     });
     s.addText(c, {
       x, y: 6.78, w: 2.48, h: 0.48,
-      fontFace: "Calibri", fontSize: 11, bold: true, color: BLUE_DK, align: "center", valign: "middle", margin: 0,
+      fontFace: "Times New Roman", fontSize: 11, bold: true, color: BLUE_DK, align: "center", valign: "middle", margin: 0,
     });
   });
   notes(s, N[0]);
@@ -245,7 +263,7 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   contain(s, path.join(A, "hust.png"), { x: 12.38, y: 0.10, w: 0.82, h: 0.54 });
   s.addText("CONTENTS", {
     x: 0.38, y: 0.12, w: 11.7, h: 0.50,
-    fontFace: "Calibri", fontSize: 28, bold: true, color: BLUE, margin: 0, valign: "middle",
+    fontFace: "Times New Roman", fontSize: 28, bold: true, color: BLUE, margin: 0, valign: "middle",
   });
   s.addShape(pres.shapes.RECTANGLE, { x: 0, y: 0.72, w: 13.333, h: 0.14, fill: { color: BLUE } });
   s.addShape(pres.shapes.ROUNDED_RECTANGLE, {
@@ -253,7 +271,7 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   });
   s.addText("A 13-page academic talk  ·  problem first, then IC-HGAT-MAPPO, then evidence", {
     x: 0.42, y: 1.15, w: 12.45, h: 0.52,
-    fontFace: "Calibri", fontSize: 16, italic: true, color: BLUE_DK, align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 16, italic: true, color: BLUE_DK, align: "center", valign: "middle", margin: 0,
   });
   const items = [
     ["01", "Background and Problem Formulation", "Applications  →  three challenges  →  Q1–Q3 mapping\nDec-POMDP under intermittent links  Aij,t"],
@@ -268,15 +286,15 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     });
     s.addText(it[0], {
       x: 0.55, y: y + 0.28, w: 1.35, h: 0.95,
-      fontFace: "Calibri", fontSize: 28, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
+      fontFace: "Times New Roman", fontSize: 28, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
     });
     s.addText(it[1], {
       x: 2.10, y: y + 0.12, w: 10.55, h: 0.48,
-      fontFace: "Calibri", fontSize: 22, bold: true, color: DARK, valign: "middle", margin: 0,
+      fontFace: "Times New Roman", fontSize: 22, bold: true, color: DARK, valign: "middle", margin: 0,
     });
     s.addText(it[2], {
       x: 2.10, y: y + 0.62, w: 10.55, h: 0.72,
-      fontFace: "Calibri", fontSize: 16, color: MUTED, valign: "middle", margin: 0,
+      fontFace: "Times New Roman", fontSize: 16, color: MUTED, valign: "middle", margin: 0,
     });
   });
   footer(s, 2);
@@ -296,22 +314,22 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   ];
   photos.forEach((ph, i) => {
     const x = 0.40 + i * 4.30;
-    contain(s, ph[0], { x, y: 1.22, w: 4.05, h: 1.85 });
+    cover(s, ph[0], { x, y: 1.20, w: 4.05, h: 2.18 });
     s.addText(ph[1], {
-      x, y: 3.08, w: 4.05, h: 0.32,
-      fontFace: "Calibri", fontSize: 15, bold: true, color: DARK, align: "center", valign: "middle", margin: 0,
+      x, y: 3.40, w: 4.05, h: 0.30,
+      fontFace: FONT, fontSize: 15, bold: true, color: DARK, align: "center", valign: "middle", margin: 0,
     });
   });
-  card(s, 0.40, 3.42, 12.55, 1.12, WHITE);
+  card(s, 0.40, 3.74, 12.55, 0.92, WHITE);
   s.addText("Dec-POMDP  (partial observation, joint reward, no assumed global map)", {
-    x: 0.55, y: 3.46, w: 12.25, h: 0.32,
-    fontFace: "Calibri", fontSize: 14, bold: true, color: BLUE, margin: 0, valign: "middle",
+    x: 0.55, y: 3.76, w: 12.25, h: 0.26,
+    fontFace: FONT, fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle",
   });
-  eqBox(s, "EQDEC", 0.45, 3.76, 12.40, 0.68, 16);
-  s.addShape(pres.shapes.RECTANGLE, { x: 0.40, y: 4.62, w: 12.55, h: 0.38, fill: { color: GRAY } });
+  eqImg(s, "dec", { x: 0.50, y: 4.02, w: 12.35, h: 0.56 });
+  s.addShape(pres.shapes.RECTANGLE, { x: 0.40, y: 4.74, w: 12.55, h: 0.34, fill: { color: GRAY } });
   s.addText("Global / reliable information    →     Local observation + intermittent communication    ·    More realistic, more challenging", {
-    x: 0.50, y: 4.62, w: 12.35, h: 0.38,
-    fontFace: "Calibri", fontSize: 13, color: DARK, align: "center", valign: "middle", margin: 0,
+    x: 0.50, y: 4.74, w: 12.35, h: 0.34,
+    fontFace: FONT, fontSize: 13, color: DARK, align: "center", valign: "middle", margin: 0,
   });
 
   const cols = [
@@ -321,15 +339,15 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   ];
   cols.forEach((c, i) => {
     const x = 0.40 + i * 4.30;
-    card(s, x, 5.08, 4.05, 1.88, c[2]);
-    accent(s, x, 5.08, 1.88);
+    card(s, x, 5.16, 4.05, 1.80, c[2]);
+    accent(s, x, 5.16, 1.80);
     s.addText(c[0], {
-      x: x + 0.18, y: 5.14, w: 3.72, h: 0.34,
-      fontFace: "Calibri", fontSize: 15, bold: true, color: c[3], margin: 0, valign: "middle",
+      x: x + 0.18, y: 5.22, w: 3.72, h: 0.34,
+      fontFace: FONT, fontSize: 15, bold: true, color: c[3], margin: 0, valign: "middle",
     });
     s.addText(c[1], {
-      x: x + 0.18, y: 5.48, w: 3.72, h: 1.38,
-      fontFace: "Calibri", fontSize: 13, color: DARK, margin: 0, valign: "middle",
+      x: x + 0.18, y: 5.54, w: 3.72, h: 1.32,
+      fontFace: FONT, fontSize: 13, color: DARK, margin: 0, valign: "middle",
     });
   });
   footer(s, 3);
@@ -358,23 +376,26 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     s.addShape(pres.shapes.RECTANGLE, { x, y: 1.22, w: 4.15, h: 0.44, fill: { color: i === 2 ? RED : BLUE } });
     s.addText(t[0], {
       x: x + 0.10, y: 1.24, w: 3.95, h: 0.40,
-      fontFace: "Calibri", fontSize: 13, bold: true, color: WHITE, margin: 0, valign: "middle",
+      fontFace: "Times New Roman", fontSize: 13, bold: true, color: WHITE, margin: 0, valign: "middle",
     });
-    contain(s, path.join(A, t[1]), { x: x + 0.12, y: 1.74, w: 3.90, h: 1.85 });
+    s.addShape(pres.shapes.RECTANGLE, {
+      x: x + 0.12, y: 1.74, w: 3.90, h: 2.05, fill: { color: GRAY },
+    });
+    contain(s, path.join(A, t[1]), { x: x + 0.12, y: 1.74, w: 3.90, h: 2.05 });
     s.addText(bodies[i], {
-      x: x + 0.16, y: 3.62, w: 3.82, h: 1.62,
-      fontFace: "Calibri", fontSize: 13, color: DARK, margin: 0, valign: "middle",
+      x: x + 0.16, y: 3.82, w: 3.82, h: 1.42,
+      fontFace: FONT, fontSize: 13, color: DARK, margin: 0, valign: "middle",
     });
   });
   card(s, 0.35, 5.48, 12.62, 1.48, BLUE_LT);
   s.addText("Instantaneous neighbor set used by the policy (not a delayed topology)", {
-    x: 0.50, y: 5.54, w: 12.32, h: 0.28,
-    fontFace: "Calibri", fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle",
+    x: 0.50, y: 5.52, w: 12.32, h: 0.26,
+    fontFace: FONT, fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle",
   });
-  eqBox(s, "EQNI", 0.40, 5.82, 12.50, 0.58, 16);
+  eqImg(s, "ni", { x: 0.50, y: 5.80, w: 12.32, h: 0.62 });
   s.addText("Focus: cooperative decision-making under communication constraints, rather than protocol optimization.", {
-    x: 0.50, y: 6.42, w: 12.32, h: 0.42,
-    fontFace: "Calibri", fontSize: 14, italic: true, color: BLUE_DK, align: "center", valign: "middle", margin: 0,
+    x: 0.50, y: 6.46, w: 12.32, h: 0.40,
+    fontFace: FONT, fontSize: 14, italic: true, color: BLUE_DK, align: "center", valign: "middle", margin: 0,
   });
   footer(s, 4);
   notes(s, N[3]);
@@ -395,24 +416,24 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     const x = 0.35 + i * 3.15;
     card(s, x, 1.22, 3.00, 2.55, WHITE);
     accent(s, x, 1.22, 2.55);
-    s.addText(m[0], { x, y: 1.28, w: 3.00, h: 0.28, fontFace: "Calibri", fontSize: 12, color: MUTED, align: "center", margin: 0, valign: "middle" });
-    s.addText(m[1], { x: x + 0.10, y: 1.54, w: 2.80, h: 0.42, fontFace: "Calibri", fontSize: 14, bold: true, color: DARK, align: "center", margin: 0, valign: "middle" });
+    s.addText(m[0], { x, y: 1.28, w: 3.00, h: 0.28, fontFace: "Times New Roman", fontSize: 12, color: MUTED, align: "center", margin: 0, valign: "middle" });
+    s.addText(m[1], { x: x + 0.10, y: 1.54, w: 2.80, h: 0.42, fontFace: "Times New Roman", fontSize: 14, bold: true, color: DARK, align: "center", margin: 0, valign: "middle" });
     s.addShape(pres.shapes.DOWN_ARROW, { x: x + 1.15, y: 1.98, w: 0.70, h: 0.28, fill: { color: m[3] } });
-    s.addText(m[2], { x: x + 0.08, y: 2.28, w: 2.84, h: 1.32, fontFace: "Calibri", fontSize: 14, bold: true, color: m[3], align: "center", margin: 0, valign: "middle" });
+    s.addText(m[2], { x: x + 0.08, y: 2.28, w: 2.84, h: 1.32, fontFace: "Times New Roman", fontSize: 14, bold: true, color: m[3], align: "center", margin: 0, valign: "middle" });
   });
   card(s, 9.85, 1.22, 3.12, 2.55, BLUE);
   s.addText("Learning (CTDE)", {
-    x: 10.00, y: 1.32, w: 2.85, h: 0.36, fontFace: "Calibri", fontSize: 15, bold: true, color: WHITE, margin: 0, valign: "middle",
+    x: 10.00, y: 1.32, w: 2.85, h: 0.36, fontFace: "Times New Roman", fontSize: 15, bold: true, color: WHITE, margin: 0, valign: "middle",
   });
   s.addText("Shared actor  pi(a|o)\nCentralized critic V(s)\nMAPPO: clip + GAE\nCommon safety projection", {
-    x: 10.00, y: 1.70, w: 2.85, h: 1.90, fontFace: "Calibri", fontSize: 14, color: WHITE, margin: 0, valign: "middle",
+    x: 10.00, y: 1.70, w: 2.85, h: 1.90, fontFace: "Times New Roman", fontSize: 14, color: WHITE, margin: 0, valign: "middle",
   });
 
   s.addShape(pres.shapes.ROUNDED_RECTANGLE, {
     x: 0.35, y: 3.90, w: 12.62, h: 3.05, fill: { color: BLUE_LT }, rectRadius: 0.08,
   });
   s.addText("From three questions to one algorithm  ·  IC-HGAT-MAPPO", {
-    x: 0.55, y: 3.98, w: 12.22, h: 0.36, fontFace: "Calibri", fontSize: 16, bold: true, color: BLUE_DK, margin: 0, valign: "middle",
+    x: 0.55, y: 3.98, w: 12.22, h: 0.36, fontFace: "Times New Roman", fontSize: 16, bold: true, color: BLUE_DK, margin: 0, valign: "middle",
   });
   const qs = [
     ["Q1", "How to maintain useful beliefs without global map sharing?", "Bayesian log-odds L  →  P, E, R"],
@@ -426,15 +447,15 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     });
     s.addText(q[0], {
       x: 0.52, y, w: 0.72, h: 0.64,
-      fontFace: "Calibri", fontSize: 16, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
+      fontFace: "Times New Roman", fontSize: 16, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
     });
     s.addText(q[1], {
       x: 1.38, y, w: 7.85, h: 0.36,
-      fontFace: "Calibri", fontSize: 14, bold: true, color: DARK, margin: 0, valign: "middle",
+      fontFace: "Times New Roman", fontSize: 14, bold: true, color: DARK, margin: 0, valign: "middle",
     });
     s.addText(q[2], {
       x: 1.38, y: y + 0.32, w: 7.85, h: 0.30,
-      fontFace: "Calibri", fontSize: 13, italic: true, color: MUTED, margin: 0, valign: "middle",
+      fontFace: "Times New Roman", fontSize: 13, italic: true, color: MUTED, margin: 0, valign: "middle",
     });
   });
   s.addShape(pres.shapes.RIGHT_ARROW, { x: 9.40, y: 5.35, w: 0.50, h: 0.30, fill: { color: BLUE } });
@@ -443,11 +464,11 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   });
   s.addText("IC-HGAT-\nMAPPO", {
     x: 10.05, y: 4.88, w: 2.65, h: 1.00,
-    fontFace: "Calibri", fontSize: 20, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 20, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
   });
   s.addText("exec: local only\ntrain: global critic", {
     x: 10.05, y: 5.90, w: 2.65, h: 0.55,
-    fontFace: "Calibri", fontSize: 12, color: "D6E2F5", align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 12, color: "D6E2F5", align: "center", valign: "middle", margin: 0,
   });
   footer(s, 5);
   notes(s, N[4]);
@@ -459,37 +480,38 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
 {
   const s = pres.addSlide();
   header(s, "2. Proposed IC-HGAT-MAPPO", "2.1 Problem Formulation");
+  card(s, 0.28, 1.18, 6.40, 3.10, WHITE);
   contain(s, path.join(A, "fig1.png"), { x: 0.28, y: 1.20, w: 6.40, h: 3.05 });
   s.addText("Fig. 1  Local sensing, intermittent links, moving targets, dynamic obstacles", {
-    x: 0.28, y: 4.26, w: 6.40, h: 0.28, fontFace: "Calibri", fontSize: 11, italic: true, color: MUTED, margin: 0, valign: "middle",
+    x: 0.28, y: 4.26, w: 6.40, h: 0.28, fontFace: "Times New Roman", fontSize: 11, italic: true, color: MUTED, margin: 0, valign: "middle",
   });
   card(s, 0.28, 4.56, 6.40, 2.40, GRAY);
-  s.addText("Scenario  ·  sensing / comm. radii", { x: 0.42, y: 4.60, w: 6.10, h: 0.28, fontFace: "Calibri", fontSize: 14, bold: true, color: BLUE, margin: 0, valign: "middle" });
-  s.addText("6 UAVs · 15 targets · 10 obstacles · 30×30 grid\nAction: 8 directions + hover     Horizon T=200\nRs = 2 cells (10 m)    Rc = 10 cells (50 m)\ndt in [0.45, 1.0] s    ·    policy uses only N_i(t)", {
-    x: 0.42, y: 4.90, w: 6.10, h: 1.92, fontFace: "Calibri", fontSize: 14, color: DARK, margin: 0, valign: "middle",
+  s.addText("Scenario  ·  sensing / comm. radii", { x: 0.42, y: 4.60, w: 6.10, h: 0.28, fontFace: "Times New Roman", fontSize: 14, bold: true, color: BLUE, margin: 0, valign: "middle" });
+  s.addText("6 UAVs · 15 targets · 10 obstacles · 30×30 grid\nAction: 8 directions + hover     Horizon T=200\nRs = 2 cells (10 m)    Rc = 10 cells (50 m)\ndt in [0.45, 1.0] s    ·    policy uses only N_i(t)\nOccupancy |X|=900 cells   ·   moving targets and obstacles\nReport D_t, C_t and T_80 on 30 held-out scenarios", {
+    x: 0.42, y: 4.90, w: 6.10, h: 1.92, fontFace: FONT, fontSize: 14, color: DARK, margin: 0, valign: "middle",
   });
 
-  card(s, 6.85, 1.18, 6.15, 1.42, WHITE);
-  s.addText("Motion model  (feasible-set projection)", { x: 6.98, y: 1.20, w: 5.90, h: 0.26, fontFace: "Calibri", fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle" });
-  eqBox(s, "EQMOTION", 6.90, 1.44, 6.02, 0.70, 16);
+  card(s, 6.85, 1.18, 6.15, 1.48, WHITE);
+  s.addText("Motion model  (feasible-set projection)", { x: 6.98, y: 1.20, w: 5.90, h: 0.24, fontFace: FONT, fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle" });
+  eqImg(s, "motion", { x: 6.95, y: 1.44, w: 5.95, h: 0.72 });
   s.addText("Discrete kinematics with adaptive decision interval dt", {
-    x: 6.98, y: 2.16, w: 5.90, h: 0.36, fontFace: "Calibri", fontSize: 12, italic: true, color: MUTED, margin: 0, valign: "middle",
+    x: 6.98, y: 2.18, w: 5.90, h: 0.40, fontFace: FONT, fontSize: 12, italic: true, color: MUTED, margin: 0, valign: "middle",
   });
 
-  card(s, 6.85, 2.68, 6.15, 1.58, WHITE);
-  s.addText("Communication constraint", { x: 6.98, y: 2.72, w: 5.90, h: 0.24, fontFace: "Calibri", fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle" });
-  eqBox(s, "EQLINK", 6.88, 2.94, 6.08, 0.72, 14);
+  card(s, 6.85, 2.74, 6.15, 1.52, WHITE);
+  s.addText("Communication constraint", { x: 6.98, y: 2.76, w: 5.90, h: 0.24, fontFace: FONT, fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle" });
+  eqImg(s, "link", { x: 6.95, y: 3.00, w: 5.95, h: 0.72 });
   s.addText("Only instantaneous reachable links enter the policy", {
-    x: 6.98, y: 3.68, w: 5.90, h: 0.46, fontFace: "Calibri", fontSize: 13, bold: true, color: RED, margin: 0, valign: "middle",
+    x: 6.98, y: 3.74, w: 5.90, h: 0.42, fontFace: FONT, fontSize: 13, bold: true, color: RED, margin: 0, valign: "middle",
   });
 
   card(s, 6.85, 4.34, 6.15, 2.62, BLUE_LT);
-  s.addText("Evaluation  ·  higher Dt, Ct better; lower T80 faster", { x: 6.98, y: 4.38, w: 5.90, h: 0.26, fontFace: "Calibri", fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle" });
-  eqBox(s, "EQDT", 6.88, 4.64, 6.08, 0.58, 15);
-  eqBox(s, "EQCT", 6.88, 5.20, 6.08, 0.70, 14);
-  eqBox(s, "EQT80", 6.88, 5.88, 6.08, 0.58, 15);
+  s.addText("Evaluation  ·  higher Dt, Ct better; lower T80 faster", { x: 6.98, y: 4.36, w: 5.90, h: 0.24, fontFace: FONT, fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle" });
+  eqImg(s, "dt", { x: 6.95, y: 4.62, w: 5.95, h: 0.58 });
+  eqImg(s, "ct", { x: 6.95, y: 5.24, w: 5.95, h: 0.70 });
+  eqImg(s, "t80", { x: 6.95, y: 5.98, w: 5.95, h: 0.54 });
   s.addText("Ct: cell-wise decisiveness of occupancy beliefs", {
-    x: 6.98, y: 6.46, w: 5.90, h: 0.38, fontFace: "Calibri", fontSize: 12, italic: true, color: MUTED, margin: 0, valign: "middle",
+    x: 6.98, y: 6.54, w: 5.90, h: 0.34, fontFace: FONT, fontSize: 12, italic: true, color: MUTED, margin: 0, valign: "middle",
   });
   footer(s, 6);
   notes(s, N[5]);
@@ -513,17 +535,17 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   feats.forEach((f, i) => {
     const x = 0.28 + (i % 6) * 2.16;
     card(s, x, 4.30, 2.08, 1.22, i === 5 ? "FFF3E8" : BLUE_LT);
-    s.addText(f[0], { x: x + 0.08, y: 4.36, w: 1.92, h: 0.36, fontFace: "Calibri", fontSize: 13, bold: true, color: BLUE_DK, margin: 0, valign: "middle" });
-    s.addText(f[1], { x: x + 0.08, y: 4.72, w: 1.92, h: 0.68, fontFace: "Calibri", fontSize: 12, color: DARK, margin: 0, valign: "middle" });
+    s.addText(f[0], { x: x + 0.08, y: 4.36, w: 1.92, h: 0.36, fontFace: "Times New Roman", fontSize: 13, bold: true, color: BLUE_DK, margin: 0, valign: "middle" });
+    s.addText(f[1], { x: x + 0.08, y: 4.72, w: 1.92, h: 0.68, fontFace: "Times New Roman", fontSize: 12, color: DARK, margin: 0, valign: "middle" });
   });
   s.addShape(pres.shapes.ROUNDED_RECTANGLE, {
     x: 0.28, y: 5.62, w: 12.78, h: 1.32, fill: { color: GRAY }, rectRadius: 0.08,
   });
   s.addText("CTDE  ·  execution uses local + reachable information only; the critic sees global s only in training.", {
-    x: 0.42, y: 5.68, w: 12.50, h: 0.32, fontFace: "Calibri", fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle",
+    x: 0.42, y: 5.68, w: 12.50, h: 0.32, fontFace: "Times New Roman", fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle",
   });
   s.addText("Safety projection is shared by Heuristic, QMIX, Local, Homogeneous-Graph, and IC-HGAT-MAPPO — not a contribution and not the source of the gains.\nDecentralized execution  ·  communication-aware masking  ·  centralized training with MAPPO.", {
-    x: 0.42, y: 6.02, w: 12.50, h: 0.80, fontFace: "Calibri", fontSize: 13, color: DARK, margin: 0, valign: "middle",
+    x: 0.42, y: 6.02, w: 12.50, h: 0.80, fontFace: "Times New Roman", fontSize: 13, color: DARK, margin: 0, valign: "middle",
   });
   footer(s, 7);
   notes(s, N[6]);
@@ -538,37 +560,37 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   card(s, 0.28, 1.18, 6.45, 5.78, WHITE);
   accent(s, 0.28, 1.18, 5.78);
   s.addText("Revisit-Aware P/E/R Memory", {
-    x: 0.46, y: 1.22, w: 6.10, h: 0.34, fontFace: "Calibri", fontSize: 16, bold: true, color: BLUE, margin: 0, valign: "middle",
+    x: 0.46, y: 1.22, w: 6.10, h: 0.34, fontFace: "Times New Roman", fontSize: 16, bold: true, color: BLUE, margin: 0, valign: "middle",
   });
-  contain(s, path.join(A, "per_maps.png"), { x: 0.42, y: 1.56, w: 6.15, h: 1.55 });
-  eqBox(s, "EQL", 0.36, 3.12, 6.25, 0.58, 14);
-  eqBox(s, "EQP", 0.36, 3.68, 6.25, 0.55, 14);
-  eqBox(s, "EQE", 0.36, 4.22, 6.25, 0.52, 14);
-  eqBox(s, "EQRFIELD", 0.36, 4.72, 6.25, 0.58, 13);
-  eqBox(s, "EQFRONT", 0.36, 5.28, 6.25, 0.52, 14);
+  contain(s, path.join(A, "per_maps.png"), { x: 0.42, y: 1.58, w: 6.15, h: 1.72 });
+  eqImg(s, "L", { x: 0.42, y: 3.36, w: 6.15, h: 0.48 });
+  eqImg(s, "P", { x: 0.42, y: 3.88, w: 6.15, h: 0.48 });
+  eqImg(s, "E", { x: 0.42, y: 4.40, w: 6.15, h: 0.48 });
+  eqImg(s, "Rfield", { x: 0.42, y: 4.92, w: 6.15, h: 0.48 });
+  eqImg(s, "front", { x: 0.42, y: 5.44, w: 6.15, h: 0.48 });
   s.addText("Sensed cells: R <- 0.    Unsensed: alpha=0.035 aging, beta=0.08 diffusion.\nFrontier score q nominates task nodes for HGAT.", {
-    x: 0.46, y: 5.82, w: 6.10, h: 0.98, fontFace: "Calibri", fontSize: 12, color: MUTED, margin: 0, valign: "middle",
+    x: 0.46, y: 5.96, w: 6.10, h: 0.88, fontFace: FONT, fontSize: 12, color: MUTED, margin: 0, valign: "middle",
   });
 
   card(s, 6.90, 1.18, 6.12, 5.78, WHITE);
   accent(s, 6.90, 1.18, 5.78);
   s.addText("Communication-History-Aware Source Selection", {
-    x: 7.08, y: 1.22, w: 5.78, h: 0.40, fontFace: "Calibri", fontSize: 14, bold: true, color: ORANGE, margin: 0, valign: "middle",
+    x: 7.08, y: 1.22, w: 5.78, h: 0.40, fontFace: "Times New Roman", fontSize: 14, bold: true, color: ORANGE, margin: 0, valign: "middle",
   });
-  contain(s, path.join(A, "source.png"), { x: 7.05, y: 1.64, w: 5.80, h: 1.85 });
-  s.addText("βd = 0.28     ·     δ = 0.82 history decay     ·     gj,t = outage age", {
-    x: 7.08, y: 3.52, w: 5.78, h: 0.32, fontFace: "Calibri", fontSize: 12, color: MUTED, margin: 0, valign: "middle",
+  contain(s, path.join(A, "source.png"), { x: 7.05, y: 1.64, w: 5.80, h: 2.05 });
+  s.addText("beta_d = 0.28     ·     delta = 0.82 history decay     ·     g_j,t = outage age", {
+    x: 7.08, y: 3.72, w: 5.78, h: 0.28, fontFace: FONT, fontSize: 12, color: MUTED, margin: 0, valign: "middle",
   });
-  eqBox(s, "EQW", 6.98, 3.84, 5.95, 0.62, 14);
-  eqBox(s, "EQJSTAR", 6.98, 4.46, 5.95, 0.58, 14);
+  eqImg(s, "w", { x: 7.05, y: 4.02, w: 5.82, h: 0.52 });
+  eqImg(s, "jstar", { x: 7.05, y: 4.58, w: 5.82, h: 0.56 });
   s.addShape(pres.shapes.ROUNDED_RECTANGLE, {
     x: 7.08, y: 5.18, w: 5.76, h: 1.58, fill: { color: "FDECEA" }, rectRadius: 0.08,
   });
   s.addText("One reachable source per cell", {
-    x: 7.22, y: 5.26, w: 5.48, h: 0.36, fontFace: "Calibri", fontSize: 15, bold: true, color: RED, margin: 0, valign: "middle",
+    x: 7.22, y: 5.26, w: 5.48, h: 0.36, fontFace: "Times New Roman", fontSize: 15, bold: true, color: RED, margin: 0, valign: "middle",
   });
   s.addText("Do not sum correlated log-odds from j and k.\nWinner takes the cell: fuse L from j⋆ only.\nDistance decay + communication history gj,t.", {
-    x: 7.22, y: 5.62, w: 5.48, h: 0.98, fontFace: "Calibri", fontSize: 13, color: DARK, margin: 0, valign: "middle",
+    x: 7.22, y: 5.62, w: 5.48, h: 0.98, fontFace: "Times New Roman", fontSize: 13, color: DARK, margin: 0, valign: "middle",
   });
   footer(s, 8);
   notes(s, N[7]);
@@ -580,26 +602,26 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
 {
   const s = pres.addSlide();
   header(s, "2. Proposed IC-HGAT-MAPPO", "2.4 Heterogeneous Graph Policy and MAPPO Optimization");
-  contain(s, path.join(A, "hgat.png"), { x: 0.18, y: 1.18, w: 6.40, h: 2.35 });
-  s.addText("Relation-specific attention  ·  k_peer=1.5, k_task=k_obs=0.7  ·  2 layers, 4 heads  ·  6 task / 4 obstacle slots", {
-    x: 0.22, y: 3.52, w: 6.40, h: 0.32, fontFace: "Calibri", fontSize: 11, color: GREEN, bold: true, margin: 0, valign: "middle",
+  contain(s, path.join(A, "hgat.png"), { x: 0.18, y: 1.16, w: 6.40, h: 2.55 });
+  s.addText("Relation-specific attention  ·  k_peer=1.5, k_task=k_obs=0.7  ·  2 layers, 4 heads", {
+    x: 0.22, y: 3.72, w: 6.40, h: 0.26, fontFace: FONT, fontSize: 11, color: GREEN, bold: true, margin: 0, valign: "middle",
   });
-  eqBox(s, "EQATT", 0.18, 3.82, 6.45, 0.70, 14);
-  contain(s, path.join(A, "actor_critic.png"), { x: 6.75, y: 1.18, w: 6.25, h: 2.35 });
-  eqBox(s, "EQREWARD", 6.80, 3.52, 6.15, 0.52, 15);
-  s.addText("(lambda_D, lambda_C, lambda_safe) = (1.0, 0.30, 0.10)", {
-    x: 6.85, y: 4.02, w: 6.10, h: 0.26, fontFace: "Calibri", fontSize: 12, color: MUTED, margin: 0, valign: "middle",
+  eqImg(s, "att", { x: 0.18, y: 3.98, w: 6.45, h: 0.52 });
+  contain(s, path.join(A, "actor_critic.png"), { x: 6.75, y: 1.16, w: 6.25, h: 2.55 });
+  eqImg(s, "reward", { x: 6.80, y: 3.74, w: 6.15, h: 0.48 });
+  s.addText("(lambda_D, lambda_C, lambda_safe) = (1.0, 0.30, 0.10)   ·   6 task / 4 obstacle slots", {
+    x: 6.85, y: 4.24, w: 6.10, h: 0.26, fontFace: FONT, fontSize: 12, color: MUTED, margin: 0, valign: "middle",
   });
-  card(s, 0.18, 4.58, 13.00, 2.38, WHITE);
+  card(s, 0.18, 4.56, 13.00, 2.40, WHITE);
   s.addText("MAPPO  (CTDE)  ·  clip eps=0.20  ·  GAE lambda=0.95  ·  gamma=0.99  ·  shared actor, one critic", {
-    x: 0.32, y: 4.62, w: 12.70, h: 0.28, fontFace: "Calibri", fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle",
+    x: 0.32, y: 4.58, w: 12.70, h: 0.26, fontFace: FONT, fontSize: 13, bold: true, color: BLUE, margin: 0, valign: "middle",
   });
-  eqBox(s, "EQRHO", 0.22, 4.90, 6.40, 0.58, 13);
-  eqBox(s, "EQDELTA", 6.70, 4.90, 6.35, 0.58, 13);
-  eqBox(s, "EQCLIP", 0.22, 5.48, 6.40, 0.72, 12);
-  eqBox(s, "EQGAE", 6.70, 5.48, 6.35, 0.72, 13);
+  eqImg(s, "rho", { x: 0.28, y: 4.88, w: 6.35, h: 0.52 });
+  eqImg(s, "delta", { x: 6.72, y: 4.88, w: 6.28, h: 0.52 });
+  eqImg(s, "clip", { x: 0.28, y: 5.44, w: 6.35, h: 0.72 });
+  eqImg(s, "gae", { x: 6.72, y: 5.44, w: 6.28, h: 0.72 });
   s.addText("Link mask zeros unreachable peer attention.  Critic is removed at execution.", {
-    x: 0.32, y: 6.22, w: 12.70, h: 0.62, fontFace: "Calibri", fontSize: 13, italic: true, color: MUTED, margin: 0, valign: "middle",
+    x: 0.32, y: 6.20, w: 12.70, h: 0.64, fontFace: FONT, fontSize: 13, italic: true, color: MUTED, margin: 0, valign: "middle",
   });
   footer(s, 9);
   notes(s, N[8]);
@@ -612,20 +634,20 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   const s = pres.addSlide();
   header(s, "3. Experimental Results", "3.1 Experimental Setup and Main Results");
   card(s, 0.28, 1.16, 5.50, 2.28, GRAY);
-  s.addText("Experiment protocol  (fair comparison)", { x: 0.40, y: 1.20, w: 5.26, h: 0.28, fontFace: "Calibri", fontSize: 14, bold: true, color: BLUE, margin: 0, valign: "middle" });
+  s.addText("Experiment protocol  (fair comparison)", { x: 0.40, y: 1.20, w: 5.26, h: 0.28, fontFace: "Times New Roman", fontSize: 14, bold: true, color: BLUE, margin: 0, valign: "middle" });
   s.addText("6 UAVs · 15 targets · 10 obstacles · 30×30\nHorizon 200  ·  2,000 episodes  ·  5 seeds\n30 held-out scenarios   Rs=2, Rc=10 cells\nSame env, reward, action, budget", {
-    x: 0.40, y: 1.50, w: 5.26, h: 1.28, fontFace: "Calibri", fontSize: 13, color: DARK, margin: 0,
+    x: 0.40, y: 1.50, w: 5.26, h: 1.28, fontFace: "Times New Roman", fontSize: 13, color: DARK, margin: 0,
   });
   s.addText("Baselines: Heuristic, QMIX, Local MAPPO, Homog. Graph MAPPO", {
-    x: 0.40, y: 2.80, w: 5.26, h: 0.52, fontFace: "Calibri", fontSize: 12, italic: true, color: MUTED, margin: 0, valign: "middle",
+    x: 0.40, y: 2.80, w: 5.26, h: 0.52, fontFace: "Times New Roman", fontSize: 12, italic: true, color: MUTED, margin: 0, valign: "middle",
   });
   contain(s, path.join(A, "fig3.png"), { x: 0.28, y: 3.50, w: 5.50, h: 2.55 });
   s.addText("Trajectories are qualitative; bars below are the evidence.", {
-    x: 0.28, y: 6.08, w: 5.50, h: 0.28, fontFace: "Calibri", fontSize: 11, italic: true, color: MUTED, margin: 0, valign: "middle",
+    x: 0.28, y: 6.08, w: 5.50, h: 0.28, fontFace: "Times New Roman", fontSize: 11, italic: true, color: MUTED, margin: 0, valign: "middle",
   });
   card(s, 0.28, 6.38, 5.50, 0.58, BLUE_LT);
   s.addText("95% CI vs Heuristic Ct: 12.96–21.36 pp   ·   vs QMIX: 28.30–36.01 pp", {
-    x: 0.36, y: 6.38, w: 5.34, h: 0.58, fontFace: "Calibri", fontSize: 11, color: BLUE_DK, margin: 0, valign: "middle",
+    x: 0.36, y: 6.38, w: 5.34, h: 0.58, fontFace: "Times New Roman", fontSize: 11, color: BLUE_DK, margin: 0, valign: "middle",
   });
 
   const labels = ["Heuristic", "QMIX", "Local", "H-Graph", "IC-HGAT"];
@@ -645,7 +667,7 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     title: "Belief Decisiveness (%)",
     titleColor: DARK,
     titleFontSize: 11,
-    titleFontFace: "Calibri",
+    titleFontFace: "Times New Roman",
     chartColors: ["5B8CC9", "5B8CC9", "5B8CC9", "5B8CC9", ORANGE],
     valAxisMaxValue: 80,
     catAxisLabelColor: DARK,
@@ -670,7 +692,7 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     title: "Target Discovery (%)",
     titleColor: DARK,
     titleFontSize: 11,
-    titleFontFace: "Calibri",
+    titleFontFace: "Times New Roman",
     chartColors: ["5B8CC9", "5B8CC9", "5B8CC9", "5B8CC9", ORANGE],
     valAxisMaxValue: 100,
     catAxisLabelColor: DARK,
@@ -681,24 +703,24 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   });
 
   card(s, 5.95, 3.80, 3.50, 1.55, "FDECEA");
-  s.addText("vs. Heuristic", { x: 6.10, y: 3.88, w: 3.20, h: 0.28, fontFace: "Calibri", fontSize: 12, color: RED, bold: true, margin: 0 });
+  s.addText("vs. Heuristic", { x: 6.10, y: 3.88, w: 3.20, h: 0.28, fontFace: "Times New Roman", fontSize: 12, color: RED, bold: true, margin: 0 });
   s.addText("+17.16 pp  decisiveness\n+9.00 pp  discovery", {
-    x: 6.10, y: 4.20, w: 3.20, h: 0.95, fontFace: "Calibri", fontSize: 16, bold: true, color: DARK, margin: 0, valign: "middle",
+    x: 6.10, y: 4.20, w: 3.20, h: 0.95, fontFace: "Times New Roman", fontSize: 16, bold: true, color: DARK, margin: 0, valign: "middle",
   });
   card(s, 9.55, 3.80, 3.50, 1.55, "FFF3E8");
-  s.addText("vs. QMIX", { x: 9.70, y: 3.88, w: 3.20, h: 0.28, fontFace: "Calibri", fontSize: 12, color: ORANGE, bold: true, margin: 0 });
+  s.addText("vs. QMIX", { x: 9.70, y: 3.88, w: 3.20, h: 0.28, fontFace: "Times New Roman", fontSize: 12, color: ORANGE, bold: true, margin: 0 });
   s.addText("+32.15 pp  decisiveness\n+14.67 pp  discovery", {
-    x: 9.70, y: 4.20, w: 3.20, h: 0.95, fontFace: "Calibri", fontSize: 16, bold: true, color: DARK, margin: 0, valign: "middle",
+    x: 9.70, y: 4.20, w: 3.20, h: 0.95, fontFace: "Times New Roman", fontSize: 16, bold: true, color: DARK, margin: 0, valign: "middle",
   });
 
   s.addShape(pres.shapes.ROUNDED_RECTANGLE, {
     x: 5.95, y: 5.50, w: 7.10, h: 1.28, fill: { color: BLUE }, rectRadius: 0.08,
   });
   s.addText("T80   ·   82.0% success     ·     88.63 steps conditional on success", {
-    x: 6.15, y: 5.58, w: 6.75, h: 0.55, fontFace: "Calibri", fontSize: 16, bold: true, color: WHITE, margin: 0, valign: "middle",
+    x: 6.15, y: 5.58, w: 6.75, h: 0.55, fontFace: "Times New Roman", fontSize: 16, bold: true, color: WHITE, margin: 0, valign: "middle",
   });
   s.addText("Safety intervention 0.17%; collision rate comparable to the heuristic (not ranked).", {
-    x: 6.15, y: 6.16, w: 6.75, h: 0.44, fontFace: "Calibri", fontSize: 13, color: "D6E2F5", margin: 0, valign: "middle",
+    x: 6.15, y: 6.16, w: 6.75, h: 0.44, fontFace: "Times New Roman", fontSize: 13, color: "D6E2F5", margin: 0, valign: "middle",
   });
   footer(s, 10);
   notes(s, N[9]);
@@ -728,7 +750,7 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     title: "Ablation  (Decisiveness / Discovery, %)",
     titleColor: DARK,
     titleFontSize: 11,
-    titleFontFace: "Calibri",
+    titleFontFace: "Times New Roman",
     chartColors: [BLUE, ORANGE],
     valAxisMaxValue: 100,
     catAxisLabelColor: DARK,
@@ -747,17 +769,17 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     const y = 1.12 + i * 0.85;
     card(s, 6.75, y, 6.25, 0.78, WHITE);
     accent(s, 6.75, y, 0.78);
-    s.addText(c[0], { x: 6.95, y: y + 0.04, w: 5.90, h: 0.26, fontFace: "Calibri", fontSize: 13, bold: true, color: c[2], margin: 0 });
-    s.addText(c[1], { x: 6.95, y: y + 0.30, w: 5.90, h: 0.42, fontFace: "Calibri", fontSize: 12, color: DARK, margin: 0 });
+    s.addText(c[0], { x: 6.95, y: y + 0.04, w: 5.90, h: 0.26, fontFace: "Times New Roman", fontSize: 13, bold: true, color: c[2], margin: 0 });
+    s.addText(c[1], { x: 6.95, y: y + 0.30, w: 5.90, h: 0.42, fontFace: "Times New Roman", fontSize: 12, color: DARK, margin: 0 });
   });
 
   contain(s, path.join(A, "fig4.png"), { x: 0.25, y: 3.72, w: 12.80, h: 2.22 });
   s.addText("Do not walk all six panels.  Cite target speed and Rc / outage; mean discovery stays higher in the tested ranges.", {
-    x: 0.30, y: 5.96, w: 12.7, h: 0.28, fontFace: "Calibri", fontSize: 12, italic: true, color: BLUE_DK, margin: 0, valign: "middle",
+    x: 0.30, y: 5.96, w: 12.7, h: 0.28, fontFace: "Times New Roman", fontSize: 12, italic: true, color: BLUE_DK, margin: 0, valign: "middle",
   });
   card(s, 0.28, 6.28, 12.78, 0.68, BLUE_LT);
   s.addText("Trade-off to state: w/o history  T80 success 86.7% vs Full 82.0%, but conditional T80 98.19 vs 88.63 and Ct 53.99 vs 62.15.", {
-    x: 0.42, y: 6.28, w: 12.50, h: 0.68, fontFace: "Calibri", fontSize: 13, color: DARK, margin: 0, valign: "middle",
+    x: 0.42, y: 6.28, w: 12.50, h: 0.68, fontFace: "Times New Roman", fontSize: 13, color: DARK, margin: 0, valign: "middle",
   });
   footer(s, 11);
   notes(s, N[10]);
@@ -778,20 +800,20 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     const y = 1.18 + i * 0.92;
     card(s, 0.35, y, 12.62, 0.84, i === 1 ? "FFF3E8" : BLUE_LT);
     accent(s, 0.35, y, 0.84);
-    s.addText(c[0], { x: 0.55, y: y + 0.04, w: 12.22, h: 0.32, fontFace: "Calibri", fontSize: 16, bold: true, color: BLUE_DK, margin: 0, valign: "middle" });
-    s.addText(c[1], { x: 0.55, y: y + 0.36, w: 12.22, h: 0.40, fontFace: "Calibri", fontSize: 14, color: DARK, margin: 0, valign: "middle" });
+    s.addText(c[0], { x: 0.55, y: y + 0.04, w: 12.22, h: 0.32, fontFace: "Times New Roman", fontSize: 16, bold: true, color: BLUE_DK, margin: 0, valign: "middle" });
+    s.addText(c[1], { x: 0.55, y: y + 0.36, w: 12.22, h: 0.40, fontFace: "Times New Roman", fontSize: 14, color: DARK, margin: 0, valign: "middle" });
   });
   s.addShape(pres.shapes.ROUNDED_RECTANGLE, {
     x: 0.35, y: 3.98, w: 12.62, h: 0.72, fill: { color: BLUE }, rectRadius: 0.08,
   });
   s.addText("62.15%  Ct     ·     86.78%  Dt     ·     82.0%  T80 success     ·     88.63 steps | success", {
-    x: 0.50, y: 3.98, w: 12.32, h: 0.72, fontFace: "Calibri", fontSize: 18, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
+    x: 0.50, y: 3.98, w: 12.32, h: 0.72, fontFace: "Times New Roman", fontSize: 18, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
   });
-  card(s, 0.35, 4.80, 12.62, 0.62, WHITE);
-  s.addText("Key identities:  r_t = lambda_D dD_t + lambda_C dC_t - lambda_safe c_t     ·     attention = softmax(QK/sqrt(d) + log chi - k_r d_ik)", {
-    x: 0.50, y: 4.80, w: 12.32, h: 0.62, fontFace: "Calibri", fontSize: 14, color: DARK, align: "center", valign: "middle", margin: 0,
-  });
-  s.addText("Future Plan", { x: 0.40, y: 5.50, w: 12.5, h: 0.28, fontFace: "Calibri", fontSize: 15, bold: true, color: BLUE, margin: 0 });
+  card(s, 0.35, 4.80, 6.20, 0.62, "F4EFE4");
+  eqImg(s, "reward", { x: 0.40, y: 4.84, w: 6.10, h: 0.54 });
+  card(s, 6.70, 4.80, 6.27, 0.62, "F4EFE4");
+  eqImg(s, "att", { x: 6.75, y: 4.84, w: 6.17, h: 0.54 });
+  s.addText("Future Plan", { x: 0.40, y: 5.50, w: 12.5, h: 0.28, fontFace: "Times New Roman", fontSize: 15, bold: true, color: BLUE, margin: 0 });
   const fut = [
     ["3D environments", "Extend planar search to 3-D UAV kinematics and occupancy"],
     ["Fully decentralized safety", "Remove the simulator-level centralized safety supervisor"],
@@ -800,8 +822,8 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   fut.forEach((f, i) => {
     const x = 0.35 + i * 4.32;
     card(s, x, 5.95, 4.15, 0.95, GRAY);
-    s.addText(f[0], { x: x + 0.12, y: 6.02, w: 3.90, h: 0.32, fontFace: "Calibri", fontSize: 15, bold: true, color: BLUE, margin: 0, valign: "middle" });
-    s.addText(f[1], { x: x + 0.12, y: 6.34, w: 3.90, h: 0.48, fontFace: "Calibri", fontSize: 13, color: DARK, margin: 0, valign: "middle" });
+    s.addText(f[0], { x: x + 0.12, y: 6.02, w: 3.90, h: 0.32, fontFace: "Times New Roman", fontSize: 15, bold: true, color: BLUE, margin: 0, valign: "middle" });
+    s.addText(f[1], { x: x + 0.12, y: 6.34, w: 3.90, h: 0.48, fontFace: "Times New Roman", fontSize: 13, color: DARK, margin: 0, valign: "middle" });
   });
   footer(s, 12);
   notes(s, N[11]);
@@ -818,15 +840,15 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
   s.addShape(pres.shapes.RECTANGLE, { x: 0, y: 1.50, w: 13.333, h: 3.15, fill: { color: BLUE } });
   s.addText("Thank you for your attention!", {
     x: 0.50, y: 2.05, w: 12.3, h: 1.20,
-    fontFace: "Calibri", fontSize: 40, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 40, bold: true, color: WHITE, align: "center", valign: "middle", margin: 0,
   });
   s.addText("A Heterogeneous Graph-Attention MAPPO Algorithm for\nCooperative Multi-UAV Search under Intermittent Communication Constraints", {
     x: 0.70, y: 3.28, w: 11.9, h: 1.10,
-    fontFace: "Calibri", fontSize: 18, color: "D6E2F5", align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 18, color: "D6E2F5", align: "center", valign: "middle", margin: 0,
   });
   s.addText("Yinying Kuang\nHuazhong University of Science and Technology\nkuangyinying039@163.com", {
     x: 0.50, y: 4.82, w: 12.3, h: 1.15,
-    fontFace: "Calibri", fontSize: 18, color: DARK, align: "center", valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 18, color: DARK, align: "center", valign: "middle", margin: 0,
   });
   const qchips = ["Dec-POMDP / N_i(t)", "Log-odds P, E, R", "Source j*", "HGAT attention", "MAPPO clip + GAE"];
   qchips.forEach((c, i) => {
@@ -836,12 +858,12 @@ Thank you for your attention. I welcome questions on the Dec-POMDP model, log-od
     });
     s.addText(c, {
       x, y: 6.08, w: 2.48, h: 0.42,
-      fontFace: "Calibri", fontSize: 12, bold: true, color: BLUE_DK, align: "center", valign: "middle", margin: 0,
+      fontFace: "Times New Roman", fontSize: 12, bold: true, color: BLUE_DK, align: "center", valign: "middle", margin: 0,
     });
   });
   s.addText("CAC 2026  ·  October 2026  ·  Welcome questions on beliefs, source selection, and HGAT", {
     x: 0.50, y: 6.60, w: 12.3, h: 0.40,
-    fontFace: "Calibri", fontSize: 15, color: BLUE, align: "center", bold: true, valign: "middle", margin: 0,
+    fontFace: "Times New Roman", fontSize: 15, color: BLUE, align: "center", bold: true, valign: "middle", margin: 0,
   });
   notes(s, N[12]);
 }
