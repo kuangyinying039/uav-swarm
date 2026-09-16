@@ -182,7 +182,11 @@ def main():
         parser.error("demo BC weights must be non-negative and decay steps must be positive")
     if cfg.step_checkpoint_interval < 0:
         parser.error("--step-checkpoint-interval must be non-negative")
-    if (cfg.demo_bc_weight > 0 or cfg.demo_bc_final_weight > 0) and args.prior is None:
+    if (
+        args.mode == "train"
+        and (cfg.demo_bc_weight > 0 or cfg.demo_bc_final_weight > 0)
+        and args.prior is None
+    ):
         parser.error("demo BC regularization requires --prior")
     factory = lambda episode=0: QuadrotorPursuitEnv(
         replace(env_cfg, seed=seed_for_episode(train_bank, episode, args.seed))

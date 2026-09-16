@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from pursuit.trainers.matd3_trainer import Matd3Trainer, mean_actor_state_from_c
 from pursuit_baselines_3d import CooperativeGuidanceMPC3D
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from train_pursuit_with_demos import PursuitDemoTrainer
+from train_pursuit_matd3 import main as matd3_cli_main
 
 
 class PursuitMatd3Tests(unittest.TestCase):
@@ -155,6 +157,30 @@ class PursuitMatd3Tests(unittest.TestCase):
         env = QuadrotorPursuitEnv(self.env_cfg)
         action = trainer.deterministic_action(env.observe_search())
         self.assertEqual(action.shape, (env.cfg.n_uavs, 4))
+
+    def test_evaluate_demo_bc_checkpoint_does_not_require_prior_dataset(self):
+        trainer = self.trainer(
+            demo_bc_weight=1.0,
+            demo_bc_final_weight=0.1,
+            demo_bc_decay_steps=10,
+            prior_fraction=0.5,
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            checkpoint = root / "best_capture.pt"
+            output = root / "evaluation"
+            trainer.save_checkpoint(checkpoint, episode=0)
+            argv = [
+                "train_pursuit_matd3.py", "evaluate",
+                "--checkpoint", str(checkpoint),
+                "--eval-episodes", "1",
+                "--eval-seed", "7000000",
+                "--device", "cpu",
+                "--out", str(output),
+            ]
+            with patch("sys.argv", argv):
+                matd3_cli_main()
+            self.assertTrue((output / "evaluation.json").is_file())
 
 
 if __name__ == "__main__":
