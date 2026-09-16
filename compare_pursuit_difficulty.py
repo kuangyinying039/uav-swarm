@@ -23,6 +23,25 @@ def load_spec(spec):
     return row
 
 
+def validate_matrix(rows, required_methods=()):
+    """Reject incomplete or duplicate difficulty-by-method comparisons."""
+    pairs = [(row["difficulty"], row["label"]) for row in rows]
+    if len(pairs) != len(set(pairs)):
+        duplicates = sorted({pair for pair in pairs if pairs.count(pair) > 1})
+        raise ValueError(f"Duplicate difficulty/method inputs: {duplicates}")
+    unknown = sorted({row["difficulty"] for row in rows} - set(DIFFICULTY_ORDER))
+    if unknown:
+        raise ValueError(f"Unknown difficulties {unknown}; use Nominal, Medium, or Hard")
+    missing = [
+        f"{difficulty}:{method}"
+        for difficulty in DIFFICULTY_ORDER
+        for method in required_methods
+        if (difficulty, method) not in set(pairs)
+    ]
+    if missing:
+        raise ValueError("Incomplete difficulty comparison; missing " + ", ".join(missing))
+
+
 def _points(rows, method, key, x0, y0, width, height, low, high):
     selected = sorted(
         (row for row in rows if row["label"] == method and row.get(key) is not None),
@@ -90,10 +109,15 @@ def write_svg(path, rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", action="append", required=True, metavar="DIFFICULTY:LABEL=PATH")
+    parser.add_argument(
+        "--require-methods", nargs="+", default=(), metavar="LABEL",
+        help="Require every listed method at Nominal, Medium, and Hard",
+    )
     parser.add_argument("--out-dir", type=artifact_path, default=default_output("radar5_difficulty_comparison"))
     args = parser.parse_args()
     try:
         rows = [load_spec(spec) for spec in args.input]
+        validate_matrix(rows, args.require_methods)
     except (OSError, json.JSONDecodeError, ValueError) as error:
         parser.error(str(error))
     args.out_dir.mkdir(parents=True, exist_ok=True)

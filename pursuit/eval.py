@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import time
 
 import numpy as np
 
@@ -23,12 +24,15 @@ def evaluate_policy(action_fn, env_cfg, seeds, method_name="matd3"):
         collisions, safety, feasible = 0, 0, 0.0
         correction, correction_magnitude, emergency = 0.0, 0.0, 0.0
         visibility = 0.0
+        policy_compute_seconds = 0.0
         closest_capture_gap = float(env.minimum_capture_gap())
         max_uavs_in_capture = _uavs_in_capture(env)
         max_encirclement = 0.0
         visibility_totals = {}
         for step in range(env.cfg.search_steps):
+            policy_started = time.perf_counter()
             action = action_fn(obs, env)
+            policy_compute_seconds += time.perf_counter() - policy_started
             result = env.step_joint(action)
             obs = result["obs"]
             total += float(result["reward"])
@@ -59,6 +63,7 @@ def evaluate_policy(action_fn, env_cfg, seeds, method_name="matd3"):
             "captured": bool(result["capture_success"]),
             "steps": step + 1,
             "return": total,
+            "mean_policy_compute_ms": 1000.0 * policy_compute_seconds / (step + 1),
             "reward_components": components,
             "initial_layout": env.initial_layout,
             "initial_distances": env.initial_distances,
@@ -125,6 +130,9 @@ def summarize(rows, methods):
             "mean_censored_steps": float(np.mean([row["steps"] for row in group])),
             "mean_success_steps": float(np.mean(successes)) if successes else None,
             "mean_return": float(np.mean([row["return"] for row in group])),
+            "mean_policy_compute_ms": float(
+                np.mean([row["mean_policy_compute_ms"] for row in group])
+            ),
             "mean_closest_capture_gap": float(np.mean([row["closest_capture_gap"] for row in group])),
             "mean_final_capture_gap": float(np.mean([row["final_capture_gap"] for row in group])),
             "mean_collisions": float(np.mean([row["collisions"] for row in group])),

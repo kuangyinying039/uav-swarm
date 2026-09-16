@@ -714,10 +714,13 @@ def evaluate(trainer, env_cfg, seeds, methods):
             collisions, safety, feasible = 0, 0, 0.0
             correction, emergency = 0., 0.
             visibility = 0.0
+            policy_compute_seconds = 0.0
             closest_capture_gap = float(env.minimum_capture_gap())
             visibility_totals = {}
             for step in range(env.cfg.search_steps):
+                policy_started = time.perf_counter()
                 action = deterministic_action(trainer, obs) if policy is None else policy.actions(env)
+                policy_compute_seconds += time.perf_counter() - policy_started
                 result = env.step_joint(action)
                 obs = result["obs"]
                 total += float(result["reward"])
@@ -744,6 +747,7 @@ def evaluate(trainer, env_cfg, seeds, methods):
                          "initial_layout": env.initial_layout, "initial_distances": env.initial_distances,
                          "evader_safety_interventions": getattr(env, "evader_safety_interventions", 0),
                          "collisions": collisions, "safety_interventions": safety,
+                         "mean_policy_compute_ms": 1000.0 * policy_compute_seconds / (step + 1),
                          "controller_feasible_rate": feasible / (step + 1),
                          "safety_correction_rate": correction / (step + 1),
                          "emergency_stop_rate": emergency / (step + 1),
@@ -761,6 +765,7 @@ def evaluate(trainer, env_cfg, seeds, methods):
                            "mean_censored_steps": np.mean([r["steps"] for r in group]).item(),
                            "mean_success_steps": float(np.mean(successes)) if successes else None,
                            "mean_return": np.mean([r["return"] for r in group]).item(),
+                           "mean_policy_compute_ms": float(np.mean([r["mean_policy_compute_ms"] for r in group])),
                            "mean_closest_capture_gap": float(np.mean([r["closest_capture_gap"] for r in group])),
                            "mean_final_capture_gap": float(np.mean([r["final_capture_gap"] for r in group])),
                            "mean_collisions": float(np.mean([r["collisions"] for r in group])),

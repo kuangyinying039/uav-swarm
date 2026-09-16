@@ -55,7 +55,11 @@ def build_parser():
     parser.add_argument("--policy-delay", type=int, default=2)
     parser.add_argument("--target-noise", type=float, default=0.1)
     parser.add_argument("--noise-clip", type=float, default=0.2)
-    parser.add_argument("--exploration-std", type=float, default=0.12)
+    parser.add_argument("--exploration-std", type=float)
+    parser.add_argument("--exploration-final-std", type=float,
+                        help="Final behavior-noise standard deviation after linear decay")
+    parser.add_argument("--exploration-decay-steps", type=int,
+                        help="Environment steps over which behavior noise decays after warmup")
     parser.add_argument("--replay-size", type=int, default=500_000)
     parser.add_argument("--warmup-steps", type=int, default=8_000)
     parser.add_argument(
@@ -70,6 +74,8 @@ def build_parser():
     parser.add_argument("--demo-bc-final-weight", type=float,
                         help="Final BC weight after linear decay")
     parser.add_argument("--demo-bc-decay-steps", type=int)
+    parser.add_argument("--critic-pretrain-updates", type=int,
+                        help="Critic-only gradient steps on --prior before online interaction")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--validation-interval", type=int, default=50)
@@ -105,7 +111,9 @@ def config_from_args(args, env_cfg, recorded=None):
         policy_delay=args.policy_delay,
         target_noise=args.target_noise,
         noise_clip=args.noise_clip,
-        exploration_std=args.exploration_std,
+        exploration_std=selected("exploration_std", "exploration_std"),
+        exploration_final_std=selected("exploration_final_std", "exploration_final_std"),
+        exploration_decay_steps=selected("exploration_decay_steps", "exploration_decay_steps"),
         batch_size=args.batch_size,
         replay_size=args.replay_size,
         warmup_steps=args.warmup_steps,
@@ -118,6 +126,7 @@ def config_from_args(args, env_cfg, recorded=None):
         demo_bc_weight=selected("demo_bc_weight", "demo_bc_weight"),
         demo_bc_final_weight=selected("demo_bc_final_weight", "demo_bc_final_weight"),
         demo_bc_decay_steps=selected("demo_bc_decay_steps", "demo_bc_decay_steps"),
+        critic_pretrain_updates=selected("critic_pretrain_updates", "critic_pretrain_updates"),
         device=args.device,
         episodes=args.episodes,
         checkpoint_interval=args.checkpoint_interval,
@@ -180,6 +189,10 @@ def main():
     cfg = config_from_args(args, env_cfg, recorded)
     if min(cfg.demo_bc_weight, cfg.demo_bc_final_weight) < 0 or cfg.demo_bc_decay_steps < 1:
         parser.error("demo BC weights must be non-negative and decay steps must be positive")
+    if min(cfg.exploration_std, cfg.exploration_final_std) < 0 or cfg.exploration_decay_steps < 1:
+        parser.error("exploration standard deviations must be non-negative and decay steps positive")
+    if cfg.critic_pretrain_updates < 0:
+        parser.error("--critic-pretrain-updates must be non-negative")
     if cfg.step_checkpoint_interval < 0:
         parser.error("--step-checkpoint-interval must be non-negative")
     if (
@@ -188,6 +201,8 @@ def main():
         and args.prior is None
     ):
         parser.error("demo BC regularization requires --prior")
+    if args.mode == "train" and cfg.critic_pretrain_updates > 0 and args.prior is None:
+        parser.error("critic pretraining requires --prior")
     factory = lambda episode=0: QuadrotorPursuitEnv(
         replace(env_cfg, seed=seed_for_episode(train_bank, episode, args.seed))
     )
@@ -253,6 +268,12 @@ def main():
             parser.error(str(error))
     rng = np.random.default_rng(args.seed)
     if trainer.start_episode == 0 and not trainer.history:
+        pretrain_summary = trainer.pretrain_critic()
+        if pretrain_summary:
+            (args.out / "critic_pretrain.json").write_text(
+                json.dumps(pretrain_summary, indent=2), encoding="utf-8"
+            )
+            print(f"[critic-pretrain] {json.dumps(pretrain_summary)}", flush=True)
         trainer.save_checkpoint(args.out / "initial.pt", episode=0)
         if trainer.validation_seeds:
             trainer.validate(0, evaluate_policy)

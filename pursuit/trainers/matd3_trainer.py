@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from marl_trainers import FlatMLP, tensorize_heterogeneous_graph
-from pursuit.algorithms.matd3 import Matd3Config, update_matd3
+from pursuit.algorithms.matd3 import Matd3Config, soft_update, update_matd3
 from pursuit.data.replay_buffer import JointReplayBuffer, mix_batches
 from pursuit.data.transition_dataset import flatten_transitions, make_transition
 from pursuit.models.twin_critic import TwinCentralizedQ
@@ -63,6 +63,10 @@ class Matd3Trainer:
             raise ValueError("warmup_policy must be 'random' or 'actor'")
         if cfg.demo_bc_weight < 0 or cfg.demo_bc_final_weight < 0:
             raise ValueError("demo BC weights must be non-negative")
+        if min(cfg.exploration_std, cfg.exploration_final_std) < 0:
+            raise ValueError("exploration standard deviations must be non-negative")
+        if cfg.exploration_decay_steps < 1 or cfg.critic_pretrain_updates < 0:
+            raise ValueError("exploration decay steps must be positive and critic pretraining non-negative")
         self.env_factory = env_factory
         self.cfg = cfg
         self.device = resolve_device(cfg.device)
@@ -130,8 +134,49 @@ class Matd3Trainer:
     @torch.no_grad()
     def explore_action(self, obs, rng):
         action = self.deterministic_action(obs)
-        noise = rng.normal(0.0, self.cfg.exploration_std, size=action.shape)
+        noise = rng.normal(0.0, self.current_exploration_std(), size=action.shape)
         return np.clip(action + noise, -1.0, 1.0).astype(np.float32)
+
+    def current_exploration_std(self):
+        """Linearly anneal behavior noise after replay warmup."""
+        progress_steps = max(self.env_steps - self.cfg.warmup_steps, 0)
+        progress = min(progress_steps / max(self.cfg.exploration_decay_steps, 1), 1.0)
+        return float(
+            self.cfg.exploration_std
+            + progress * (self.cfg.exploration_final_std - self.cfg.exploration_std)
+        )
+
+    def pretrain_critic(self, updates=None):
+        """Fit the twin critics on expert replay before changing a warm-start actor."""
+        requested = self.cfg.critic_pretrain_updates if updates is None else int(updates)
+        completed = int(self.demo_metadata.get("critic_pretrain_updates_completed", 0))
+        remaining = max(requested - completed, 0)
+        if remaining == 0:
+            return {}
+        if len(self.prior_replay) < 1:
+            raise ValueError("critic pretraining requires a non-empty prior replay buffer")
+        totals = {}
+        last = {}
+        for _ in range(remaining):
+            batch = self.prior_replay.sample(self.cfg.batch_size, self.device)
+            batch["is_prior"] = torch.ones(
+                self.cfg.batch_size, dtype=torch.bool, device=self.device
+            )
+            last = update_matd3(self, batch, update_actor=False)
+            self.total_updates += 1
+            if self.total_updates % self.cfg.policy_delay == 0:
+                soft_update(self.critic_target, self.critic, self.cfg.tau)
+            for key in ("critic_loss", "target_q_mean", "td_abs_mean", "q_disagreement"):
+                totals[key] = totals.get(key, 0.0) + float(last[key])
+        completed += remaining
+        self.demo_metadata["critic_pretrain_updates_completed"] = completed
+        summary = {
+            "updates": remaining,
+            "completed_updates": completed,
+            **{f"mean_{key}": value / remaining for key, value in totals.items()},
+            **{f"final_{key}": float(last[key]) for key in totals},
+        }
+        return summary
 
     def save_checkpoint(self, path, episode=None):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -297,7 +342,7 @@ class Matd3Trainer:
                 "prior_size": len(self.prior_replay),
                 "env_steps": self.env_steps,
                 "matd3_updates": self.total_updates,
-                "exploration_std": self.cfg.exploration_std,
+                "exploration_std": self.current_exploration_std(),
                 "utd": self.cfg.utd,
                 "actor_grad_norm": last_stats.get("actor_grad_norm"),
                 "critic_grad_norm": last_stats.get("critic_grad_norm"),

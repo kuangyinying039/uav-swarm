@@ -38,8 +38,12 @@ def run_episode(method: str, seed: int, args) -> dict:
     visibility_totals = {}
     result = {}
     executed = 0
+    policy_compute_seconds = 0.0
     for step in range(args.steps):
-        result = env.step_joint(policy.actions(env))
+        policy_started = time.perf_counter()
+        action = policy.actions(env)
+        policy_compute_seconds += time.perf_counter() - policy_started
+        result = env.step_joint(action)
         executed = step + 1
         totals["reward"] += float(result["reward"])
         totals["visible"] += float(result.get("direct_target_visible", 0.0))
@@ -78,6 +82,7 @@ def run_episode(method: str, seed: int, args) -> dict:
         "emergency_stop_rate": totals['emergency'] / max(executed, 1),
         "path_length": totals["path_length"],
         "return": totals["reward"],
+        "mean_policy_compute_ms": 1000.0 * policy_compute_seconds / max(executed, 1),
     }
 
 
@@ -110,6 +115,9 @@ def summarize(rows: list[dict]) -> dict:
             ),
             "mean_emergency_stop_rate": float(np.mean([row["emergency_stop_rate"] for row in group])),
             "mean_return": float(np.mean([row["return"] for row in group])),
+            "mean_policy_compute_ms": float(
+                np.mean([row["mean_policy_compute_ms"] for row in group])
+            ),
         }
     return summary
 

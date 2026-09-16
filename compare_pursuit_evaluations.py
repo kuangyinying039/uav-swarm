@@ -18,7 +18,7 @@ FIELDS = (
     "mean_n_uavs_seeing_target", "mean_return", "mean_safety_interventions",
     "mean_safety_correction_rate", "mean_safety_correction_magnitude",
     "p90_safety_interventions", "safety_intervention_free_episode_rate",
-    "mean_emergency_stop_rate",
+    "mean_emergency_stop_rate", "mean_policy_compute_ms",
 )
 
 
@@ -55,7 +55,11 @@ def load_row(spec):
         )
     n = int(metrics["episodes"])
     rate = float(metrics["capture_rate"])
-    low, high = _wilson(rate, n)
+    low, high = (
+        metrics.get("capture_ci_low"), metrics.get("capture_ci_high")
+    )
+    if low is None or high is None:
+        low, high = _wilson(rate, n)
     row = {
         "label": label, "episodes": n, "capture_rate": rate,
         "capture_ci_low": low, "capture_ci_high": high,

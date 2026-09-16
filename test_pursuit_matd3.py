@@ -136,6 +136,51 @@ class PursuitMatd3Tests(unittest.TestCase):
         self.assertAlmostEqual(stats["demo_bc_weight"], 0.625)
         self.assertAlmostEqual(stats["prior_batch_fraction"], 0.5)
 
+    def test_critic_pretraining_preserves_actor_and_anneals_exploration(self):
+        trainer = self.trainer(
+            critic_pretrain_updates=3,
+            exploration_std=0.12,
+            exploration_final_std=0.02,
+            exploration_decay_steps=10,
+            warmup_steps=2,
+        )
+        env = QuadrotorPursuitEnv(self.env_cfg)
+        teacher = CooperativeGuidanceMPC3D()
+        teacher.reset(env)
+        obs = env.observe_search()
+        action, labels = teacher_step(teacher, env)
+        result = env.step_joint(action)
+        row = make_transition(
+            obs, action, result, labels, np.ones(env.cfg.n_uavs, dtype=bool),
+            ~env.disabled_uavs,
+        )
+        for _ in range(4):
+            trainer.prior_replay.add(row)
+        actor_before = {
+            key: value.detach().clone() for key, value in trainer.actor.state_dict().items()
+        }
+        critic_before = {
+            key: value.detach().clone() for key, value in trainer.critic.state_dict().items()
+        }
+        summary = trainer.pretrain_critic()
+        self.assertEqual(summary["completed_updates"], 3)
+        self.assertEqual(trainer.total_updates, 3)
+        self.assertEqual(trainer.pretrain_critic(), {})
+        self.assertTrue(all(
+            torch.equal(value, trainer.actor.state_dict()[key])
+            for key, value in actor_before.items()
+        ))
+        self.assertTrue(any(
+            not torch.equal(value, trainer.critic.state_dict()[key])
+            for key, value in critic_before.items()
+        ))
+        trainer.env_steps = 2
+        self.assertAlmostEqual(trainer.current_exploration_std(), 0.12)
+        trainer.env_steps = 7
+        self.assertAlmostEqual(trainer.current_exploration_std(), 0.07)
+        trainer.env_steps = 12
+        self.assertAlmostEqual(trainer.current_exploration_std(), 0.02)
+
     def test_short_train_and_eval(self):
         trainer = self.trainer(episodes=1, warmup_steps=1, batch_size=2, replay_size=16)
         history = trainer.train(np.random.default_rng(4))

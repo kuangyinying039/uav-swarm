@@ -17,6 +17,8 @@ class Matd3Config:
     target_noise: float = 0.1
     noise_clip: float = 0.2
     exploration_std: float = 0.12
+    exploration_final_std: float = 0.12
+    exploration_decay_steps: int = 150_000
     batch_size: int = 256
     replay_size: int = 500_000
     warmup_steps: int = 8_000
@@ -33,6 +35,7 @@ class Matd3Config:
     demo_bc_weight: float = 0.0
     demo_bc_final_weight: float = 0.0
     demo_bc_decay_steps: int = 100_000
+    critic_pretrain_updates: int = 0
     device: str = "auto"
     episodes: int = 3000
     checkpoint_interval: int = 50
