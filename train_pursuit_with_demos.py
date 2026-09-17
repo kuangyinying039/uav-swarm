@@ -1,8 +1,9 @@
-"""Pursuit-only demonstration warm start and on-policy MAPPO fine tuning.
+"""Frozen on-policy MAPPO pursuit baseline (BC / retention / DAgger reproduction).
 
-Successful teacher trajectories provide optional behavior-cloning initialization.
-Teacher transitions are used only for supervised learning, never as PPO data.
-The search environment and discrete search training path are left unchanged.
+Do not extend this file with off-policy MATD3. New pursuit RL lives in
+``train_pursuit_matd3.py`` and the ``pursuit/`` package. Successful teacher
+trajectories here remain BC-only; they are never PPO data. The cooperative
+search environment and discrete search trainers are left unchanged.
 """
 from __future__ import annotations
 
@@ -26,9 +27,11 @@ from pursuit_graph_encoder import (
     PURSUIT_GRAPH_VERSION, PursuitGraphActor, pursuit_graph_from_flat_observation,
 )
 from pursuit_baselines_3d import BASELINES_3D
+from pursuit_lidar import accumulate_visibility, finalize_visibility
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from pursuit_training_output import clean_history_row, write_pursuit_outputs, write_evaluation_chart, write_reward_capture_chart
 from pursuit_ppo import update_pursuit
+from artifact_paths import artifact_path, default_output
 
 
 SEED_BANK_VERSION = 1
@@ -197,11 +200,15 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.reward_totals = {}
         self.closest_capture_gap = float("inf")
         self.lidar_rates = []
+        self.visibility_totals = {}
+        self.visibility_steps = 0
         original_step = self.active_env.step_joint
         def timed_step(actions):
             started = time.perf_counter()
             result = original_step(actions)
             self.environment_seconds += time.perf_counter() - started
+            accumulate_visibility(self.visibility_totals, result)
+            self.visibility_steps += 1
             for key, value in result.get("reward_components", {}).items():
                 if key not in ("pursuit", "estimation"):
                     self.reward_totals[key] = self.reward_totals.get(key, 0.0) + float(value)
@@ -235,6 +242,7 @@ class PursuitDemoTrainer(MAPPOTrainer):
         if self.lidar_rates:
             row["lidar_detection_ratio"] = float(np.mean(self.lidar_rates))
         row["target_observation_ratio"] = row.get("continuous_visibility_ratio")
+        row.update(finalize_visibility(self.visibility_totals, self.visibility_steps))
         row["minimum_capture_gap"] = self.active_env.minimum_capture_gap()
         row["demo_loss_weight"] = self.demo_loss_weight(row["episode"] - 1)
         row["reference_kl_weight"] = self.reference_kl_weight if self.reference_actor is not None else 0.0
@@ -705,9 +713,14 @@ def evaluate(trainer, env_cfg, seeds, methods):
             obs, total, components = env.observe_search(), 0.0, {}
             collisions, safety, feasible = 0, 0, 0.0
             correction, emergency = 0., 0.
+            visibility = 0.0
+            policy_compute_seconds = 0.0
             closest_capture_gap = float(env.minimum_capture_gap())
+            visibility_totals = {}
             for step in range(env.cfg.search_steps):
+                policy_started = time.perf_counter()
                 action = deterministic_action(trainer, obs) if policy is None else policy.actions(env)
+                policy_compute_seconds += time.perf_counter() - policy_started
                 result = env.step_joint(action)
                 obs = result["obs"]
                 total += float(result["reward"])
@@ -716,9 +729,11 @@ def evaluate(trainer, env_cfg, seeds, methods):
                 feasible += float(result.get("controller_feasible_rate", 0.0))
                 correction += float(result.get('safety_correction_rate', 0.))
                 emergency += float(result.get('emergency_stop_rate', 0.))
+                visibility += float(result.get("target_visibility_rate", 0.0))
                 closest_capture_gap = min(
                     closest_capture_gap, float(result.get("minimum_capture_gap", env.minimum_capture_gap()))
                 )
+                accumulate_visibility(visibility_totals, result)
                 if (step + 1) % 100 == 0:
                     print(f"[evaluation] {method} seed={seed} step={step+1}", flush=True)
                 for key, value in result["reward_components"].items():
@@ -732,11 +747,14 @@ def evaluate(trainer, env_cfg, seeds, methods):
                          "initial_layout": env.initial_layout, "initial_distances": env.initial_distances,
                          "evader_safety_interventions": getattr(env, "evader_safety_interventions", 0),
                          "collisions": collisions, "safety_interventions": safety,
+                         "mean_policy_compute_ms": 1000.0 * policy_compute_seconds / (step + 1),
                          "controller_feasible_rate": feasible / (step + 1),
                          "safety_correction_rate": correction / (step + 1),
                          "emergency_stop_rate": emergency / (step + 1),
+                         "target_visibility_rate": visibility / (step + 1),
                          "closest_capture_gap": closest_capture_gap,
-                         "final_capture_gap": env.minimum_capture_gap()})
+                         "final_capture_gap": env.minimum_capture_gap(),
+                         **finalize_visibility(visibility_totals, step + 1)})
             print(f"[evaluation] {method} seed={seed} captured={rows[-1]['captured']} steps={step+1}", flush=True)
     trainer.actor.train()
     summary = {}
@@ -747,13 +765,19 @@ def evaluate(trainer, env_cfg, seeds, methods):
                            "mean_censored_steps": np.mean([r["steps"] for r in group]).item(),
                            "mean_success_steps": float(np.mean(successes)) if successes else None,
                            "mean_return": np.mean([r["return"] for r in group]).item(),
+                           "mean_policy_compute_ms": float(np.mean([r["mean_policy_compute_ms"] for r in group])),
                            "mean_closest_capture_gap": float(np.mean([r["closest_capture_gap"] for r in group])),
                            "mean_final_capture_gap": float(np.mean([r["final_capture_gap"] for r in group])),
                            "mean_collisions": float(np.mean([r["collisions"] for r in group])),
                            "mean_safety_interventions": float(np.mean([r["safety_interventions"] for r in group])),
                            "mean_controller_feasible_rate": float(np.mean([r["controller_feasible_rate"] for r in group])),
                            "mean_safety_correction_rate": float(np.mean([r["safety_correction_rate"] for r in group])),
-                           "mean_emergency_stop_rate": float(np.mean([r["emergency_stop_rate"] for r in group]))}
+                           "mean_emergency_stop_rate": float(np.mean([r["emergency_stop_rate"] for r in group])),
+                           "mean_team_visibility_ratio": float(np.mean([r["team_visibility_ratio"] for r in group])),
+                           "mean_uav_visibility_ratio": float(np.mean([r["uav_visibility_ratio"] for r in group])),
+                           "mean_building_occlusion_ratio": float(np.mean([r["building_occlusion_ratio"] for r in group])),
+                           "mean_n_uavs_seeing_target": float(np.mean([r["mean_n_uavs_seeing_target"] for r in group])),
+                           "mean_target_visibility_rate": float(np.mean([r["target_visibility_rate"] for r in group]))}
     return {"env_config": asdict(env_cfg), "rows": rows, "summary": summary}
 
 
@@ -763,15 +787,53 @@ def load_environment_config(recorded):
         raise ValueError("Capture rule changed to 3-D distance; recollect demonstrations and retrain")
     if recorded.get("policy_observation_version") != 2:
         raise ValueError("Pursuit observation v2 adds target height/velocity and deadline; recollect demonstrations and retrain into a new directory")
-    if recorded.get("scenario_version") != 2:
-        raise ValueError("Scenario v2 changes initialization and evader dynamics; recollect demonstrations and retrain into a new directory")
+    if recorded.get("scenario_version") != 3:
+        raise ValueError("Scenario v3 uses same-side triangle lidar starts; recollect demonstrations and retrain into a new directory")
     if recorded.get("task_mode") != "pursuit_quadrotor_3d" or any(
             key in recorded for key in ("execution_mode", "sensor_mode", "nmpc_horizon")):
         raise ValueError("Old NMPC/FOV demonstrations or checkpoint are incompatible. "
                          "Recollect with the current velocity/MID-360 environment into a new file.")
-    if recorded.get('execution_reward_version') != 3:
-        raise ValueError('Safety execution and rewards changed to v3; recollect demos and retrain in a new directory')
+    if recorded.get("execution_reward_version") != 4:
+        raise ValueError("Safety execution and rewards changed to v4 lidar visibility shaping; recollect demos and retrain in a new directory")
+    if recorded.get("pursuit_target_observable", False):
+        raise ValueError("Pursuit is limited-FOV MID-360 lidar, not globally observable; recollect demonstrations")
     return QuadrotorPursuitConfig(**recorded)
+
+
+def load_evaluation_environment_config(path, checkpoint_cfg):
+    """Use a new scenario for evaluation only when checkpoint tensor shapes match."""
+    evaluation_cfg = QuadrotorPursuitConfig(**json.loads(path.read_text(encoding="utf-8")))
+    evaluation_cfg.building_state_capacity = max(
+        evaluation_cfg.building_state_capacity, evaluation_cfg.building_count
+    )
+    contract_fields = (
+        "task_mode", "action_mode", "scenario_version",
+        "policy_observation_version", "execution_reward_version", "capture_mode",
+    )
+    changed_contracts = [
+        field for field in contract_fields
+        if getattr(evaluation_cfg, field) != getattr(checkpoint_cfg, field)
+    ]
+    if changed_contracts:
+        raise ValueError(f"Evaluation environment changes checkpoint contracts: {changed_contracts}")
+    checkpoint_env = QuadrotorPursuitEnv(checkpoint_cfg)
+    evaluation_env = QuadrotorPursuitEnv(evaluation_cfg)
+    checkpoint_shape = (
+        checkpoint_cfg.n_uavs, checkpoint_cfg.n_targets,
+        checkpoint_env.obs_dim(), checkpoint_env.state_dim(),
+        checkpoint_env.continuous_action_dim(),
+    )
+    evaluation_shape = (
+        evaluation_cfg.n_uavs, evaluation_cfg.n_targets,
+        evaluation_env.obs_dim(), evaluation_env.state_dim(),
+        evaluation_env.continuous_action_dim(),
+    )
+    if evaluation_shape != checkpoint_shape:
+        raise ValueError(
+            f"Evaluation environment changes checkpoint input/action dimensions: "
+            f"checkpoint={checkpoint_shape}, evaluation={evaluation_shape}"
+        )
+    return evaluation_cfg
 
 
 def main():
@@ -779,12 +841,17 @@ def main():
     parser.add_argument("mode", choices=["collect", "pretrain", "train", "evaluate"])
     parser.add_argument("--training-profile", choices=["auto", "plain", "warmstart"], default="auto")
     parser.add_argument("--env-config", type=Path, help="JSON object of QuadrotorPursuitConfig overrides")
-    parser.add_argument("--demos", type=Path, default=Path("outputs/pursuit_game_v2_demos.pt"))
-    parser.add_argument("--aux-demos", type=Path, help="DAgger corrections.pt used by PPO auxiliary replay")
+    parser.add_argument("--eval-env-config", type=Path,
+                        help="Evaluate a checkpoint in a different, dimension-compatible environment")
+    parser.add_argument("--demos", type=artifact_path,
+                        default=default_output("pursuit_game_v2_demos.pt"))
+    parser.add_argument("--aux-demos", type=artifact_path,
+                        help="DAgger corrections.pt used by PPO auxiliary replay")
     parser.add_argument("--no-aux-demos", action="store_true",
                         help="Guarantee that no DAgger correction replay is loaded")
-    parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--out", type=Path, default=Path("outputs/pursuit_game_v2_run"))
+    parser.add_argument("--checkpoint", type=artifact_path)
+    parser.add_argument("--out", type=artifact_path,
+                        default=default_output("pursuit_game_v2_run"))
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--demo-seed", type=int, default=2000000)
     parser.add_argument("--demo-successes", type=int, default=10)
@@ -814,16 +881,16 @@ def main():
     parser.add_argument("--validation-interval", type=int, default=50)
     parser.add_argument("--validation-episodes", type=int, default=10)
     parser.add_argument("--validation-seed", type=int, default=4000000)
-    parser.add_argument("--train-seeds-file", type=Path,
+    parser.add_argument("--train-seeds-file", type=artifact_path,
                         help="MPC-solvable training seeds, one integer per line")
-    parser.add_argument("--validation-seeds-file", type=Path,
+    parser.add_argument("--validation-seeds-file", type=artifact_path,
                         help="Held-out validation seeds, one integer per line")
     parser.add_argument("--safeguard-drop", type=float, default=0.10)
     parser.add_argument("--safeguard-patience", type=int, default=2)
     parser.add_argument("--min-actor-lr", type=float, default=1e-5)
     parser.add_argument("--eval-seed", type=int, default=3000000)
     parser.add_argument("--eval-episodes", type=int, default=100)
-    parser.add_argument("--eval-seeds-file", type=Path,
+    parser.add_argument("--eval-seeds-file", type=artifact_path,
                         help="Held-out evaluation seeds, one integer per line")
     parser.add_argument("--methods", nargs="+", choices=["mappo", *BASELINES_3D], default=["mappo", "apf", "frpn", "mpc"])
     parser.add_argument("--correction-rounds", type=int, default=0)
@@ -836,6 +903,8 @@ def main():
     parser.add_argument("--dagger-validation-seed", type=int)
     parser.add_argument("--dagger-validation-episodes", type=int)
     args = parser.parse_args()
+    if args.eval_env_config and args.mode != "evaluate":
+        parser.error("--eval-env-config is only valid for evaluate")
     try:
         explicit_aux_path = resolve_auxiliary_path(args.aux_demos, args.no_aux_demos)
         requested_train_bank = load_seed_bank(args.train_seeds_file)
@@ -954,7 +1023,11 @@ def main():
         used.update(metadata.get("validation_seeds", []))
         if used.intersection(seeds):
             parser.error("Evaluation seeds overlap demonstration or training seeds")
-        result = evaluate(trainer, env_cfg, seeds, args.methods)
+        evaluation_cfg = (
+            load_evaluation_environment_config(args.eval_env_config, env_cfg)
+            if args.eval_env_config else env_cfg
+        )
+        result = evaluate(trainer, evaluation_cfg, seeds, args.methods)
         (args.out / "evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         write_evaluation_chart(args.out / "evaluation.svg", result)
         print(json.dumps(result["summary"], indent=2))

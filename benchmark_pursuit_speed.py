@@ -2,6 +2,8 @@
 import argparse
 import json
 from pathlib import Path
+
+from artifact_paths import artifact_path, default_output
 import time
 import numpy as np
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
@@ -11,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--steps', type=int, default=30)
     parser.add_argument('--env-config', type=Path)
-    parser.add_argument('--out', type=Path, default=Path('outputs/pursuit_speed.json'))
+    parser.add_argument('--out', type=artifact_path, default=default_output('pursuit_speed.json'))
     parser.add_argument('--render', action='store_true')
     args = parser.parse_args()
     if args.steps < 1:

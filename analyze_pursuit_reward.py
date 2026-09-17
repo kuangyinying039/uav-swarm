@@ -14,11 +14,12 @@ from marl_trainers import TrainConfig
 from pursuit_baselines_3d import BASELINES_3D
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from train_pursuit_with_demos import PursuitDemoTrainer, deterministic_action, load_environment_config
+from artifact_paths import artifact_path, default_output
 
 
 AUDIT_COMPONENTS = (
     "capture", "timeout", "time", "individual_approach", "nearest_approach",
-    "encirclement_progress", "obstacle_proximity", "boundary_proximity",
+    "encirclement_progress", "visibility_progress", "obstacle_proximity", "boundary_proximity",
     "peer_proximity", "reference_smoothness", "controller_rejection",
     "safety_correction",
 )
@@ -134,13 +135,13 @@ def load_checkpoint_trainer(path, device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--checkpoint", type=Path)
+    source.add_argument("--checkpoint", type=artifact_path)
     source.add_argument("--baseline", choices=sorted(BASELINES_3D))
     parser.add_argument("--seeds", nargs="+", type=int, required=True)
     parser.add_argument("--env-config", type=Path,
                         help="Required for a baseline; checkpoint embeds its environment")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--out", type=Path, default=Path("outputs/reward_audit"))
+    parser.add_argument("--out", type=artifact_path, default=default_output("reward_audit"))
     args = parser.parse_args()
     if len(args.seeds) != len(set(args.seeds)):
         parser.error("--seeds contains duplicates")

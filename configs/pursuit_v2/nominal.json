@@ -1,3 +1,6 @@
 {
-  "scenario_version": 2
+  "scenario_version": 3,
+  "execution_reward_version": 4,
+  "pursuit_target_observable": false,
+  "evader_policy": "occlusion"
 }

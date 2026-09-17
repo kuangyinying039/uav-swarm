@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 
 
-PURSUIT_GRAPH_VERSION = 2
+PURSUIT_GRAPH_VERSION = 3
 SELF_DIM = 16
 TARGET_DIM = 8
 PEER_DIM = 7
@@ -81,12 +81,17 @@ def pursuit_graph_observation(env):
             if track.initialized and len(track.mean) >= 6:
                 relative = np.asarray(track.mean[:3], dtype=float) - position
                 distance = float(np.linalg.norm(relative))
+                try:
+                    from pursuit_lidar import lidar_sees_point
+                except ImportError:
+                    from .pursuit_lidar import lidar_sees_point
+                own_lidar = float(lidar_sees_point(env, agent, track.mean[:3]))
                 graph["target_nodes"][agent, 0] = np.r_[
                     relative[:2] / cfg.grid_size,
                     relative[2] / z_scale,
                     np.asarray(track.mean[3:6], dtype=float) / target_speed,
                     min(distance / cfg.grid_size, 1.0),
-                    1.0,
+                    own_lidar,
                 ]
                 graph["target_mask"][agent, 0] = True
 

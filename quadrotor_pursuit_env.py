@@ -28,19 +28,21 @@ except ImportError:
 class QuadrotorPursuitConfig(Pursuit3DConfig):
     task_mode: str = "pursuit_quadrotor_3d"
     action_mode: str = "world_velocity_xyz_and_yaw_rate_to_autopilot"
-    scenario_version: int = 2
+    scenario_version: int = 3
     policy_observation_version: int = 2
-    execution_reward_version: int = 3
+    execution_reward_version: int = 4
     target_speed: float = 1.82  # 1.3 times pursuer horizontal speed; simulation assumption
     target_vertical_speed: float = 1.04
-    initial_distance_min: float = 8.0
-    initial_distance_max: float = 16.0
+    initial_distance_min: float = 6.0
+    initial_distance_max: float = 10.0
+    formation_spacing: float = 2.2
     evader_response_time: float = 0.35
     evader_horizontal_acceleration: float = 2.5
     evader_vertical_acceleration: float = 2.0
     evader_prediction_steps: int = 6
-    pursuit_target_observable: bool = True
-    evader_policy: str = "repulsive"
+    pursuit_target_observable: bool = False
+    evader_policy: str = "occlusion"
+    handoff_initial_track: bool = False
     game_position_noise_std: float = 0.10
     evader_position_noise_std: float = 0.10
     # The policy sends velocity and yaw-rate setpoints at 5 Hz.
@@ -67,12 +69,13 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     individual_approach_weight: float = 2.0
     target_proximity_weight: float = 0.0
     encirclement_progress_weight: float = 2.0
+    visibility_progress_weight: float = 1.5
     encirclement_distance_scale: float = 6.0
     encirclement_height_scale: float = 2.0
     obstacle_proximity_weight: float = 0.03
     obstacle_reward_safe_distance: float = 1.5
     obstacle_reward_log_scale: float = 0.1
-    # Fully observed pursuit: estimation and messaging remain diagnostics.
+    # Lidar pursuit: estimation and messaging remain diagnostics, not rewards.
     information_gain_reward: float = 0.0
     uncertain_track_penalty: float = 0.0
     communication_cost_per_kb: float = 0.0
@@ -98,15 +101,16 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     lidar_mount_rpy_deg: tuple = (0.0, 0.0, 0.0)
 
     def __post_init__(self):
-        if self.execution_reward_version != 3:
-            raise ValueError("Use execution_reward_version=3 and retrain with the corrected safety/reward contract")
+        if self.execution_reward_version != 4:
+            raise ValueError("Use execution_reward_version=4 for lidar visibility shaping; recollect demonstrations")
         if not 0 < self.reward_gamma <= 1 or min(self.approach_distance_scale, self.boundary_reward_safe_distance, self.safety_buffer) <= 0:
             raise ValueError("Invalid shaping discount, distance scale, or safety buffer")
         if self.target_proximity_weight != 0:
             raise ValueError("v3 uses terminal-aware potential shaping, not a per-step proximity bonus")
         if min(self.safety_correction_weight, self.boundary_proximity_weight, self.peer_proximity_weight,
                self.controller_rejection_penalty, self.obstacle_proximity_weight,
-               self.individual_approach_weight, self.nearest_approach_weight, self.encirclement_progress_weight) < 0:
+               self.individual_approach_weight, self.nearest_approach_weight, self.encirclement_progress_weight,
+               self.visibility_progress_weight) < 0:
             raise ValueError("Reward weights must be nonnegative")
         if min(self.encirclement_distance_scale, self.encirclement_height_scale,
                self.obstacle_reward_safe_distance, self.obstacle_reward_log_scale) <= 0:
@@ -120,8 +124,8 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
             raise ValueError("Distance capture succeeds immediately; capture_hold_steps must be 1")
         if self.policy_observation_version != 2:
             raise ValueError("Only pursuit policy_observation_version=2 is supported")
-        if self.scenario_version != 2:
-            raise ValueError("Scenario version must be 2; old demonstrations need recollection")
+        if self.scenario_version != 3:
+            raise ValueError("Scenario version must be 3; same-side triangle + lidar starts need recollection")
         if not 0 < self.initial_distance_min < self.initial_distance_max:
             raise ValueError("Invalid initial distance interval")
         if min(self.evader_response_time, self.evader_horizontal_acceleration, self.evader_vertical_acceleration) <= 0 or self.evader_prediction_steps < 1:
@@ -156,6 +160,8 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
             raise ValueError("Decision period, speeds, yaw-rate limit and gravity must be positive")
         if self.n_targets != 1 or self.capture_mode != "single_distance" or self.capture_required_uavs != 1:
             raise ValueError("Distance pursuit requires one evader and any one active UAV to capture it")
+        if self.evader_policy not in ("repulsive", "occlusion"):
+            raise ValueError("Pursuit evader_policy must be repulsive or occlusion")
 
 
 class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
@@ -175,7 +181,10 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         if not hasattr(self, "quadrotor_states") or self.quadrotor_states.shape != (c.n_uavs, 13):
             self.quadrotor_states = np.zeros((c.n_uavs, 13), dtype=float)
         for i in range(c.n_uavs):
-            yaw = float(self.headings[i]) * np.pi / 4.0
+            if hasattr(self, "initial_yaws"):
+                yaw = float(self.initial_yaws[i])
+            else:
+                yaw = float(self.headings[i]) * np.pi / 4.0
             self.quadrotor_states[i, :3] = [*self.positions[i], self.altitudes[i]]
             self.quadrotor_states[i, 3:6] = 0.0
             self.quadrotor_states[i, 6:10] = quaternion_from_yaw(yaw)
@@ -188,7 +197,13 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         obs = super().reset()
         if hasattr(self, "quadrotor_states"):
             self._initialize_quadrotor_states()
+            if hasattr(self, "_initialize_3d_tracking_state"):
+                self._initialize_3d_tracking_state()
+            self._lidar_last_scan.clear()
+            self._lidar_mask_scan = -1
+            self._lidar_detections[:] = False
             obs = self.observe_search()
+            self._lidar_opening_scan = False
         return obs
 
     def _reset_lidar(self, cfg):
@@ -203,11 +218,17 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         self._lidar_last_scan = {}
         self._lidar_mask_scan = -1
         self._lidar_detections = np.zeros((cfg.n_uavs, cfg.n_targets), dtype=bool)
+        self._lidar_opening_scan = True
+        self._visible_steps = 0
 
     def direct_visibility_mask(self):
         if self.cfg.pursuit_target_observable:
             return np.broadcast_to((~self.disabled_uavs)[:, None], (self.cfg.n_uavs, self.cfg.n_targets)).copy()
-        return self._lidar_detections & (~self.disabled_uavs)[:, None]
+        try:
+            from pursuit_lidar import lidar_visibility
+        except ImportError:
+            from .pursuit_lidar import lidar_visibility
+        return lidar_visibility(self)
 
     def _measurement_visibility_mask(self):
         if self.cfg.pursuit_target_observable:
@@ -237,7 +258,14 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         if self._lidar_last_scan.get(key) == scan:
             return None, 0.0
         self._lidar_last_scan[key] = scan
-        if self._lidar_rng.random() >= cfg.lidar_detection_probability:
+        skip_dropout = bool(self._lidar_opening_scan) and cfg.lidar_detection_probability > 0
+        if skip_dropout:
+            try:
+                from pursuit_lidar import lidar_visibility
+            except ImportError:
+                from .pursuit_lidar import lidar_visibility
+            skip_dropout = bool(lidar_visibility(self)[agent, target_id])
+        if (not skip_dropout) and self._lidar_rng.random() >= cfg.lidar_detection_probability:
             return None, 0.0
         try:
             from pursuit_lidar import sensor_pose
@@ -250,12 +278,12 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         return truth + self._lidar_rng.normal(0.0, sigma, 3), float(sigma*sigma)
 
     def _initialize_handoff_triangle_formation(self):
-        # Override the inherited near-target triangle with randomized starts.
-        try:
-            from pursuit_scenarios import initialize_formation
-        except ImportError:
-            from .pursuit_scenarios import initialize_formation
-        initialize_formation(self)
+        super()._initialize_handoff_triangle_formation()
+        self.initial_layout = "one_side_triangle"
+        target = np.r_[self.dynamic_targets[0], self.target_altitudes[0]]
+        self.initial_distances = np.linalg.norm(
+            np.column_stack([self.positions, self.altitudes]) - target, axis=1
+        ).tolist()
 
     def _game_escape_direction(self, target_index):
         try:
@@ -325,6 +353,11 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
                     features[i, 12] = min(distance/c.grid_size, 1.)
                     features[i, 13] = 1.
                     features[i, 17:19] = [distance <= c.tracking_radius, 1.]
+                    try:
+                        from pursuit_lidar import lidar_sees_point
+                    except ImportError:
+                        from .pursuit_lidar import lidar_sees_point
+                    features[i, 16] = float(lidar_sees_point(self, i, track.mean[:3]))
         return features
 
     def observe_search(self) -> dict:
@@ -415,15 +448,18 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
 
     def step_joint(self, actions: np.ndarray) -> dict:
         try:
-            from pursuit_rewards import geometry_features, shaped_rewards, obstacle_cost, clearance_costs
+            from pursuit_rewards import geometry_features, shaped_rewards, obstacle_cost, clearance_costs, visibility_shaping
+            from pursuit_lidar import visibility_metrics
             from pursuit_safety import safe_velocity_step, paths_conflict
         except ImportError:
-            from .pursuit_rewards import geometry_features, shaped_rewards, obstacle_cost, clearance_costs
+            from .pursuit_rewards import geometry_features, shaped_rewards, obstacle_cost, clearance_costs, visibility_shaping
+            from .pursuit_lidar import visibility_metrics
             from .pursuit_safety import safe_velocity_step, paths_conflict
         actions = np.asarray(actions, dtype=float)
         active_before = ~self.disabled_uavs.copy()
         previous_geometry = geometry_features(self.quadrotor_states[:, :3],
             [*self.dynamic_targets[0], self.target_altitudes[0]], active_before, self.cfg)
+        previous_visibility = visibility_metrics(self)
         if actions.shape != (self.cfg.n_uavs, 4):
             raise ValueError(f"Expected continuous actions {(self.cfg.n_uavs, 4)}, got {actions.shape}")
         if not np.all(np.isfinite(actions)):
@@ -515,7 +551,12 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         result["body_angular_rates"] = self.quadrotor_states[:, 10:13].tolist()
         result["target_observation_ratio"] = float(np.mean(self.direct_visibility_mask()))
         if not c.pursuit_target_observable:
-            result["lidar_detection_ratio"] = result["target_observation_ratio"]
+            result["lidar_detection_ratio"] = float(np.mean(self._lidar_detections))
+        visible = self.direct_visibility_mask()
+        result["target_visibility_rate"] = float(np.mean(np.any(visible, axis=0)))
+        result["target_visible_uav_fraction"] = float(np.mean(visible))
+        self._visible_steps += int(np.any(visible))
+        result["target_visibility_uptime"] = self._visible_steps / max(self.t, 1)
         result["continuous_safety_interventions"] = int(interventions)
         result["safety_intervention_rate"] = max(
             float(result.get("safety_intervention_rate", 0.0)),
@@ -535,10 +576,21 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
             active_before, self.buildings, self.building_heights, c)
         shaping.update(clearance_costs(self.quadrotor_states[:, :3], active_before, c,
                                       np.column_stack([self.obstacles, self.obstacle_altitudes])))
+        current_visibility = visibility_metrics(self)
+        terminal = bool(result["capture_success"] or self.t >= c.search_steps or result.get("terminated", False))
+        shaping.update(visibility_shaping(
+            (previous_visibility["team_visible"], previous_visibility["uav_visibility_ratio"]),
+            (current_visibility["team_visible"], current_visibility["uav_visibility_ratio"]),
+            c, terminal=terminal,
+        ))
         result["reward"] = float(result["reward"] + sum(shaping.values()))
         result["individual_approach_progress"] = individual_progress.tolist()
         result["encirclement_score"] = current_geometry[2]
         result["minimum_capture_gap"] = current_capture_gap
+        result["team_visible"] = current_visibility["team_visible"]
+        result["uav_visibility_ratio"] = current_visibility["uav_visibility_ratio"]
+        result["building_occlusion_ratio"] = current_visibility["building_occlusion_ratio"]
+        result["n_uavs_seeing_target"] = current_visibility["n_uavs_seeing_target"]
         result["reward_components"].update(shaping)
         result["reward_components"]["reference_smoothness"] = -smoothness
         result["reward_components"]["controller_rejection"] = -infeasible_cost

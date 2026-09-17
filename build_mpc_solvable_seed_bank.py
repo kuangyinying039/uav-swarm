@@ -8,12 +8,14 @@ import json
 from pathlib import Path
 import random
 
+from artifact_paths import artifact_path
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True,
+    parser.add_argument("--input", type=artifact_path, required=True,
                         help="JSON output produced by evaluate_3d_baselines.py")
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--out", type=artifact_path, required=True)
     parser.add_argument("--train", type=int, default=1000)
     parser.add_argument("--validation", type=int, default=100)
     parser.add_argument("--test", type=int, default=100)
