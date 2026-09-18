@@ -1,5 +1,9 @@
 # Radar5 围捕论文实验说明书
 
+> **重跑请改用** [`RADAR5_PAPER_COMPLETE_PROTOCOL.md`](RADAR5_PAPER_COMPLETE_PROTOCOL.md)
+> 与脚本 `run_radar5_paper_suite.py`。默认训练域已改为 **Medium**；MPC 为专家上界而非必须超越的目标。
+> 下文保留 Nominal 口径的历史说明，仅作对照。
+
 本说明书用于冻结环境、训练、模型选择、正式测试、统计与作图。所有命令从
 `~/xieton/repro` 执行；命令中的 `outputs/...` 实际写入 `~/xieton/outputs/...`。
 
