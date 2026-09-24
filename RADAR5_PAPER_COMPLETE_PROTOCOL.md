@@ -131,9 +131,16 @@ python run_radar5_paper_suite.py --stage aggregate_ablation --train-level medium
 
 # 7) 定性轨迹
 python run_radar5_paper_suite.py --stage qualitative --train-level medium --seeds 11
+
+# 8) 消融柱状图（需已有 aggregate + aggregate_ablation；主方法聚合也要有）
+python run_radar5_paper_suite.py --stage plot_ablation --train-level medium
+
+# 9) 同一 held-out 场景对比 APF/FRPN/MPC/MAPPO/MATD3
+python run_radar5_paper_suite.py --stage same_scene --train-level medium --seeds 11 \
+  --scene-seed 7000017 --scene-level medium
 ```
 
-说明：`--stage all` 会按顺序包含 assets → baselines → train_main → train_ablation → evaluate → evaluate_ablation → aggregate → aggregate_ablation → qualitative。算力紧张时请分阶段跑，先 `train_main --seeds 11` 冒烟。
+说明：`--stage all` 会按顺序包含 assets → baselines → train_main → train_ablation → evaluate → evaluate_ablation → aggregate → aggregate_ablation → qualitative。算力紧张时请分阶段跑，先 `train_main --seeds 11` 冒烟。`plot_ablation` / `same_scene` 需单独运行。
 
 输出前缀默认 `radar5_medium_*`。若坚持 Nominal 开训：
 

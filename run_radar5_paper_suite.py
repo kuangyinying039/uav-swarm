@@ -113,6 +113,14 @@ class SuitePaths:
     def qualitative_dir(self) -> str:
         return f"outputs/{self.prefix}_qualitative"
 
+    @property
+    def ablation_plot_dir(self) -> str:
+        return f"outputs/{self.prefix}_ablation_comparison"
+
+    @property
+    def same_scene_dir(self) -> str:
+        return f"outputs/{self.prefix}_same_scene"
+
 
 def matd3_opt_flags() -> list[str]:
     return [
@@ -491,6 +499,74 @@ def qualitative_commands(paths: SuitePaths, seed: int = 11) -> list[dict]:
     return rows
 
 
+def plot_ablation_commands(paths: SuitePaths) -> list[dict]:
+    """Bar chart of A0–A4 plus main HGAT-MATD3-Opt / MAPPO on the train domain."""
+    level = paths.train_level
+    cmd = [
+        PYTHON, str(ROOT / "compare_pursuit_evaluations.py"),
+        "--out-dir", paths.ablation_plot_dir,
+        "--input", f"A0_MLP_scratch={paths.aggregate('ABLATION_A0_MLP_SCRATCH', level)}",
+        "--input", f"A1_HGAT_scratch={paths.aggregate('ABLATION_A1_HGAT_SCRATCH', level)}",
+        "--input", f"A2_no_retention={paths.aggregate('ABLATION_A2_NO_RETENTION', level)}",
+        "--input", f"A3_no_critic_pretrain={paths.aggregate('ABLATION_A3_NO_CRITIC_PRETRAIN', level)}",
+        "--input", f"A4_no_visibility={paths.aggregate('ABLATION_A4_NO_VISIBILITY', level)}",
+        "--input", f"A5_HGAT_MATD3_OPT={paths.aggregate('HGAT_MATD3_OPT', level)}",
+        "--input", f"MAPPO={paths.aggregate('MAPPO', level)}",
+    ]
+    return [{"id": "plot_ablation_medium", "command": cmd}]
+
+
+def same_scene_commands(
+    paths: SuitePaths,
+    *,
+    train_seed: int = 11,
+    scene_seed: int = 7000017,
+    level: str | None = None,
+) -> list[dict]:
+    """Render APF/FRPN/MPC/MAPPO/MATD3 on one fixed held-out scene."""
+    level = level or paths.train_level
+    env = str(paths.level_config(level))
+    out_root = f"{paths.same_scene_dir}/seed{scene_seed}_{level}"
+    rows = []
+    for method in ("apf", "frpn", "mpc"):
+        rows.append({
+            "id": f"same_scene_{method}",
+            "command": [
+                PYTHON, str(ROOT / "visualize_3d_pursuit_episode.py"),
+                "--method", method,
+                "--env-config", env,
+                "--seed", str(scene_seed),
+                "--steps", "300",
+                "--out-dir", f"{out_root}/{method}",
+            ],
+        })
+    rows.append({
+        "id": "same_scene_mappo",
+        "command": [
+            PYTHON, str(ROOT / "visualize_3d_pursuit_episode.py"),
+            "--method", "mappo",
+            "--checkpoint", f"{paths.mappo_run(train_seed)}/best_capture.pt",
+            "--env-config", env,
+            "--seed", str(scene_seed),
+            "--steps", "300",
+            "--out-dir", f"{out_root}/mappo",
+        ],
+    })
+    rows.append({
+        "id": "same_scene_matd3",
+        "command": [
+            PYTHON, str(ROOT / "visualize_3d_pursuit_episode.py"),
+            "--method", "matd3",
+            "--checkpoint", f"{paths.matd3_run('hgat_matd3_opt', train_seed)}/best_capture.pt",
+            "--env-config", env,
+            "--seed", str(scene_seed),
+            "--steps", "300",
+            "--out-dir", f"{out_root}/matd3",
+        ],
+    })
+    return rows
+
+
 ABLATION_VARIANTS = (
     "ablation_a0_mlp_scratch",
     "ablation_a1_hgat_scratch",
@@ -587,6 +663,17 @@ def build_manifest(args) -> dict:
         )
     if stage in ("qualitative", "all"):
         jobs.extend(qualitative_commands(paths, seed=seeds[0]))
+    if stage == "plot_ablation":
+        jobs.extend(plot_ablation_commands(paths))
+    if stage == "same_scene":
+        jobs.extend(
+            same_scene_commands(
+                paths,
+                train_seed=seeds[0],
+                scene_seed=int(getattr(args, "scene_seed", 7000017)),
+                level=getattr(args, "scene_level", None) or paths.train_level,
+            )
+        )
 
     return {
         "train_level": args.train_level,
@@ -629,7 +716,7 @@ def main() -> None:
             "assets", "baselines", "baselines_extreme", "train_main", "train_ablation",
             "evaluate", "evaluate_extreme", "evaluate_ablation",
             "aggregate", "aggregate_extreme", "aggregate_ablation",
-            "qualitative", "all",
+            "plot_ablation", "qualitative", "same_scene", "all",
         ],
         default="all",
     )
@@ -641,6 +728,13 @@ def main() -> None:
     parser.add_argument("--seeds", default="11,12,13")
     parser.add_argument("--episodes", type=int, default=3000)
     parser.add_argument(
+        "--scene-seed", type=int, default=7000017,
+        help="Held-out scene seed for --stage same_scene",
+    )
+    parser.add_argument(
+        "--scene-level", choices=ALL_EVAL_LEVELS, default=None,
+        help="Environment profile for --stage same_scene (default: train-level)",
+    )    parser.add_argument(
         "--include-ablation-eval", action="store_true",
         help="Also evaluate/aggregate A0–A4 across difficulties (expensive).",
     )

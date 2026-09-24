@@ -76,6 +76,25 @@ class Radar5PaperSuiteTests(unittest.TestCase):
         self.assertTrue(any("hgat_matd3_opt" in job_id for job_id in ids))
         self.assertTrue(any("mappo" in job_id for job_id in ids))
 
+    def test_plot_ablation_includes_a0_to_a5(self):
+        manifest = build_manifest(_args(stage="plot_ablation", seeds="11"))
+        joined = " ".join(manifest["jobs"][0]["command"])
+        self.assertIn("compare_pursuit_evaluations.py", joined)
+        self.assertIn("A0_MLP_scratch=", joined)
+        self.assertIn("A5_HGAT_MATD3_OPT=", joined)
+        self.assertIn("MAPPO=", joined)
+
+    def test_same_scene_renders_five_methods(self):
+        args = _args(stage="same_scene", seeds="11")
+        args.scene_seed = 7000017
+        args.scene_level = "medium"
+        manifest = build_manifest(args)
+        ids = [job["id"] for job in manifest["jobs"]]
+        self.assertEqual(
+            ids,
+            ["same_scene_apf", "same_scene_frpn", "same_scene_mpc", "same_scene_mappo", "same_scene_matd3"],
+        )
+
     def test_difficulty_aggregate_requires_five_main_methods(self):
         manifest = build_manifest(_args(stage="aggregate", seeds="11,12"))
         compare = next(job for job in manifest["jobs"] if job["id"] == "difficulty_five_methods")
