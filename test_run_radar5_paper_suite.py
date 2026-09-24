@@ -68,6 +68,14 @@ class Radar5PaperSuiteTests(unittest.TestCase):
         self.assertFalse(any("mappo" in job_id for job_id in ids))
         self.assertTrue(any("ablation_a0" in job_id for job_id in ids))
 
+    def test_extreme_stage_only_targets_extreme(self):
+        manifest = build_manifest(_args(stage="evaluate_extreme", seeds="11"))
+        ids = [job["id"] for job in manifest["jobs"]]
+        self.assertTrue(ids)
+        self.assertTrue(all(job_id.endswith("_extreme") for job_id in ids))
+        self.assertTrue(any("hgat_matd3_opt" in job_id for job_id in ids))
+        self.assertTrue(any("mappo" in job_id for job_id in ids))
+
     def test_difficulty_aggregate_requires_five_main_methods(self):
         manifest = build_manifest(_args(stage="aggregate", seeds="11,12"))
         compare = next(job for job in manifest["jobs"] if job["id"] == "difficulty_five_methods")
@@ -75,6 +83,7 @@ class Radar5PaperSuiteTests(unittest.TestCase):
         for method in ("APF", "FRPN", "MPC", "MAPPO", "HGAT_MATD3_OPT"):
             self.assertIn(method, joined)
         self.assertIn("--require-methods", joined)
+        self.assertNotIn("Extreme", joined)
 
 
 if __name__ == "__main__":

@@ -177,3 +177,41 @@ python run_radar5_paper_suite.py --stage all --train-level nominal --dry-run
 - [ ] 消融表：A0–A5（或精简三组）
 - [ ] 定性图：训练域成功 + Hard 迁移案例（建筑、可见区间、捕获时刻）
 - [ ] 记录 commit、配置哈希、checkpoint 路径、硬件与框架版本
+
+---
+
+## 7. Extreme 极限难度（附录/压力测试，不改训练）
+
+正文主难度曲线仍用 Nominal / Medium / Hard。若要看更强遮挡与更快目标下的零样本表现，使用
+`configs/pursuit_v2/radar5_benchmark_extreme.json`（相对 Hard：更远开局、更快目标、更大建筑、
+更低检出概率；观测/动作维度与捕获条件不变）。**不要在 Extreme 上重新训练主方法。**
+
+| 参数 | Hard | Extreme |
+|---|---:|---:|
+| 三角开局距离 (m) | 9.5–11.0 | 10.5–12.0 |
+| 目标水平速度 (m/s) | 2.35 | 2.55 |
+| 目标垂直速度 (m/s) | 1.30 | 1.42 |
+| 建筑边长 (m) | 3.0–5.5 | 3.5–6.0 |
+| 建筑高度 (m) | 5.0–11.5 | 5.5–12.0 |
+| 雷达检出概率 | 0.80 | 0.70 |
+
+建议先用校准 seed `6000100..6000139` 看 MPC 捕获率是否落在约 45–65%（有区分但未坍塌）。满意后冻结配置，再用正式测试 `7000000..7000199`。
+
+```bash
+# 可选：40 回合 MPC 校准（不要用 7000000 段调参）
+python evaluate_3d_baselines.py \
+  --env-config configs/pursuit_v2/radar5_benchmark_extreme.json \
+  --methods mpc --seed-start 6000100 --seed-count 40 --workers 8 \
+  --out outputs/radar5_medium_extreme_mpc_calibrate_40.json
+
+# Extreme 规则基线
+python run_radar5_paper_suite.py --stage baselines_extreme --train-level medium
+
+# 已有 Medium checkpoint 的零样本评估
+python run_radar5_paper_suite.py --stage evaluate_extreme --train-level medium --seeds 11,12,13
+
+# 拼上 Nominal/Medium/Hard 已有结果，画四档难度图
+python run_radar5_paper_suite.py --stage aggregate_extreme --train-level medium --seeds 11,12,13
+```
+
+注意：若 MATD3 的 `best_capture` 锁在 episode 0，Extreme 上评 `best_capture.pt` 实际评的是 DAgger 初始化；建议同时评 `final.pt` 并在文中写明选模规则。

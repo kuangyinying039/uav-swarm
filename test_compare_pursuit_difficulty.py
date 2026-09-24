@@ -13,13 +13,28 @@ class DifficultyComparisonTests(unittest.TestCase):
         ]
         validate_matrix(rows, methods)
 
+    def test_extreme_matrix_is_optional(self):
+        methods = ("APF", "MPC")
+        rows = [
+            {"difficulty": difficulty, "label": method}
+            for difficulty in ("Hard", "Extreme")
+            for method in methods
+        ]
+        validate_matrix(rows, methods)
+        with self.assertRaisesRegex(ValueError, "Extreme:MPC"):
+            validate_matrix(
+                [{"difficulty": "Hard", "label": "MPC"}],
+                ("MPC",),
+                required_difficulties=("Hard", "Extreme"),
+            )
+
     def test_missing_method_is_rejected(self):
         rows = [
             {"difficulty": "Nominal", "label": "MPC"},
             {"difficulty": "Medium", "label": "MPC"},
         ]
-        with self.assertRaisesRegex(ValueError, "Hard:MPC"):
-            validate_matrix(rows, ("MPC",))
+        with self.assertRaisesRegex(ValueError, "Medium:APF|Nominal:APF"):
+            validate_matrix(rows, ("MPC", "APF"))
 
     def test_duplicate_pair_is_rejected(self):
         rows = [

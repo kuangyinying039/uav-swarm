@@ -30,7 +30,14 @@ ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
 
 LEVELS = ("nominal", "medium", "hard")
-LEVEL_TITLE = {"nominal": "Nominal", "medium": "Medium", "hard": "Hard"}
+STRESS_LEVELS = ("extreme",)
+ALL_EVAL_LEVELS = LEVELS + STRESS_LEVELS
+LEVEL_TITLE = {
+    "nominal": "Nominal",
+    "medium": "Medium",
+    "hard": "Hard",
+    "extreme": "Extreme",
+}
 DEFAULT_SEEDS = (11, 12, 13)
 
 
@@ -97,6 +104,10 @@ class SuitePaths:
     @property
     def difficulty_dir(self) -> str:
         return f"outputs/{self.prefix}_difficulty_five_methods"
+
+    @property
+    def difficulty_dir_with_extreme(self) -> str:
+        return f"outputs/{self.prefix}_difficulty_with_extreme"
 
     @property
     def qualitative_dir(self) -> str:
@@ -187,9 +198,9 @@ def assets_commands(paths: SuitePaths, episodes: int) -> list[dict]:
     ]
 
 
-def baseline_commands(paths: SuitePaths) -> list[dict]:
+def baseline_commands(paths: SuitePaths, levels: Iterable[str] = LEVELS) -> list[dict]:
     rows = []
-    for level in LEVELS:
+    for level in levels:
         rows.append({
             "id": f"baseline_{level}",
             "command": [
@@ -436,6 +447,23 @@ def aggregate_commands(
                 f"{title}:HGAT_MATD3_OPT={paths.aggregate('HGAT_MATD3_OPT', level)}",
             ])
         rows.append({"id": "difficulty_five_methods", "command": compare})
+    if include_main and tuple(level_list) == ALL_EVAL_LEVELS:
+        compare = [
+            PYTHON, str(ROOT / "compare_pursuit_difficulty.py"),
+            "--require-methods", "APF", "FRPN", "MPC", "MAPPO", "HGAT_MATD3_OPT",
+            "--require-difficulties", "Nominal", "Medium", "Hard", "Extreme",
+            "--out-dir", paths.difficulty_dir_with_extreme,
+        ]
+        for level in ALL_EVAL_LEVELS:
+            title = LEVEL_TITLE[level]
+            for method in ("APF", "FRPN", "MPC"):
+                compare.extend(["--input", f"{title}:{method}={paths.baseline(level)}"])
+            compare.extend(["--input", f"{title}:MAPPO={paths.aggregate('MAPPO', level)}"])
+            compare.extend([
+                "--input",
+                f"{title}:HGAT_MATD3_OPT={paths.aggregate('HGAT_MATD3_OPT', level)}",
+            ])
+        rows.append({"id": "difficulty_with_extreme", "command": compare})
     return rows
 
 
@@ -488,7 +516,9 @@ def build_manifest(args) -> dict:
     if stage in ("assets", "all"):
         jobs.extend(assets_commands(paths, args.episodes))
     if stage in ("baselines", "all"):
-        jobs.extend(baseline_commands(paths))
+        jobs.extend(baseline_commands(paths, LEVELS))
+    if stage == "baselines_extreme":
+        jobs.extend(baseline_commands(paths, STRESS_LEVELS))
     if stage in ("train_main", "all"):
         jobs.extend(train_main_commands(paths, seeds, args.episodes))
     if stage in ("train_ablation", "all"):
@@ -501,6 +531,17 @@ def build_manifest(args) -> dict:
                 include_main=True,
                 ablation_ids=ABLATION_VARIANTS if args.include_ablation_eval else (),
                 levels=LEVELS,
+            )
+        )
+    if stage == "evaluate_extreme":
+        # Zero-shot stress test of already-trained Medium checkpoints.
+        jobs.extend(
+            evaluate_commands(
+                paths,
+                seeds,
+                include_main=True,
+                ablation_ids=(),
+                levels=STRESS_LEVELS,
             )
         )
     if stage in ("evaluate_ablation", "all"):
@@ -522,6 +563,16 @@ def build_manifest(args) -> dict:
                 include_main=True,
                 ablation_ids=ABLATION_VARIANTS if args.include_ablation_eval else (),
                 levels=LEVELS,
+            )
+        )
+    if stage == "aggregate_extreme":
+        jobs.extend(
+            aggregate_commands(
+                paths,
+                seeds,
+                include_main=True,
+                ablation_ids=(),
+                levels=ALL_EVAL_LEVELS,
             )
         )
     if stage in ("aggregate_ablation", "all"):
@@ -575,8 +626,9 @@ def main() -> None:
     parser.add_argument(
         "--stage",
         choices=[
-            "assets", "baselines", "train_main", "train_ablation",
-            "evaluate", "evaluate_ablation", "aggregate", "aggregate_ablation",
+            "assets", "baselines", "baselines_extreme", "train_main", "train_ablation",
+            "evaluate", "evaluate_extreme", "evaluate_ablation",
+            "aggregate", "aggregate_extreme", "aggregate_ablation",
             "qualitative", "all",
         ],
         default="all",
