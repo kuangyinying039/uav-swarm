@@ -734,7 +734,8 @@ def main() -> None:
     parser.add_argument(
         "--scene-level", choices=ALL_EVAL_LEVELS, default=None,
         help="Environment profile for --stage same_scene (default: train-level)",
-    )    parser.add_argument(
+    )
+    parser.add_argument(
         "--include-ablation-eval", action="store_true",
         help="Also evaluate/aggregate A0–A4 across difficulties (expensive).",
     )
