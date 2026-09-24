@@ -174,10 +174,28 @@ def main():
         env_cfg = load_environment_config(payload["env_config"])
         recorded = payload.get("train_config", {})
     elif args.actor_init:
+        # Keep CLI --env-config as the training/evaluation domain. Actor-init only
+        # supplies weights; overwriting env from the imitation checkpoint would
+        # silently force Nominal training when the user asked for Medium/Hard.
         actor_init_payload = torch.load(args.actor_init, map_location="cpu", weights_only=False)
-        if "env_config" in actor_init_payload:
-            env_cfg = load_environment_config(actor_init_payload["env_config"])
         recorded = actor_init_payload.get("train_config", {})
+        if "env_config" in actor_init_payload:
+            init_cfg = load_environment_config(actor_init_payload["env_config"])
+            init_env = QuadrotorPursuitEnv(init_cfg)
+            train_env = QuadrotorPursuitEnv(env_cfg)
+            init_shape = (
+                init_cfg.n_uavs, init_cfg.n_targets,
+                init_env.obs_dim(), init_env.state_dim(), init_env.continuous_action_dim(),
+            )
+            train_shape = (
+                env_cfg.n_uavs, env_cfg.n_targets,
+                train_env.obs_dim(), train_env.state_dim(), train_env.continuous_action_dim(),
+            )
+            if init_shape != train_shape:
+                parser.error(
+                    "--actor-init checkpoint input/action dimensions differ from --env-config: "
+                    f"actor-init={init_shape}, env-config={train_shape}"
+                )
     if args.actor_init and args.no_gat:
         parser.error("--actor-init contains an HGAT actor and cannot be combined with --no-gat")
     if args.prior_fraction is None:

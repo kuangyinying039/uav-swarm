@@ -56,7 +56,7 @@ class ScenarioTests(unittest.TestCase):
     def test_radar5_benchmark_profiles_keep_contract_and_raise_difficulty(self):
         root = Path(__file__).parent / "configs/pursuit_v2"
         names = ("radar5_benchmark_nominal.json", "radar5_benchmark_medium.json",
-                 "radar5_benchmark_hard.json")
+                 "radar5_benchmark_hard.json", "radar5_benchmark_extreme.json")
         configs = [QuadrotorPursuitConfig(**json.loads((root / name).read_text(encoding="utf-8")))
                    for name in names]
         reference = configs[0]
@@ -69,17 +69,16 @@ class ScenarioTests(unittest.TestCase):
                              (reference.capture_mode, reference.target_diameter,
                               reference.capture_required_uavs, reference.capture_hold_steps,
                               reference.n_uavs, reference.building_state_capacity))
+            self.assertLessEqual(cfg.handoff_formation_max_distance, cfg.lidar_target_detection_range)
             for seed in range(3):
                 env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(**{**cfg.__dict__, "seed": seed}))
                 self.assertTrue(env.direct_visibility_mask().all())
                 self.assertEqual((env.obs_dim(), env.state_dim(), env.continuous_action_dim()),
                                  reference_shape)
-        self.assertLess(configs[0].target_speed, configs[1].target_speed)
-        self.assertLess(configs[1].target_speed, configs[2].target_speed)
-        self.assertLess(configs[0].handoff_formation_min_distance,
-                        configs[1].handoff_formation_min_distance)
-        self.assertLess(configs[1].handoff_formation_min_distance,
-                        configs[2].handoff_formation_min_distance)
+        for left, right in zip(configs, configs[1:]):
+            self.assertLess(left.target_speed, right.target_speed)
+            self.assertLess(left.handoff_formation_min_distance, right.handoff_formation_min_distance)
+            self.assertGreaterEqual(left.lidar_detection_probability, right.lidar_detection_probability)
 
     def test_mpc_agent_does_not_read_other_local_target_estimates(self):
         env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(building_count=0))

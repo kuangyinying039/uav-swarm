@@ -11,7 +11,7 @@ from artifact_paths import artifact_path, default_output
 from compare_pursuit_evaluations import FIELDS, load_row
 
 
-DIFFICULTY_ORDER = {"Nominal": 0, "Medium": 1, "Hard": 2}
+DIFFICULTY_ORDER = {"Nominal": 0, "Medium": 1, "Hard": 2, "Extreme": 3}
 
 
 def load_spec(spec):
@@ -23,18 +23,37 @@ def load_spec(spec):
     return row
 
 
-def validate_matrix(rows, required_methods=()):
-    """Reject incomplete or duplicate difficulty-by-method comparisons."""
+def ordered_difficulties(rows):
+    present = {row["difficulty"] for row in rows}
+    return sorted(present, key=lambda name: DIFFICULTY_ORDER[name])
+
+
+def validate_matrix(rows, required_methods=(), required_difficulties=None):
+    """Reject incomplete or duplicate difficulty-by-method comparisons.
+
+    By default, completeness is checked only over difficulties present in the
+    inputs so a three-level paper figure and a four-level Extreme stress plot
+    can share the same tool. Pass ``required_difficulties`` to force a full grid.
+    """
     pairs = [(row["difficulty"], row["label"]) for row in rows]
     if len(pairs) != len(set(pairs)):
         duplicates = sorted({pair for pair in pairs if pairs.count(pair) > 1})
         raise ValueError(f"Duplicate difficulty/method inputs: {duplicates}")
     unknown = sorted({row["difficulty"] for row in rows} - set(DIFFICULTY_ORDER))
     if unknown:
-        raise ValueError(f"Unknown difficulties {unknown}; use Nominal, Medium, or Hard")
+        raise ValueError(
+            f"Unknown difficulties {unknown}; use Nominal, Medium, Hard, or Extreme"
+        )
+    if required_difficulties is None:
+        difficulties = ordered_difficulties(rows)
+    else:
+        difficulties = list(required_difficulties)
+        bad = sorted(set(difficulties) - set(DIFFICULTY_ORDER))
+        if bad:
+            raise ValueError(f"Unknown required difficulties {bad}")
     missing = [
         f"{difficulty}:{method}"
-        for difficulty in DIFFICULTY_ORDER
+        for difficulty in difficulties
         for method in required_methods
         if (difficulty, method) not in set(pairs)
     ]
@@ -42,17 +61,19 @@ def validate_matrix(rows, required_methods=()):
         raise ValueError("Incomplete difficulty comparison; missing " + ", ".join(missing))
 
 
-def _points(rows, method, key, x0, y0, width, height, low, high):
+def _points(rows, method, key, x0, y0, width, height, low, high, difficulties):
     selected = sorted(
         (row for row in rows if row["label"] == method and row.get(key) is not None),
         key=lambda row: DIFFICULTY_ORDER.get(row["difficulty"], 999),
     )
+    span = max(len(difficulties) - 1, 1)
+    index_of = {name: index for index, name in enumerate(difficulties)}
     points = []
     for row in selected:
-        index = DIFFICULTY_ORDER.get(row["difficulty"])
+        index = index_of.get(row["difficulty"])
         if index is None:
             continue
-        x = x0 + index * width / 2
+        x = x0 + index * width / span
         y = y0 + height * (1.0 - (float(row[key]) - low) / (high - low))
         points.append((x, y))
     return points
@@ -60,6 +81,7 @@ def _points(rows, method, key, x0, y0, width, height, low, high):
 
 def write_svg(path, rows):
     methods = list(dict.fromkeys(row["label"] for row in rows))
+    difficulties = ordered_difficulties(rows)
     panels = (
         ("Capture rate", "capture_rate", 0.0, 1.0),
         ("Team visibility ratio", "mean_team_visibility_ratio", 0.0, 1.0),
@@ -84,12 +106,18 @@ def write_svg(path, rows):
                 f'<text x="{x0-8}" y="{y+4:.1f}" text-anchor="end" font-size="10">'
                 f'{low+(high-low)*fraction:.2g}</text>'
             )
-        for index, difficulty in enumerate(("Nominal", "Medium", "Hard")):
-            x = x0 + index * panel_width / 2
-            body.append(f'<text x="{x:.1f}" y="430" text-anchor="middle" font-size="11">{difficulty}</text>')
+        span = max(len(difficulties) - 1, 1)
+        for index, difficulty in enumerate(difficulties):
+            x = x0 + index * panel_width / span
+            body.append(
+                f'<text x="{x:.1f}" y="430" text-anchor="middle" font-size="11">'
+                f'{html.escape(difficulty)}</text>'
+            )
         for method_index, method in enumerate(methods):
             color = colors[method_index % len(colors)]
-            points = _points(rows, method, key, x0, y0, panel_width, panel_height, low, high)
+            points = _points(
+                rows, method, key, x0, y0, panel_width, panel_height, low, high, difficulties
+            )
             if len(points) > 1:
                 encoded = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
                 body.append(f'<polyline points="{encoded}" fill="none" stroke="{color}" stroke-width="2.5"/>')
@@ -111,13 +139,17 @@ def main():
     parser.add_argument("--input", action="append", required=True, metavar="DIFFICULTY:LABEL=PATH")
     parser.add_argument(
         "--require-methods", nargs="+", default=(), metavar="LABEL",
-        help="Require every listed method at Nominal, Medium, and Hard",
+        help="Require every listed method at each difficulty present in --input",
+    )
+    parser.add_argument(
+        "--require-difficulties", nargs="+", default=None, metavar="DIFFICULTY",
+        help="Optionally force a full difficulty grid (e.g. Nominal Medium Hard Extreme)",
     )
     parser.add_argument("--out-dir", type=artifact_path, default=default_output("radar5_difficulty_comparison"))
     args = parser.parse_args()
     try:
         rows = [load_spec(spec) for spec in args.input]
-        validate_matrix(rows, args.require_methods)
+        validate_matrix(rows, args.require_methods, args.require_difficulties)
     except (OSError, json.JSONDecodeError, ValueError) as error:
         parser.error(str(error))
     args.out_dir.mkdir(parents=True, exist_ok=True)
