@@ -203,6 +203,37 @@ class PursuitMatd3Tests(unittest.TestCase):
         action = trainer.deterministic_action(env.observe_search())
         self.assertEqual(action.shape, (env.cfg.n_uavs, 4))
 
+    def test_pre_rl_validation_does_not_claim_best_capture(self):
+        trainer = self.trainer()
+        with tempfile.TemporaryDirectory() as folder:
+            trainer.output_directory = Path(folder)
+            trainer.validation_seeds = [4]
+
+            def fake_evaluate(action_fn, env_cfg, seeds, method_name="matd3"):
+                del action_fn, env_cfg, seeds
+                rate = 0.94 if trainer.env_steps == 0 else 0.50
+                return {
+                    "summary": {
+                        method_name: {
+                            "capture_rate": rate,
+                            "mean_censored_steps": 60.0,
+                            "mean_return": 1.0,
+                        }
+                    }
+                }
+
+            trainer.validate(0, fake_evaluate)
+            self.assertFalse((trainer.output_directory / "best_capture.pt").exists())
+            self.assertTrue(trainer.validation_records[0]["pre_rl"])
+            self.assertFalse(trainer.validation_records[0]["considered_for_best"])
+            self.assertEqual(trainer.best_capture_score[0], -1.0)
+
+            trainer.env_steps = 1000
+            trainer.validate(100, fake_evaluate)
+            self.assertTrue((trainer.output_directory / "best_capture.pt").exists())
+            self.assertTrue(trainer.validation_records[1]["considered_for_best"])
+            self.assertAlmostEqual(trainer.best_capture_score[0], 0.50)
+
     def test_evaluate_demo_bc_checkpoint_does_not_require_prior_dataset(self):
         trainer = self.trainer(
             demo_bc_weight=1.0,

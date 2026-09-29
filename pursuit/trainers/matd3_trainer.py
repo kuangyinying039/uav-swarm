@@ -364,7 +364,16 @@ class Matd3Trainer:
             self.save_checkpoint(self.output_directory / "final.pt", episode=self.cfg.episodes)
         return self.history
 
-    def validate(self, episode, evaluate_policy):
+    def validate(self, episode, evaluate_policy, *, consider_for_best=None):
+        """Run held-out validation.
+
+        ``episode=0`` is the pre-RL snapshot (DAgger/BC init after critic
+        pretrain). It is logged and compared as a reference, but does **not**
+        compete for ``best_capture.pt`` — otherwise a warm-started actor that
+        later collapses under TD updates permanently owns the best checkpoint.
+        """
+        if consider_for_best is None:
+            consider_for_best = int(episode) > 0
         self.actor.eval()
         result = evaluate_policy(
             lambda obs, env: self.deterministic_action(obs),
@@ -375,8 +384,15 @@ class Matd3Trainer:
         self.actor.train()
         metrics = result["summary"]["matd3"]
         score = (metrics["capture_rate"], -metrics["mean_censored_steps"], metrics["mean_return"])
-        self.validation_records.append({"episode": episode, "env_steps": self.env_steps, **metrics})
-        if score > self.best_capture_score:
+        record = {
+            "episode": episode,
+            "env_steps": self.env_steps,
+            "pre_rl": int(episode) == 0 and int(self.env_steps) == 0,
+            "considered_for_best": bool(consider_for_best),
+            **metrics,
+        }
+        self.validation_records.append(record)
+        if consider_for_best and score > self.best_capture_score:
             self.best_capture_score = score
             self.best_actor_state = {key: value.detach().cpu().clone() for key, value in self.actor.state_dict().items()}
             self.save_checkpoint(self.output_directory / "best_capture.pt", episode=episode)
@@ -385,6 +401,6 @@ class Matd3Trainer:
         )
         print(
             f"[validation] episode={episode} capture_rate={metrics['capture_rate']:.3f} "
-            f"return={metrics['mean_return']:.2f}",
+            f"return={metrics['mean_return']:.2f} considered_for_best={bool(consider_for_best)}",
             flush=True,
         )

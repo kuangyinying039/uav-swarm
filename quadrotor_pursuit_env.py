@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -158,8 +158,10 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
         if min(self.decision_dt, self.max_horizontal_velocity, self.max_vertical_velocity,
                self.max_reference_yaw_rate, self.quadrotor_gravity) <= 0:
             raise ValueError("Decision period, speeds, yaw-rate limit and gravity must be positive")
-        if self.n_targets != 1 or self.capture_mode != "single_distance" or self.capture_required_uavs != 1:
-            raise ValueError("Distance pursuit requires one evader and any one active UAV to capture it")
+        if self.n_targets != 1 or self.capture_mode != "single_distance":
+            raise ValueError("Distance pursuit requires one evader and single_distance capture")
+        if not 1 <= int(self.capture_required_uavs) <= int(self.n_uavs):
+            raise ValueError("capture_required_uavs must be in [1, n_uavs]")
         if self.evader_policy not in ("repulsive", "occlusion"):
             raise ValueError("Pursuit evader_policy must be repulsive or occlusion")
 
@@ -299,6 +301,34 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
             from .pursuit_scenarios import advance_evader
         advance_evader(self, target_index, direction, dt)
 
+    def thu_velocity_actions(self, policy_actions: np.ndarray) -> np.ndarray:
+        """Map normalized policy actions to THU-UAV VelController inputs.
+
+        Uses the current quadrotor yaw and ``current_decision_dt``. Safe to call
+        from an Isaac / THU-UAV adapter without importing the simulator here.
+        """
+        try:
+            from thu_uav_velocity_bridge import (
+                current_yaw_from_quadrotor_states,
+                limits_from_pursuit_config,
+                velocity_action_for_thu,
+            )
+        except ImportError:
+            from .thu_uav_velocity_bridge import (
+                current_yaw_from_quadrotor_states,
+                limits_from_pursuit_config,
+                velocity_action_for_thu,
+            )
+        limits = replace(
+            limits_from_pursuit_config(self.cfg),
+            decision_dt=float(getattr(self, "current_decision_dt", self.cfg.decision_dt)),
+        )
+        return velocity_action_for_thu(
+            policy_actions,
+            current_yaw_from_quadrotor_states(self.quadrotor_states),
+            limits=limits,
+        )
+
     def continuous_action_dim(self) -> int:
         return 4
 
@@ -433,18 +463,22 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         return super().state_dim() + self.cfg.n_uavs * 13
 
     def _capture_geometry(self) -> tuple[bool, int, float]:
-        """Any active pursuer within twice the target diameter, in world 3-D."""
+        """Count active pursuers inside the capture sphere; need ``capture_required_uavs``."""
         target = np.array([*self.dynamic_targets[0], self.target_altitudes[0]])
         distances = np.linalg.norm(self.quadrotor_states[:, :3] - target, axis=1)
         count = int(np.count_nonzero((distances <= self.cfg.capture_radius) & ~self.disabled_uavs))
-        return count > 0, count, 0.0
+        return count >= int(self.cfg.capture_required_uavs), count, 0.0
 
     def minimum_capture_gap(self) -> float:
-        """Distance remaining outside the nearest capture sphere (metres)."""
+        """Metres still needed for the k-th closest active pursuer to enter capture."""
         target = np.array([*self.dynamic_targets[0], self.target_altitudes[0]])
         distances = np.linalg.norm(self.quadrotor_states[:, :3] - target, axis=1)
-        active = ~self.disabled_uavs
-        return float(max(np.min(distances[active])-self.cfg.capture_radius, 0.0)) if np.any(active) else float(self.cfg.grid_size)
+        active = distances[~self.disabled_uavs]
+        if not len(active):
+            return float(self.cfg.grid_size)
+        ordered = np.sort(active)
+        needed = min(int(self.cfg.capture_required_uavs), len(ordered))
+        return float(max(ordered[needed - 1] - self.cfg.capture_radius, 0.0))
 
     def step_joint(self, actions: np.ndarray) -> dict:
         try:

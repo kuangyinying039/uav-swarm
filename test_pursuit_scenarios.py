@@ -81,6 +81,41 @@ class ScenarioTests(unittest.TestCase):
         self.assertLess(configs[1].handoff_formation_min_distance,
                         configs[2].handoff_formation_min_distance)
 
+    def test_radar5_dual_profiles_require_two_uavs_and_include_extreme(self):
+        root = Path(__file__).parent / "configs/pursuit_v2"
+        names = (
+            "radar5_dual_nominal.json",
+            "radar5_dual_medium.json",
+            "radar5_dual_hard.json",
+            "radar5_dual_extreme.json",
+        )
+        configs = [QuadrotorPursuitConfig(**json.loads((root / name).read_text(encoding="utf-8")))
+                   for name in names]
+        reference = configs[0]
+        for cfg in configs:
+            self.assertEqual(cfg.capture_required_uavs, 2)
+            self.assertEqual(cfg.n_uavs, reference.n_uavs)
+            self.assertEqual(cfg.building_state_capacity, reference.building_state_capacity)
+            self.assertEqual(cfg.policy_observation_version, reference.policy_observation_version)
+        self.assertLess(configs[2].target_speed, configs[3].target_speed)
+        self.assertGreater(configs[2].lidar_detection_probability, configs[3].lidar_detection_probability)
+        self.assertGreater(configs[3].handoff_formation_min_distance, configs[2].handoff_formation_min_distance)
+        env = QuadrotorPursuitEnv.__new__(QuadrotorPursuitEnv)
+        env.cfg = QuadrotorPursuitConfig(building_count=0, capture_required_uavs=2, seed=3)
+        env.disabled_uavs = np.zeros(env.cfg.n_uavs, dtype=bool)
+        env.quadrotor_states = np.zeros((env.cfg.n_uavs, 13), dtype=float)
+        env.dynamic_targets = np.array([[5.0, 5.0]])
+        env.target_altitudes = np.array([5.0])
+        env.quadrotor_states[:, :3] = [[5, 5, 5], [15, 15, 5], [20, 20, 5]]
+        captured, count, _ = QuadrotorPursuitEnv._capture_geometry(env)
+        self.assertEqual(count, 1)
+        self.assertFalse(captured)
+        env.quadrotor_states[1, :3] = [5.2, 5.0, 5.0]
+        captured, count, _ = QuadrotorPursuitEnv._capture_geometry(env)
+        self.assertEqual(count, 2)
+        self.assertTrue(captured)
+        self.assertAlmostEqual(QuadrotorPursuitEnv.minimum_capture_gap(env), 0.0)
+
     def test_mpc_agent_does_not_read_other_local_target_estimates(self):
         env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(building_count=0))
         before = CooperativeGuidanceMPC3D().actions(env)[0]

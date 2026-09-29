@@ -8,7 +8,7 @@ class DifficultyComparisonTests(unittest.TestCase):
         methods = ("APF", "FRPN", "MPC", "MAPPO", "HGAT_MATD3")
         rows = [
             {"difficulty": difficulty, "label": method}
-            for difficulty in ("Nominal", "Medium", "Hard")
+            for difficulty in ("Nominal", "Medium", "Hard", "Extreme")
             for method in methods
         ]
         validate_matrix(rows, methods)
@@ -17,9 +17,18 @@ class DifficultyComparisonTests(unittest.TestCase):
         rows = [
             {"difficulty": "Nominal", "label": "MPC"},
             {"difficulty": "Medium", "label": "MPC"},
+            {"difficulty": "Hard", "label": "MPC"},
+            {"difficulty": "Extreme", "label": "APF"},
         ]
-        with self.assertRaisesRegex(ValueError, "Hard:MPC"):
+        with self.assertRaisesRegex(ValueError, "Extreme:MPC"):
             validate_matrix(rows, ("MPC",))
+
+    def test_three_difficulty_matrix_still_validates(self):
+        rows = [
+            {"difficulty": difficulty, "label": "MPC"}
+            for difficulty in ("Nominal", "Medium", "Hard")
+        ]
+        validate_matrix(rows, ("MPC",))
 
     def test_duplicate_pair_is_rejected(self):
         rows = [

@@ -40,9 +40,9 @@ Nominal 与原来的 `previous_models_current_radar.json` 参数相同。Medium 
 三档都使用相同的 100 个测试 seed：
 
 ```bash
-python evaluate_3d_baselines.py --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --methods apf frpn mpc --seed-start 7000000 --seed-count 100 --workers 8 --out outputs/benchmark_nominal_baselines_100.json
-python evaluate_3d_baselines.py --env-config configs/pursuit_v2/radar5_benchmark_medium.json --methods apf frpn mpc --seed-start 7000000 --seed-count 100 --workers 8 --out outputs/benchmark_medium_baselines_100.json
-python evaluate_3d_baselines.py --env-config configs/pursuit_v2/radar5_benchmark_hard.json --methods apf frpn mpc --seed-start 7000000 --seed-count 100 --workers 8 --out outputs/benchmark_hard_baselines_100.json
+python evaluate_3d_baselines.py --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --methods apf frpn mpc --seed-start 7000000 --seed-count 200 --workers 8 --out outputs/benchmark_nominal_baselines_200.json
+python evaluate_3d_baselines.py --env-config configs/pursuit_v2/radar5_benchmark_medium.json --methods apf frpn mpc --seed-start 7000000 --seed-count 200 --workers 8 --out outputs/benchmark_medium_baselines_200.json
+python evaluate_3d_baselines.py --env-config configs/pursuit_v2/radar5_benchmark_hard.json --methods apf frpn mpc --seed-start 7000000 --seed-count 200 --workers 8 --out outputs/benchmark_hard_baselines_200.json
 ```
 
 APF、FRPN 和 MPC 都只读取各无人机本地 KF/CI 航迹，不读取目标真值。MPC 是专家
@@ -53,19 +53,19 @@ APF、FRPN 和 MPC 都只读取各无人机本地 KF/CI 航迹，不读取目标
 MAPPO scratch：
 
 ```bash
-python train_pursuit_with_demos.py train --training-profile plain --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --bc-updates 0 --episodes 3000 --seed 11 --validation-seed 4000000 --validation-episodes 50 --validation-interval 50 --out outputs/radar5_mappo_scratch_seed11
+python train_pursuit_with_demos.py train --training-profile plain --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --bc-updates 0 --episodes 3000 --seed 11 --validation-seed 4000000 --validation-episodes 10 --validation-interval 200 --out outputs/radar5_mappo_scratch_seed11
 ```
 
 普通 MATD3 scratch（MLP actor，用于证明 HGAT 的贡献）：
 
 ```bash
-python train_pursuit_matd3.py train --no-gat --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --prior-fraction 0 --warmup-policy random --episodes 3000 --seed 11 --validation-seed 4000000 --validation-episodes 50 --validation-interval 50 --step-checkpoint-interval 10000 --out outputs/radar5_matd3_mlp_scratch_seed11
+python train_pursuit_matd3.py train --no-gat --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --prior-fraction 0 --warmup-policy random --episodes 3000 --seed 11 --validation-seed 4000000 --validation-episodes 10 --validation-interval 200 --step-checkpoint-interval 10000 --out outputs/radar5_matd3_mlp_scratch_seed11
 ```
 
 HGAT-MATD3 scratch：
 
 ```bash
-python train_pursuit_matd3.py train --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --prior-fraction 0 --warmup-policy random --episodes 3000 --seed 11 --validation-seed 4000000 --validation-episodes 50 --validation-interval 50 --step-checkpoint-interval 10000 --out outputs/radar5_hgat_matd3_scratch_seed11
+python train_pursuit_matd3.py train --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --prior-fraction 0 --warmup-policy random --episodes 3000 --seed 11 --validation-seed 4000000 --validation-episodes 10 --validation-interval 200 --step-checkpoint-interval 10000 --out outputs/radar5_hgat_matd3_scratch_seed11
 ```
 
 论文正式统计将上述命令分别用 `--seed 11`、`--seed 12`、`--seed 13` 运行。不同
@@ -87,8 +87,10 @@ python train_pursuit_matd3.py train --env-config configs/pursuit_v2/radar5_bench
 ```
 
 训练会自动生成 `initial.pt`，并在 `validation.json` 写入 `episode=0, env_steps=0`
-的训练前结果；`checkpoints/step_000010000.pt` 等文件用于画 0、10k、20k……环境步
-的性能曲线。
+的训练前结果（`pre_rl=true`）。该次验证只作 DAgger 上限参考，**不参与**
+`best_capture.pt` 竞选，避免 warm-start 永久占据最优 checkpoint。正式报告应分开写
+`initial.pt`（模仿上限）与 `best_capture.pt`（RL 后最优）。`checkpoints/step_*.pt`
+用于画 0、10k、20k……环境步的性能曲线。
 
 ## 5. 专家保持版本：HGAT-MATD3 + decaying BC
 
@@ -96,7 +98,7 @@ python train_pursuit_matd3.py train --env-config configs/pursuit_v2/radar5_bench
 纯 MATD3 对照仍使用 `--demo-bc-weight 0`。
 
 ```bash
-python train_pursuit_matd3.py train --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --actor-init outputs/radar5_dagger/best_imitation.pt --prior outputs/radar5_mpc_transitions200.pt --prior-fraction 0.5 --warmup-policy actor --demo-bc-weight 1.0 --demo-bc-final-weight 0.05 --demo-bc-decay-steps 150000 --episodes 3000 --seed 11 --validation-seed 4000000 --validation-episodes 50 --validation-interval 50 --step-checkpoint-interval 10000 --out outputs/radar5_hgat_matd3_dagger_bc_seed11
+python train_pursuit_matd3.py train --env-config configs/pursuit_v2/radar5_benchmark_nominal.json --actor-init outputs/radar5_dagger/best_imitation.pt --prior outputs/radar5_mpc_transitions200.pt --prior-fraction 0.5 --warmup-policy actor --demo-bc-weight 1.0 --demo-bc-final-weight 0.05 --demo-bc-decay-steps 150000 --episodes 3000 --seed 11 --validation-seed 4000000 --validation-episodes 10 --validation-interval 200 --step-checkpoint-interval 10000 --out outputs/radar5_hgat_matd3_dagger_bc_seed11
 ```
 
 `history.json` 和 `training.csv` 会额外记录 `actor_rl_loss`、`demo_bc_loss`、
@@ -109,24 +111,24 @@ actor 被 critic 更新破坏；如果 TD error 持续很大，则先处理 crit
 MATD3 示例：
 
 ```bash
-python train_pursuit_matd3.py evaluate --checkpoint outputs/radar5_hgat_matd3_dagger_bc_seed11/best_capture.pt --eval-env-config configs/pursuit_v2/radar5_benchmark_nominal.json --eval-seed 7000000 --eval-episodes 100 --methods matd3 --out outputs/eval_hgat_matd3_dagger_bc_nominal
-python train_pursuit_matd3.py evaluate --checkpoint outputs/radar5_hgat_matd3_dagger_bc_seed11/best_capture.pt --eval-env-config configs/pursuit_v2/radar5_benchmark_medium.json --eval-seed 7000000 --eval-episodes 100 --methods matd3 --out outputs/eval_hgat_matd3_dagger_bc_medium
-python train_pursuit_matd3.py evaluate --checkpoint outputs/radar5_hgat_matd3_dagger_bc_seed11/best_capture.pt --eval-env-config configs/pursuit_v2/radar5_benchmark_hard.json --eval-seed 7000000 --eval-episodes 100 --methods matd3 --out outputs/eval_hgat_matd3_dagger_bc_hard
+python train_pursuit_matd3.py evaluate --checkpoint outputs/radar5_hgat_matd3_dagger_bc_seed11/best_capture.pt --eval-env-config configs/pursuit_v2/radar5_benchmark_nominal.json --eval-seed 7000000 --eval-episodes 200 --methods matd3 --out outputs/eval_hgat_matd3_dagger_bc_nominal
+python train_pursuit_matd3.py evaluate --checkpoint outputs/radar5_hgat_matd3_dagger_bc_seed11/best_capture.pt --eval-env-config configs/pursuit_v2/radar5_benchmark_medium.json --eval-seed 7000000 --eval-episodes 200 --methods matd3 --out outputs/eval_hgat_matd3_dagger_bc_medium
+python train_pursuit_matd3.py evaluate --checkpoint outputs/radar5_hgat_matd3_dagger_bc_seed11/best_capture.pt --eval-env-config configs/pursuit_v2/radar5_benchmark_hard.json --eval-seed 7000000 --eval-episodes 200 --methods matd3 --out outputs/eval_hgat_matd3_dagger_bc_hard
 ```
 
 MAPPO 示例；checkpoint 已保存训练环境，因此不再传 `--env-config`：
 
 ```bash
-python train_pursuit_with_demos.py evaluate --checkpoint outputs/radar5_mappo_dagger_replay/best_capture.pt --eval-env-config configs/pursuit_v2/radar5_benchmark_hard.json --eval-seed 7000000 --eval-episodes 100 --methods mappo --out outputs/eval_mappo_dagger_replay_hard
+python train_pursuit_with_demos.py evaluate --checkpoint outputs/radar5_mappo_dagger_replay/best_capture.pt --eval-env-config configs/pursuit_v2/radar5_benchmark_hard.json --eval-seed 7000000 --eval-episodes 200 --methods mappo --out outputs/eval_mappo_dagger_replay_hard
 ```
 
 绘制难度曲线：
 
 ```bash
 python compare_pursuit_difficulty.py \
-  --input Nominal:MPC=outputs/benchmark_nominal_baselines_100.json \
-  --input Medium:MPC=outputs/benchmark_medium_baselines_100.json \
-  --input Hard:MPC=outputs/benchmark_hard_baselines_100.json \
+  --input Nominal:MPC=outputs/benchmark_nominal_baselines_200.json \
+  --input Medium:MPC=outputs/benchmark_medium_baselines_200.json \
+  --input Hard:MPC=outputs/benchmark_hard_baselines_200.json \
   --input Nominal:HGAT_MATD3_BC=outputs/eval_hgat_matd3_dagger_bc_nominal/evaluation.json \
   --input Medium:HGAT_MATD3_BC=outputs/eval_hgat_matd3_dagger_bc_medium/evaluation.json \
   --input Hard:HGAT_MATD3_BC=outputs/eval_hgat_matd3_dagger_bc_hard/evaluation.json \
@@ -137,3 +139,108 @@ python compare_pursuit_difficulty.py \
 UAV visibility、building occlusion、collision、safety correction magnitude、P90 safety
 interventions 和 intervention-free episode rate。单目标情况下 `target_visibility_rate` 与
 `team_visibility_ratio` 数学上相同，论文只保留后者。
+
+## 7. 双机捕获 + Extreme + Hard 混合训练（对照协议）
+
+旧 `radar5_benchmark_*` 仍是单机捕获，保留作历史对照。新协议使用：
+
+| 参数 | Dual Nominal | Dual Medium | Dual Hard | Dual Extreme |
+|---|---:|---:|---:|---:|
+| `capture_required_uavs` | 2 | 2 | 2 | 2 |
+| 三角初始距 (m) | 6–8 | 7.5–9.5 | 9.5–11 | 11–13 |
+| 目标水平速 (m/s) | 1.82 | 2.15 | 2.35 | 2.60 |
+| 雷达检出概率 | 0.90 | 0.85 | 0.80 | 0.55 |
+| 雷达量程 (m) | 12 | 12 | 12 | 9 |
+
+配置：`configs/pursuit_v2/radar5_dual_{nominal,medium,hard,extreme}.json`。
+观测/动作维度与旧 Radar5 一致，可零样本跨档评估；但捕获成功标签变了，**必须重采**
+MPC prior / DAgger（不要直接复用旧 `radar5_mpc_transitions200.pt` 的成功统计）。
+
+### 7.1 重采双机 Hard 专家数据
+
+```bash
+python train_pursuit_matd3.py collect-transitions \
+  --env-config configs/pursuit_v2/radar5_dual_hard.json \
+  --teacher mpc --demo-seed 2000000 --rollouts 200 \
+  --dataset outputs/radar5_dual_mpc_transitions200.pt
+```
+
+### 7.2 Hard 混合训练（Nominal/Medium/Hard 循环；验证用 Hard）
+
+A5 / HGAT-MATD3-Opt：
+
+```bash
+python train_pursuit_matd3.py train \
+  --mix-env-configs \
+    configs/pursuit_v2/radar5_dual_nominal.json \
+    configs/pursuit_v2/radar5_dual_medium.json \
+    configs/pursuit_v2/radar5_dual_hard.json \
+  --actor-init outputs/radar5_dagger/best_imitation.pt \
+  --prior outputs/radar5_dual_mpc_transitions200.pt \
+  --prior-fraction 0.5 --warmup-policy actor \
+  --critic-pretrain-updates 5000 \
+  --demo-bc-weight 1.0 --demo-bc-final-weight 0.05 --demo-bc-decay-steps 150000 \
+  --episodes 3000 --seed 11 \
+  --validation-seed 4000000 --validation-episodes 50 --validation-interval 100 \
+  --step-checkpoint-interval 10000 \
+  --out outputs/radar5_dual_hgat_matd3_opt_mix_seed11
+```
+
+MAPPO（同样 Hard 混合；若无双机 DAgger，可先用 plain 或旧 warm-start 权重试跑）：
+
+```bash
+python train_pursuit_with_demos.py train \
+  --training-profile plain \
+  --mix-env-configs \
+    configs/pursuit_v2/radar5_dual_nominal.json \
+    configs/pursuit_v2/radar5_dual_medium.json \
+    configs/pursuit_v2/radar5_dual_hard.json \
+  --bc-updates 0 --episodes 3000 --seed 11 \
+  --validation-seed 4000000 --validation-episodes 50 --validation-interval 100 \
+  --out outputs/radar5_dual_mappo_mix_seed11
+```
+
+`--mix-env-configs` 按 episode 轮转；`factory()` / 验证 / checkpoint 的 primary 环境是**列表最后一项（Hard）**。
+
+### 7.3 四档评估：MPC / MAPPO / A5
+
+```bash
+for DIFF in nominal medium hard extreme; do
+  python evaluate_3d_baselines.py \
+    --env-config configs/pursuit_v2/radar5_dual_${DIFF}.json \
+    --methods apf frpn mpc --seed-start 7000000 --seed-count 200 --workers 8 \
+    --out outputs/dual_benchmark_${DIFF}_baselines_200.json
+done
+
+for DIFF in nominal medium hard extreme; do
+  python train_pursuit_matd3.py evaluate \
+    --checkpoint outputs/radar5_dual_hgat_matd3_opt_mix_seed11/best_capture.pt \
+    --eval-env-config configs/pursuit_v2/radar5_dual_${DIFF}.json \
+    --eval-seed 7000000 --eval-episodes 200 --methods matd3 \
+    --out outputs/eval_dual_hgat_matd3_opt_${DIFF}
+  python train_pursuit_with_demos.py evaluate \
+    --checkpoint outputs/radar5_dual_mappo_mix_seed11/best_capture.pt \
+    --eval-env-config configs/pursuit_v2/radar5_dual_${DIFF}.json \
+    --eval-seed 7000000 --eval-episodes 200 --methods mappo \
+    --out outputs/eval_dual_mappo_${DIFF}
+done
+
+python compare_pursuit_difficulty.py \
+  --input Nominal:MPC=outputs/dual_benchmark_nominal_baselines_200.json \
+  --input Medium:MPC=outputs/dual_benchmark_medium_baselines_200.json \
+  --input Hard:MPC=outputs/dual_benchmark_hard_baselines_200.json \
+  --input Extreme:MPC=outputs/dual_benchmark_extreme_baselines_200.json \
+  --input Nominal:MAPPO=outputs/eval_dual_mappo_nominal/evaluation.json \
+  --input Medium:MAPPO=outputs/eval_dual_mappo_medium/evaluation.json \
+  --input Hard:MAPPO=outputs/eval_dual_mappo_hard/evaluation.json \
+  --input Extreme:MAPPO=outputs/eval_dual_mappo_extreme/evaluation.json \
+  --input Nominal:HGAT_MATD3_OPT=outputs/eval_dual_hgat_matd3_opt_nominal/evaluation.json \
+  --input Medium:HGAT_MATD3_OPT=outputs/eval_dual_hgat_matd3_opt_medium/evaluation.json \
+  --input Hard:HGAT_MATD3_OPT=outputs/eval_dual_hgat_matd3_opt_hard/evaluation.json \
+  --input Extreme:HGAT_MATD3_OPT=outputs/eval_dual_hgat_matd3_opt_extreme/evaluation.json \
+  --require-methods MPC MAPPO HGAT_MATD3_OPT \
+  --out-dir outputs/radar5_dual_difficulty_comparison
+```
+
+建议先用 `--seed-count 40` / `--eval-episodes 40` 做校准冒烟，确认 Dual Extreme 上 MPC
+捕获率明显低于 Dual Nominal，再跑满 200。

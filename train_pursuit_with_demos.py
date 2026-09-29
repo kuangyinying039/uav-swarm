@@ -27,6 +27,7 @@ from pursuit_graph_encoder import (
     PURSUIT_GRAPH_VERSION, PursuitGraphActor, pursuit_graph_from_flat_observation,
 )
 from pursuit_baselines_3d import BASELINES_3D
+from pursuit_env_mix import load_pursuit_config, make_pursuit_env_factory, mix_manifest
 from pursuit_lidar import accumulate_visibility, finalize_visibility
 from quadrotor_pursuit_env import QuadrotorPursuitConfig, QuadrotorPursuitEnv
 from pursuit_training_output import clean_history_row, write_pursuit_outputs, write_evaluation_chart, write_reward_capture_chart
@@ -841,6 +842,12 @@ def main():
     parser.add_argument("mode", choices=["collect", "pretrain", "train", "evaluate"])
     parser.add_argument("--training-profile", choices=["auto", "plain", "warmstart"], default="auto")
     parser.add_argument("--env-config", type=Path, help="JSON object of QuadrotorPursuitConfig overrides")
+    parser.add_argument(
+        "--mix-env-configs",
+        nargs="+",
+        type=Path,
+        help="Cycle these configs during training; validation/primary uses the last one",
+    )
     parser.add_argument("--eval-env-config", type=Path,
                         help="Evaluate a checkpoint in a different, dimension-compatible environment")
     parser.add_argument("--demos", type=artifact_path,
@@ -960,10 +967,21 @@ def main():
         parser.error("Counts must be positive (bc-updates may be zero for ablation)")
     seed_everything(args.seed)
     torch.set_num_threads(max(1, args.torch_threads))
-    env_cfg = QuadrotorPursuitConfig(**(json.loads(args.env_config.read_text(encoding="utf-8")) if args.env_config else {}))
+    if args.mix_env_configs and args.mode == "evaluate":
+        parser.error("--mix-env-configs is only valid for train/collect/pretrain")
+    if args.mix_env_configs:
+        if args.env_config:
+            parser.error("Use either --env-config or --mix-env-configs, not both")
+        mix_paths = list(args.mix_env_configs)
+        mix_cfgs = [load_pursuit_config(path) for path in mix_paths]
+        env_cfg = mix_cfgs[-1]
+    else:
+        mix_paths = []
+        mix_cfgs = []
+        env_cfg = QuadrotorPursuitConfig(**(json.loads(args.env_config.read_text(encoding="utf-8")) if args.env_config else {}))
+        env_cfg.building_state_capacity = max(env_cfg.building_state_capacity, env_cfg.building_count)
     if env_cfg.search_steps < 1:
         parser.error("search_steps must be positive")
-    env_cfg.building_state_capacity = max(env_cfg.building_state_capacity, env_cfg.building_count)
     args.out.mkdir(parents=True, exist_ok=True)
     if args.mode == "collect":
         dataset = collect_demos(env_cfg, args.demo_seed, args.demo_successes, args.demo_attempts, args.teacher, args.demos)
@@ -982,9 +1000,13 @@ def main():
                       checkpoint_path=str(args.out / "latest.pt"))
     if args.checkpoint:
         payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        env_cfg = load_environment_config(payload["env_config"])
-        if args.env_config:
-            parser.error("Checkpoint already defines the environment; omit --env-config")
+        if mix_cfgs:
+            if args.env_config:
+                parser.error("Mixed training already defines the environment; omit --env-config")
+        else:
+            env_cfg = load_environment_config(payload["env_config"])
+            if args.env_config:
+                parser.error("Checkpoint already defines the environment; omit --env-config")
         cfg = TrainConfig(**payload["train_config"])
         cfg.device = args.device
         if args.mode == "train":
@@ -1004,10 +1026,20 @@ def main():
             and requested_train_bank and recorded_train_bank != requested_train_bank):
         parser.error("Resume requires the same --train-seeds-file stored in the checkpoint")
     train_seed_bank = requested_train_bank or (recorded_train_bank if args.mode == "train" else [])
-    factory = lambda episode=0: QuadrotorPursuitEnv(
-        replace(env_cfg, seed=seed_for_episode(train_seed_bank, episode, args.seed))
-    )
+    if mix_cfgs:
+        factory, primary_cfg = make_pursuit_env_factory(
+            mix_cfgs,
+            seed_fn=lambda episode: seed_for_episode(train_seed_bank, episode, args.seed),
+            primary_index=-1,
+        )
+        env_cfg = primary_cfg
+    else:
+        factory = lambda episode=0: QuadrotorPursuitEnv(
+            replace(env_cfg, seed=seed_for_episode(train_seed_bank, episode, args.seed))
+        )
     trainer = PursuitDemoTrainer(factory, cfg)
+    if mix_paths:
+        trainer.demo_metadata.update(mix_manifest(mix_paths, env_cfg))
     if args.checkpoint:
         trainer.load_checkpoint(args.checkpoint)
         if args.mode == "train" and trainer.start_episode == 0 and trainer.reference_actor is None:

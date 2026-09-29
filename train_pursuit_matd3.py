@@ -15,6 +15,7 @@ from pursuit.algorithms.matd3 import Matd3Config
 from pursuit.data.transition_dataset import collect_teacher_transitions, json_sidecar, load_transition_dataset
 from pursuit.eval import evaluate_methods, evaluate_policy
 from pursuit.trainers.matd3_trainer import Matd3Trainer, mean_actor_state_from_checkpoint
+from pursuit_env_mix import load_pursuit_config, make_pursuit_env_factory, mix_manifest
 from pursuit_baselines_3d import BASELINES_3D
 from pursuit_graph_encoder import PURSUIT_GRAPH_VERSION
 from pursuit_training_output import write_evaluation_chart, write_pursuit_outputs
@@ -32,6 +33,12 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["collect-transitions", "train", "evaluate"])
     parser.add_argument("--env-config", type=Path, default=SOURCE_ROOT / "configs/pursuit_v2/learning_start.json")
+    parser.add_argument(
+        "--mix-env-configs",
+        nargs="+",
+        type=Path,
+        help="Cycle these configs during training; validation/primary uses the last one",
+    )
     parser.add_argument("--eval-env-config", type=Path,
                         help="Evaluate a checkpoint in a different, dimension-compatible environment")
     parser.add_argument("--out", type=artifact_path, default=default_output("pursuit_matd3_run"))
@@ -156,8 +163,17 @@ def main():
         parser.error("counts must be positive")
     seed_everything(args.seed)
     torch.set_num_threads(max(1, args.torch_threads))
-    env_cfg = QuadrotorPursuitConfig(**json.loads(Path(args.env_config).read_text(encoding="utf-8")))
-    env_cfg.building_state_capacity = max(env_cfg.building_state_capacity, env_cfg.building_count)
+    if args.mix_env_configs and args.mode == "evaluate":
+        parser.error("--mix-env-configs is only valid for train/collect-transitions")
+    if args.mix_env_configs:
+        mix_paths = list(args.mix_env_configs)
+        mix_cfgs = [load_pursuit_config(path) for path in mix_paths]
+        env_cfg = mix_cfgs[-1]
+    else:
+        mix_paths = []
+        mix_cfgs = []
+        env_cfg = QuadrotorPursuitConfig(**json.loads(Path(args.env_config).read_text(encoding="utf-8")))
+        env_cfg.building_state_capacity = max(env_cfg.building_state_capacity, env_cfg.building_count)
 
     if args.mode == "collect-transitions":
         args.dataset.parent.mkdir(parents=True, exist_ok=True)
@@ -171,11 +187,12 @@ def main():
     actor_init_payload = None
     if args.checkpoint:
         payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        env_cfg = load_environment_config(payload["env_config"])
+        if not mix_cfgs:
+            env_cfg = load_environment_config(payload["env_config"])
         recorded = payload.get("train_config", {})
     elif args.actor_init:
         actor_init_payload = torch.load(args.actor_init, map_location="cpu", weights_only=False)
-        if "env_config" in actor_init_payload:
+        if not mix_cfgs and "env_config" in actor_init_payload:
             env_cfg = load_environment_config(actor_init_payload["env_config"])
         recorded = actor_init_payload.get("train_config", {})
     if args.actor_init and args.no_gat:
@@ -203,10 +220,20 @@ def main():
         parser.error("demo BC regularization requires --prior")
     if args.mode == "train" and cfg.critic_pretrain_updates > 0 and args.prior is None:
         parser.error("critic pretraining requires --prior")
-    factory = lambda episode=0: QuadrotorPursuitEnv(
-        replace(env_cfg, seed=seed_for_episode(train_bank, episode, args.seed))
-    )
+    if mix_cfgs:
+        factory, primary_cfg = make_pursuit_env_factory(
+            mix_cfgs,
+            seed_fn=lambda episode: seed_for_episode(train_bank, episode, args.seed),
+            primary_index=-1,
+        )
+        env_cfg = primary_cfg
+    else:
+        factory = lambda episode=0: QuadrotorPursuitEnv(
+            replace(env_cfg, seed=seed_for_episode(train_bank, episode, args.seed))
+        )
     trainer = Matd3Trainer(factory, cfg, seed=args.seed)
+    if mix_paths:
+        trainer.demo_metadata.update(mix_manifest(mix_paths, env_cfg))
     if args.checkpoint:
         trainer.load_checkpoint(args.checkpoint)
     elif args.actor_init:
