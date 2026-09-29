@@ -34,6 +34,6 @@
   "lidar_vertical_min_deg": -7.0,
   "lidar_vertical_max_deg": 52.0,
   "lidar_scan_hz": 10.0,
-  "lidar_detection_probability": 0.55,
+  "lidar_detection_probability": 0.8,
   "search_steps": 300
 }
