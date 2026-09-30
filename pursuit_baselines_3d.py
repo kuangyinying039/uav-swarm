@@ -252,7 +252,7 @@ class CooperativeGuidanceMPC3D:
                 teacher_role[i] = 1
             goals[i] = np.asarray(goal, dtype=float)
             teacher_goal[i] = goals[i]
-        return goals, teacher_role, predicted_target, required
+        return goals, teacher_role, teacher_goal, predicted_target, required
 
     def plan(self, env) -> dict:
         """Return proposed actions plus interceptor/flanker labels for offline datasets.
@@ -266,7 +266,7 @@ class CooperativeGuidanceMPC3D:
         positions = env.quadrotor_states[:, :3]
         tracks = [_local_track(env, i) for i in range(c.n_uavs)]
         n_uavs = c.n_uavs
-        goals, teacher_role, predicted_target, required = self._assign_goals(
+        goals, teacher_role, teacher_goal, predicted_target, required = self._assign_goals(
             env, tracks, positions, self.horizon * dt
         )
         # Multi-UAV capture needs teammates closer than the legacy flank geometry.
