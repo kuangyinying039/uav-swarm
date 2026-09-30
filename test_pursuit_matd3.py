@@ -50,6 +50,43 @@ class PursuitMatd3Tests(unittest.TestCase):
         self.assertEqual(planned["teacher_role"].shape, (env.cfg.n_uavs,))
         self.assertTrue(set(planned["teacher_role"]).issubset({0, 1}))
 
+    def test_mpc_dual_capture_assigns_multiple_interceptors(self):
+        cfg = QuadrotorPursuitConfig(
+            seed=4, building_count=0, capture_required_uavs=2, search_steps=3
+        )
+        env = QuadrotorPursuitEnv.__new__(QuadrotorPursuitEnv)
+        env.cfg = cfg
+        env.current_decision_dt = cfg.decision_dt
+        env.disabled_uavs = np.zeros(cfg.n_uavs, dtype=bool)
+        env.quadrotor_states = np.zeros((cfg.n_uavs, 13), dtype=float)
+        env.quadrotor_states[:, 6] = 1.0
+        env.quadrotor_states[:, :3] = [[4.0, 5.0, 5.0], [6.0, 5.0, 5.0], [12.0, 12.0, 5.0]]
+        env.dynamic_targets = np.array([[5.0, 5.0]])
+        env.target_altitudes = np.array([5.0])
+        env.target_velocity = np.zeros((1, 2), dtype=float)
+        env.target_vertical_velocity = np.zeros(1, dtype=float)
+        # Minimal track memory: initialized local estimates at the true target.
+        class _Track:
+            def __init__(self):
+                self.initialized = True
+                self.mean = np.array([5.0, 5.0, 5.0, 0.0, 0.0, 0.0], dtype=float)
+
+        env.track_memory = [[_Track()] for _ in range(cfg.n_uavs)]
+        env.last_graph = np.ones((cfg.n_uavs, cfg.n_uavs), dtype=float)
+        env.buildings = []
+        env.building_heights = []
+        teacher = CooperativeGuidanceMPC3D()
+        teacher.reset(env)
+        planned = teacher.plan(env)
+        self.assertEqual(planned["capture_required_uavs"], 2)
+        self.assertGreaterEqual(int(np.count_nonzero(planned["teacher_role"] == 0)), 2)
+        # Intercept goals stay inside the capture sphere around the prediction.
+        for agent in np.flatnonzero(planned["teacher_role"] == 0):
+            offset = np.linalg.norm(
+                planned["teacher_goal"][agent] - planned["predicted_target"][agent]
+            )
+            self.assertLessEqual(offset, cfg.capture_radius + 1e-6)
+
     def test_transition_keeps_proposed_action_and_failures(self):
         env = QuadrotorPursuitEnv(self.env_cfg)
         teacher = CooperativeGuidanceMPC3D()

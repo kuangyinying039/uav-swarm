@@ -171,9 +171,11 @@ class FastResponseProportionalNavigation3D:
 class CooperativeGuidanceMPC3D:
     """Kinematic receding-horizon guidance above the common velocity-response flight model.
 
-    The closest pursuer intercepts the predicted target while the remaining
-    vehicles occupy lateral blocking points.  A compact velocity-reference
-    search accounts for terminal error, peers, buildings, and smoothness.
+    With ``capture_required_uavs == 1`` (legacy), the closest pursuer intercepts the
+    predicted target while teammates take lateral blocking points.  When the
+    environment needs multi-UAV capture (``capture_required_uavs >= 2``), the
+    ``k`` closest teammates all receive intercept goals inside the capture
+    sphere so the teacher matches the evaluation success rule.
     """
 
     horizon: int = 8
@@ -182,6 +184,8 @@ class CooperativeGuidanceMPC3D:
     separation_weight: float = 1.5
     building_weight: float = 4.0
     smoothness_weight: float = 0.25
+    # Fraction of capture_radius used to stagger multi-intercept goals (dual+).
+    multi_intercept_stagger_fraction: float = 0.35
     name: str = "cooperative_guidance_mpc_3d"
 
     def reset(self, env) -> None:
@@ -198,6 +202,58 @@ class CooperativeGuidanceMPC3D:
             clearance = min(clearance, float(np.linalg.norm(point - closest)))
         return clearance
 
+    def _assign_goals(self, env, tracks, positions, predicted_horizon_dt: float):
+        """Return per-agent goals, roles, and predicted intercept points."""
+        c = env.cfg
+        n_uavs = c.n_uavs
+        required = max(1, int(getattr(c, "capture_required_uavs", 1)))
+        capture_radius = float(getattr(c, "capture_radius", max(2.0 * getattr(c, "target_diameter", 0.5), 1e-6)))
+        stagger = min(
+            self.multi_intercept_stagger_fraction * capture_radius,
+            0.45 * capture_radius,
+        )
+        teacher_role = np.zeros(n_uavs, dtype=np.int64)
+        teacher_goal = np.zeros((n_uavs, 3), dtype=np.float32)
+        predicted_target = np.zeros((n_uavs, 3), dtype=np.float32)
+        goals = [None] * n_uavs
+        for i in range(n_uavs):
+            target_position, target_velocity = tracks[i]
+            visible_peers = np.flatnonzero(env.policy_peer_mask(i))
+            if not len(visible_peers):
+                visible_peers = np.array([i], dtype=int)
+            order = sorted(
+                visible_peers.tolist(),
+                key=lambda agent: float(np.linalg.norm(positions[agent] - target_position)),
+            )
+            interceptors = order[: min(required, len(order))]
+            predicted = target_position + target_velocity * predicted_horizon_dt
+            predicted_target[i] = predicted
+            if i in interceptors:
+                rank = interceptors.index(i)
+                if required <= 1:
+                    goal = predicted
+                else:
+                    angle = 2.0 * math.pi * rank / max(required, 1)
+                    goal = predicted + stagger * np.array(
+                        [math.cos(angle), math.sin(angle), 0.0], dtype=float
+                    )
+                teacher_role[i] = 0
+            else:
+                flankers = [agent for agent in order if agent not in interceptors]
+                flank_rank = flankers.index(i)
+                speed_xy = float(np.linalg.norm(target_velocity[:2]))
+                evader_heading = (
+                    math.atan2(target_velocity[1], target_velocity[0]) if speed_xy > 1e-6 else 0.0
+                )
+                angle = evader_heading + math.pi / 2.0 + flank_rank * math.pi
+                goal = predicted + self.flank_radius * np.array(
+                    [math.cos(angle), math.sin(angle), 0.25], dtype=float
+                )
+                teacher_role[i] = 1
+            goals[i] = np.asarray(goal, dtype=float)
+            teacher_goal[i] = goals[i]
+        return goals, teacher_role, predicted_target, required
+
     def plan(self, env) -> dict:
         """Return proposed actions plus interceptor/flanker labels for offline datasets.
 
@@ -210,28 +266,21 @@ class CooperativeGuidanceMPC3D:
         positions = env.quadrotor_states[:, :3]
         tracks = [_local_track(env, i) for i in range(c.n_uavs)]
         n_uavs = c.n_uavs
+        goals, teacher_role, predicted_target, required = self._assign_goals(
+            env, tracks, positions, self.horizon * dt
+        )
+        # Multi-UAV capture needs teammates closer than the legacy flank geometry.
+        separation_weight = (
+            0.35 * self.separation_weight if required >= 2 else self.separation_weight
+        )
+        min_peer_distance = 0.45 if required >= 2 else 0.2
         actions = []
-        teacher_role = np.zeros(n_uavs, dtype=np.int64)
-        teacher_goal = np.zeros((n_uavs, 3), dtype=np.float32)
-        predicted_target = np.zeros((n_uavs, 3), dtype=np.float32)
         candidate_velocity = np.zeros((n_uavs, 11, 3), dtype=np.float32)
         selected_velocity = np.zeros((n_uavs, 3), dtype=np.float32)
         for i, state in enumerate(env.quadrotor_states):
             target_position, target_velocity = tracks[i]
             visible_peers = np.flatnonzero(env.policy_peer_mask(i))
-            interceptor = int(visible_peers[np.argmin(np.linalg.norm(positions[visible_peers]-target_position, axis=1))])
-            flankers = [agent for agent in visible_peers if agent != interceptor]
-            predicted = target_position + target_velocity * (self.horizon * dt)
-            if i == interceptor:
-                goal = predicted
-                teacher_role[i] = 0
-            else:
-                flank_rank = flankers.index(i)
-                evader_heading = math.atan2(target_velocity[1], target_velocity[0]) if np.linalg.norm(target_velocity[:2]) > 1e-6 else 0.0
-                angle = evader_heading + math.pi / 2.0 + flank_rank * math.pi
-                goal = predicted + self.flank_radius * np.array([math.cos(angle), math.sin(angle), 0.25])
-                teacher_role[i] = 1
-
+            goal = goals[i]
             direct = _unit(goal - state[:3])
             tangent = _unit(np.array([-direct[1], direct[0], 0.0]))
             candidates = []
@@ -251,9 +300,10 @@ class CooperativeGuidanceMPC3D:
                 endpoint = state[:3] + velocity * (self.horizon * dt)
                 cost = self.terminal_weight * float(np.sum((endpoint - goal) ** 2))
                 cost += self.smoothness_weight * float(np.sum((velocity - self.previous_velocity[i]) ** 2))
-                peer_distance = np.linalg.norm(positions[[j for j in visible_peers if j != i]] - endpoint, axis=1)
-                if len(peer_distance):
-                    cost += self.separation_weight / max(float(np.min(peer_distance)), 0.2) ** 2
+                peer_ids = [j for j in visible_peers if j != i]
+                if peer_ids:
+                    peer_distance = np.linalg.norm(positions[peer_ids] - endpoint, axis=1)
+                    cost += separation_weight / max(float(np.min(peer_distance)), min_peer_distance) ** 2
                 clearance = self._building_clearance(endpoint, env)
                 if np.isfinite(clearance):
                     cost += self.building_weight / max(clearance, 0.2) ** 2
@@ -261,8 +311,6 @@ class CooperativeGuidanceMPC3D:
                     best_cost, best_velocity = cost, velocity
             self.previous_velocity[i] = best_velocity
             actions.append(_reference_action(env, i, best_velocity))
-            teacher_goal[i] = goal
-            predicted_target[i] = predicted
             candidate_velocity[i] = np.stack(candidates[:11])
             selected_velocity[i] = best_velocity
         return {
@@ -272,6 +320,7 @@ class CooperativeGuidanceMPC3D:
             "predicted_target": predicted_target,
             "candidate_velocity": candidate_velocity,
             "selected_velocity": selected_velocity,
+            "capture_required_uavs": int(required),
         }
 
     def actions(self, env) -> np.ndarray:
