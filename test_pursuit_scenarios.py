@@ -10,10 +10,11 @@ from pursuit_baselines_3d import CooperativeGuidanceMPC3D
 class ScenarioTests(unittest.TestCase):
     def test_limits_and_capture_contract(self):
         cfg = QuadrotorPursuitConfig()
+        self.assertAlmostEqual(cfg.building_min_gap, 0.25)
         self.assertAlmostEqual(cfg.target_speed/cfg.max_horizontal_velocity, 1.3)
         self.assertGreater(cfg.target_vertical_speed, cfg.max_vertical_velocity)
         self.assertEqual((cfg.capture_radius, cfg.target_diameter, cfg.capture_required_uavs,
-                          cfg.capture_hold_steps), (1., .5, 1, 1))
+                          cfg.capture_hold_steps), (1., .5, 2, 1))
         self.assertEqual(QuadrotorPursuitConfig(target_diameter=.7).capture_radius, 1.4)
         velocity = np.zeros(3)
         for _ in range(100):

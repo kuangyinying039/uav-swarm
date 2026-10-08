@@ -53,8 +53,16 @@ def mean_actor_state_from_checkpoint(payload):
 class Matd3Trainer:
     def __init__(self, env_factory, cfg: Matd3Config, seed=0):
         probe = env_factory()
-        if not isinstance(probe, QuadrotorPursuitEnv):
-            raise ValueError("MATD3 trainer is restricted to quadrotor pursuit")
+        required_env_members = (
+            "cfg", "observe_search", "step_joint", "minimum_capture_gap",
+            "obs_dim", "state_dim", "continuous_action_dim",
+        )
+        missing_env_members = [name for name in required_env_members if not hasattr(probe, name)]
+        if missing_env_members:
+            raise TypeError(
+                "MATD3 trainer environment is missing required members: "
+                f"{missing_env_members}"
+            )
         if not np.isclose(cfg.gamma, probe.cfg.reward_gamma, atol=1e-10):
             raise ValueError("MATD3 gamma must equal environment reward_gamma")
         if cfg.utd < 1 or cfg.policy_delay < 1:

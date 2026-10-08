@@ -71,6 +71,7 @@ class PursuitConfig(WeakCommConfig):
     building_state_capacity: int = 0
     building_min_size: float = 2.0
     building_max_size: float = 4.5
+    building_min_gap: float = 0.25
     # Default paper environment: the evader both repels nearby pursuers and
     # seeks the far side of buildings to create line-of-sight occlusion.
     evader_policy: str = "occlusion"  # random, repulsive, occlusion, external

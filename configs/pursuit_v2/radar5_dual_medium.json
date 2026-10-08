@@ -1,6 +1,6 @@
 {
   "scenario_version": 3,
-  "execution_reward_version": 4,
+  "execution_reward_version": 5,
   "policy_observation_version": 2,
   "capture_mode": "single_distance",
   "target_diameter": 0.5,

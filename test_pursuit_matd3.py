@@ -152,6 +152,7 @@ class PursuitMatd3Tests(unittest.TestCase):
         stats = update_matd3(trainer, batch, update_actor=True)
         self.assertTrue(np.isfinite(stats["critic_loss"]))
         self.assertTrue(stats["updated_actor"])
+        self.assertTrue(all(parameter.grad is None for parameter in trainer.critic.parameters()))
 
     def test_demo_bc_regularizer_is_explicit_and_reports_drift(self):
         trainer = self.trainer(demo_bc_weight=1.0, demo_bc_final_weight=0.25,

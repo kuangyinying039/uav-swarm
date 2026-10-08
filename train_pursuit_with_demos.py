@@ -117,8 +117,16 @@ class PursuitActor(nn.Module):
 class PursuitDemoTrainer(MAPPOTrainer):
     def __init__(self, env_factory, cfg):
         probe = env_factory()
-        if not isinstance(probe, QuadrotorPursuitEnv):
-            raise ValueError("This trainer is restricted to quadrotor pursuit")
+        required_env_members = (
+            "cfg", "observe_search", "step_joint", "minimum_capture_gap",
+            "obs_dim", "state_dim", "continuous_action_dim",
+        )
+        missing_env_members = [name for name in required_env_members if not hasattr(probe, name)]
+        if missing_env_members:
+            raise TypeError(
+                "Pursuit trainer environment is missing required members: "
+                f"{missing_env_members}"
+            )
         if cfg.use_assignment_head or cfg.use_search_weights:
             raise ValueError("Pursuit demonstration training requires direct motion actions")
         if not math.isclose(cfg.gamma, probe.cfg.reward_gamma, abs_tol=1e-10):
@@ -203,27 +211,31 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.lidar_rates = []
         self.visibility_totals = {}
         self.visibility_steps = 0
-        original_step = self.active_env.step_joint
-        def timed_step(actions):
-            started = time.perf_counter()
-            result = original_step(actions)
-            self.environment_seconds += time.perf_counter() - started
-            accumulate_visibility(self.visibility_totals, result)
-            self.visibility_steps += 1
-            for key, value in result.get("reward_components", {}).items():
-                if key not in ("pursuit", "estimation"):
-                    self.reward_totals[key] = self.reward_totals.get(key, 0.0) + float(value)
-            self.closest_capture_gap = min(self.closest_capture_gap, result.get("minimum_capture_gap", float("inf")))
-            self.controller_rates.append(result.get("controller_feasible_rate", 0.0))
-            for key in self.safety_metrics:
-                self.safety_metrics[key].append(result[key])
-            for reasons in result['safety_reasons']:
-                for reason in reasons:
-                    self.safety_reason_counts[reason] = self.safety_reason_counts.get(reason, 0)+1
-            if "lidar_detection_ratio" in result:
-                self.lidar_rates.append(result["lidar_detection_ratio"])
-            return result
-        self.active_env.step_joint = timed_step
+        if not getattr(self.active_env, "_pursuit_timing_wrapped", False):
+            original_step = self.active_env.step_joint
+
+            def timed_step(actions):
+                started = time.perf_counter()
+                result = original_step(actions)
+                self.environment_seconds += time.perf_counter() - started
+                accumulate_visibility(self.visibility_totals, result)
+                self.visibility_steps += 1
+                for key, value in result.get("reward_components", {}).items():
+                    if key not in ("pursuit", "estimation"):
+                        self.reward_totals[key] = self.reward_totals.get(key, 0.0) + float(value)
+                self.closest_capture_gap = min(self.closest_capture_gap, result.get("minimum_capture_gap", float("inf")))
+                self.controller_rates.append(result.get("controller_feasible_rate", 0.0))
+                for key in self.safety_metrics:
+                    self.safety_metrics[key].append(result.get(key, 0.0))
+                for reasons in result.get("safety_reasons", []):
+                    for reason in reasons:
+                        self.safety_reason_counts[reason] = self.safety_reason_counts.get(reason, 0) + 1
+                if "lidar_detection_ratio" in result:
+                    self.lidar_rates.append(result["lidar_detection_ratio"])
+                return result
+
+            self.active_env.step_joint = timed_step
+            self.active_env._pursuit_timing_wrapped = True
         return self.active_env
 
     def _update(self, rollout, episode):
@@ -794,8 +806,14 @@ def load_environment_config(recorded):
             key in recorded for key in ("execution_mode", "sensor_mode", "nmpc_horizon")):
         raise ValueError("Old NMPC/FOV demonstrations or checkpoint are incompatible. "
                          "Recollect with the current velocity/MID-360 environment into a new file.")
-    if recorded.get("execution_reward_version") != 4:
-        raise ValueError("Safety execution and rewards changed to v4 lidar visibility shaping; recollect demos and retrain in a new directory")
+    reward_version = int(recorded.get("execution_reward_version", -1))
+    required_uavs = int(recorded.get("capture_required_uavs", 1))
+    expected_reward_version = 5 if required_uavs > 1 else 4
+    if reward_version != expected_reward_version:
+        raise ValueError(
+            f"Capture/reward contract requires execution_reward_version={expected_reward_version}; "
+            "recollect demos and retrain in a new directory"
+        )
     if recorded.get("pursuit_target_observable", False):
         raise ValueError("Pursuit is limited-FOV MID-360 lidar, not globally observable; recollect demonstrations")
     return QuadrotorPursuitConfig(**recorded)
@@ -810,6 +828,7 @@ def load_evaluation_environment_config(path, checkpoint_cfg):
     contract_fields = (
         "task_mode", "action_mode", "scenario_version",
         "policy_observation_version", "execution_reward_version", "capture_mode",
+        "capture_required_uavs",
     )
     changed_contracts = [
         field for field in contract_fields

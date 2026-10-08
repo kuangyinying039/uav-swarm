@@ -67,16 +67,24 @@ def make_transition(obs, action, result, labels, active, next_active):
     }
 
 
-def collect_teacher_transitions(env_cfg, first_seed, rollouts, teacher_name, progress_path=None):
+def collect_teacher_transitions(
+    env_cfg, first_seed, rollouts, teacher_name, progress_path=None,
+    *, env_factory=None, execution_backend="kinematic",
+):
     """Roll out the teacher and keep every episode, including timeouts."""
     if rollouts < 1:
         raise ValueError("Need at least one teacher rollout")
     episodes, report = [], []
     for seed in range(first_seed, first_seed + rollouts):
-        env = QuadrotorPursuitEnv(replace(env_cfg, seed=seed))
+        if env_factory is None:
+            env = QuadrotorPursuitEnv(replace(env_cfg, seed=seed))
+            obs = env.observe_search()
+        else:
+            env = env_factory(seed)
+            obs = env.reset(seed=seed)
         teacher = BASELINES_3D[teacher_name]()
         teacher.reset(env)
-        obs, trajectory = env.observe_search(), []
+        trajectory = []
         for step in range(env.cfg.search_steps):
             action, labels = teacher_step(teacher, env)
             active = ~env.disabled_uavs
@@ -96,7 +104,9 @@ def collect_teacher_transitions(env_cfg, first_seed, rollouts, teacher_name, pro
         if progress_path is not None:
             progress_path = Path(progress_path)
             progress_path.parent.mkdir(parents=True, exist_ok=True)
-            partial = _dataset_payload(env_cfg, teacher_name, episodes, report)
+            partial = _dataset_payload(
+                env_cfg, teacher_name, episodes, report, execution_backend
+            )
             torch.save(partial, progress_path)
             progress_path.with_suffix(".json").write_text(
                 json_sidecar(partial), encoding="utf-8"
@@ -105,13 +115,14 @@ def collect_teacher_transitions(env_cfg, first_seed, rollouts, teacher_name, pro
             f"[transitions] seed={seed} success={success} kept={len(episodes)}/{rollouts}",
             flush=True,
         )
-    return _dataset_payload(env_cfg, teacher_name, episodes, report)
+    return _dataset_payload(env_cfg, teacher_name, episodes, report, execution_backend)
 
 
-def _dataset_payload(env_cfg, teacher_name, episodes, report):
+def _dataset_payload(env_cfg, teacher_name, episodes, report, execution_backend="kinematic"):
     return {
         "format": TRANSITION_DATASET_V2,
         "env_config": asdict(env_cfg),
+        "execution_backend": str(execution_backend),
         "teacher": teacher_name,
         "episodes": episodes,
         "report": report,
@@ -131,9 +142,13 @@ def json_sidecar(dataset):
     return json.dumps(summary, indent=2)
 
 
-def validate_transition_dataset(dataset, env_cfg):
+def validate_transition_dataset(dataset, env_cfg, expected_backend=None):
     if dataset.get("format") != TRANSITION_DATASET_V2:
         raise ValueError("Expected pursuit_transition_dataset_v2; this file is not TD-complete")
+    if expected_backend is not None and dataset.get("execution_backend") != expected_backend:
+        raise ValueError(
+            f"Transition backend must be {expected_backend!r}; recollect data in the target simulator"
+        )
     recorded = asdict(QuadrotorPursuitConfig(**dataset["env_config"]))
     current = asdict(env_cfg)
     recorded.pop("seed", None)
@@ -163,9 +178,9 @@ def validate_transition_dataset(dataset, env_cfg):
     dataset["pursuit_graph_version"] = PURSUIT_GRAPH_VERSION
 
 
-def load_transition_dataset(path, env_cfg):
+def load_transition_dataset(path, env_cfg, expected_backend=None):
     dataset = torch.load(path, map_location="cpu", weights_only=False)
-    validate_transition_dataset(dataset, env_cfg)
+    validate_transition_dataset(dataset, env_cfg, expected_backend=expected_backend)
     return dataset
 
 

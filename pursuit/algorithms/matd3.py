@@ -72,6 +72,7 @@ def update_matd3(trainer, batch, update_actor):
     critic_loss.backward()
     critic_grad = nn.utils.clip_grad_norm_(trainer.critic.parameters(), cfg.max_grad_norm)
     trainer.critic_optim.step()
+    trainer.critic_optim.zero_grad(set_to_none=True)
 
     stats = {
         "critic_loss": float(critic_loss.detach()),
@@ -96,7 +97,16 @@ def update_matd3(trainer, batch, update_actor):
 
     proposed = trainer.actor(batch["obs"], batch["adjacency"], batch["graph"]).tanh()
     proposed = proposed * batch["active"].unsqueeze(-1)
-    actor_rl_loss = -trainer.critic.q1_only(batch["state"], flatten_actions(proposed)).mean()
+    critic_parameters = tuple(trainer.critic.parameters())
+    for parameter in critic_parameters:
+        parameter.requires_grad_(False)
+    try:
+        actor_rl_loss = -trainer.critic.q1_only(
+            batch["state"], flatten_actions(proposed)
+        ).mean()
+    finally:
+        for parameter in critic_parameters:
+            parameter.requires_grad_(True)
     actor_loss = actor_rl_loss
     is_prior = batch.get("is_prior")
     demo_bc_loss = None

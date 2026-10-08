@@ -30,7 +30,7 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     action_mode: str = "world_velocity_xyz_and_yaw_rate_to_autopilot"
     scenario_version: int = 3
     policy_observation_version: int = 2
-    execution_reward_version: int = 4
+    execution_reward_version: int = 5
     target_speed: float = 1.82  # 1.3 times pursuer horizontal speed; simulation assumption
     target_vertical_speed: float = 1.04
     initial_distance_min: float = 6.0
@@ -62,9 +62,10 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     reward_gamma: float = 0.995
     approach_distance_scale: float = 12.0
     nearest_approach_weight: float = 4.0
+    capture_team_progress_weight: float = 4.0
     capture_mode: str = "single_distance"
     target_diameter: float = 0.5  # simulation equivalent, not a hardware measurement
-    capture_required_uavs: int = 1
+    capture_required_uavs: int | None = None
     capture_hold_steps: int = 1
     individual_approach_weight: float = 2.0
     target_proximity_weight: float = 0.0
@@ -101,8 +102,10 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     lidar_mount_rpy_deg: tuple = (0.0, 0.0, 0.0)
 
     def __post_init__(self):
-        if self.execution_reward_version != 4:
-            raise ValueError("Use execution_reward_version=4 for lidar visibility shaping; recollect demonstrations")
+        if self.capture_required_uavs is None:
+            self.capture_required_uavs = 1 if self.execution_reward_version == 4 else 2
+        if self.execution_reward_version not in (4, 5):
+            raise ValueError("Unsupported pursuit reward version; recollect demonstrations")
         if not 0 < self.reward_gamma <= 1 or min(self.approach_distance_scale, self.boundary_reward_safe_distance, self.safety_buffer) <= 0:
             raise ValueError("Invalid shaping discount, distance scale, or safety buffer")
         if self.target_proximity_weight != 0:
@@ -110,7 +113,7 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
         if min(self.safety_correction_weight, self.boundary_proximity_weight, self.peer_proximity_weight,
                self.controller_rejection_penalty, self.obstacle_proximity_weight,
                self.individual_approach_weight, self.nearest_approach_weight, self.encirclement_progress_weight,
-               self.visibility_progress_weight) < 0:
+               self.capture_team_progress_weight, self.visibility_progress_weight) < 0:
             raise ValueError("Reward weights must be nonnegative")
         if min(self.encirclement_distance_scale, self.encirclement_height_scale,
                self.obstacle_reward_safe_distance, self.obstacle_reward_log_scale) <= 0:
@@ -162,6 +165,10 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
             raise ValueError("Distance pursuit requires one evader and single_distance capture")
         if not 1 <= int(self.capture_required_uavs) <= int(self.n_uavs):
             raise ValueError("capture_required_uavs must be in [1, n_uavs]")
+        if self.capture_required_uavs > 1 and self.execution_reward_version != 5:
+            raise ValueError("Multi-UAV capture shaping requires execution_reward_version=5")
+        if self.capture_required_uavs == 1 and self.execution_reward_version != 4:
+            raise ValueError("Single-UAV capture configs must use execution_reward_version=4")
         if self.evader_policy not in ("repulsive", "occlusion"):
             raise ValueError("Pursuit evader_policy must be repulsive or occlusion")
 
