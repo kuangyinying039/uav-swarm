@@ -96,3 +96,22 @@ class IsaacLidarMissingSensorTests(unittest.TestCase):
         bridge.clear_native_sensor_scan()
         self.assertIsNone(bridge.env._external_sensor_scan)
         self.assertEqual(bridge.last_sensor_diagnostics["sensor_mode"], "geometric_lidar_fallback")
+
+    def test_repro_quadrotor_env_supports_external_sensor_hooks(self):
+        from quadrotor_pursuit_env import (
+            QuadrotorPursuitConfig as ReproConfig,
+            QuadrotorPursuitEnv as ReproEnv,
+        )
+
+        env = ReproEnv(ReproConfig(building_count=0, n_obstacles=0, search_steps=3))
+        env.set_external_sensor_scan(
+            0.2,
+            {(0, 0): np.array([1.0, 2.0, 3.0])},
+            np.array([[True], [False], [False]], dtype=bool),
+            {(0, 0): 0.01},
+        )
+        measurement, variance = env._target_measurement(0, 0)
+        self.assertTrue(np.allclose(measurement, [1.0, 2.0, 3.0]))
+        self.assertAlmostEqual(variance, 0.01)
+        env.clear_external_sensor_scan()
+        self.assertIsNone(env._external_sensor_scan)

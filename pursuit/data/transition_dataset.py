@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import os
 from pathlib import Path
 
 import numpy as np
@@ -67,6 +68,45 @@ def make_transition(obs, action, result, labels, active, next_active):
     }
 
 
+def _same_collection_config(saved, env_cfg) -> bool:
+    left = dict(saved or {})
+    right = asdict(env_cfg)
+    left.pop("seed", None)
+    right.pop("seed", None)
+    return left == right
+
+
+def _resume_teacher_progress(progress_path, env_cfg, teacher_name, execution_backend, first_seed, rollouts):
+    path = Path(progress_path)
+    if not path.is_file():
+        return {}
+    try:
+        previous = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        print(f"[transitions] ignore unreadable progress {path}: {error}", flush=True)
+        return {}
+    if previous.get("teacher") != teacher_name or previous.get("execution_backend") != execution_backend:
+        print(f"[transitions] ignore progress with a different teacher or backend: {path}", flush=True)
+        return {}
+    if not _same_collection_config(previous.get("env_config"), env_cfg):
+        print(f"[transitions] ignore progress from a different environment profile: {path}", flush=True)
+        return {}
+    episodes = list(previous.get("episodes") or [])
+    report = list(previous.get("report") or [])
+    if len(episodes) != len(report):
+        print(f"[transitions] ignore progress with mismatched episodes and report: {path}", flush=True)
+        return {}
+    wanted = set(range(int(first_seed), int(first_seed) + int(rollouts)))
+    kept = {}
+    for episode, row in zip(episodes, report):
+        seed = int(row.get("seed", -1))
+        if seed in wanted and seed not in kept:
+            kept[seed] = (episode, row)
+    if kept:
+        print(f"[transitions] resume kept={len(kept)}/{rollouts} from {path}", flush=True)
+    return kept
+
+
 def collect_teacher_transitions(
     env_cfg, first_seed, rollouts, teacher_name, progress_path=None,
     *, env_factory=None, execution_backend="kinematic",
@@ -74,8 +114,20 @@ def collect_teacher_transitions(
     """Roll out the teacher and keep every episode, including timeouts."""
     if rollouts < 1:
         raise ValueError("Need at least one teacher rollout")
+    resumed = (
+        _resume_teacher_progress(
+            progress_path, env_cfg, teacher_name, execution_backend, first_seed, rollouts
+        )
+        if progress_path is not None
+        else {}
+    )
     episodes, report = [], []
     for seed in range(first_seed, first_seed + rollouts):
+        if seed in resumed:
+            episode, row = resumed[seed]
+            episodes.append(episode)
+            report.append(row)
+            continue
         if env_factory is None:
             env = QuadrotorPursuitEnv(replace(env_cfg, seed=seed))
             obs = env.observe_search()
@@ -107,10 +159,13 @@ def collect_teacher_transitions(
             partial = _dataset_payload(
                 env_cfg, teacher_name, episodes, report, execution_backend
             )
-            torch.save(partial, progress_path)
-            progress_path.with_suffix(".json").write_text(
-                json_sidecar(partial), encoding="utf-8"
-            )
+            temporary = progress_path.with_suffix(".pt.tmp")
+            torch.save(partial, temporary)
+            os.replace(temporary, progress_path)
+            sidecar = progress_path.with_suffix(".json")
+            sidecar_tmp = sidecar.with_suffix(".json.tmp")
+            sidecar_tmp.write_text(json_sidecar(partial), encoding="utf-8")
+            os.replace(sidecar_tmp, sidecar)
         print(
             f"[transitions] seed={seed} success={success} kept={len(episodes)}/{rollouts}",
             flush=True,
@@ -142,7 +197,20 @@ def json_sidecar(dataset):
     return json.dumps(summary, indent=2)
 
 
-def validate_transition_dataset(dataset, env_cfg, expected_backend=None):
+# Reward / shaping weights may differ for clean ablations that reuse the same
+# Medium geometry prior (e.g. A4c: visibility weight off, shared MPC prior).
+REWARD_ABLATION_IGNORE_KEYS = (
+    "visibility_progress_weight",
+    "encirclement_progress_weight",
+    "capture_team_progress_weight",
+    "individual_approach_weight",
+    "nearest_approach_weight",
+)
+
+
+def validate_transition_dataset(
+    dataset, env_cfg, expected_backend=None, *, ignore_config_keys=(),
+):
     if dataset.get("format") != TRANSITION_DATASET_V2:
         raise ValueError("Expected pursuit_transition_dataset_v2; this file is not TD-complete")
     if expected_backend is not None and dataset.get("execution_backend") != expected_backend:
@@ -153,6 +221,9 @@ def validate_transition_dataset(dataset, env_cfg, expected_backend=None):
     current = asdict(env_cfg)
     recorded.pop("seed", None)
     current.pop("seed", None)
+    for key in ignore_config_keys:
+        recorded.pop(key, None)
+        current.pop(key, None)
     if recorded != current:
         raise ValueError("Transition environment differs from training; regenerate with the same config")
     if not dataset["episodes"] or any(not episode for episode in dataset["episodes"]):
@@ -178,9 +249,16 @@ def validate_transition_dataset(dataset, env_cfg, expected_backend=None):
     dataset["pursuit_graph_version"] = PURSUIT_GRAPH_VERSION
 
 
-def load_transition_dataset(path, env_cfg, expected_backend=None):
+def load_transition_dataset(
+    path, env_cfg, expected_backend=None, *, ignore_config_keys=(),
+):
     dataset = torch.load(path, map_location="cpu", weights_only=False)
-    validate_transition_dataset(dataset, env_cfg, expected_backend=expected_backend)
+    validate_transition_dataset(
+        dataset,
+        env_cfg,
+        expected_backend=expected_backend,
+        ignore_config_keys=ignore_config_keys,
+    )
     return dataset
 
 
@@ -188,4 +266,23 @@ def flatten_transitions(dataset):
     rows = [row for episode in dataset["episodes"] for row in episode]
     if not rows:
         raise ValueError("Dataset contains no transitions")
+    return rows
+
+
+def flatten_successful_transitions(dataset):
+    """Keep transitions from episodes the dataset report marks as captures."""
+    episodes = list(dataset["episodes"])
+    report = list(dataset.get("report") or [])
+    if len(report) != len(episodes):
+        raise ValueError(
+            f"Cannot filter successes: report has {len(report)} rows for {len(episodes)} episodes"
+        )
+    rows = [
+        row
+        for episode, meta in zip(episodes, report)
+        if meta.get("success")
+        for row in episode
+    ]
+    if not rows:
+        raise ValueError("Dataset contains no successful episodes")
     return rows

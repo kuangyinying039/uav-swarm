@@ -24,7 +24,11 @@ def sensor_pose(env, agent):
 
 
 def lidar_visibility_report(env):
-    """Geometric MID-360 visibility: range, elevation/azimuth FOV, and building LOS."""
+    """Geometric MID-360 visibility: range, elevation/azimuth FOV, and building LOS.
+
+    Vectorized over UAVs for the common single-target pursuit case; falls back
+    to a per-agent loop when ``n_targets>1``.
+    """
     cfg = env.cfg
     n_uavs, n_targets = cfg.n_uavs, cfg.n_targets
     report = {
@@ -36,6 +40,35 @@ def lidar_visibility_report(env):
     }
     targets = np.column_stack([env.dynamic_targets, env.target_altitudes])
     disabled = np.asarray(getattr(env, "disabled_uavs", np.zeros(n_uavs, dtype=bool)), dtype=bool)
+    if n_targets == 1:
+        # Batch sensor frames for all active UAVs against the single target.
+        origins = np.zeros((n_uavs, 3), dtype=float)
+        rotations = np.zeros((n_uavs, 3, 3), dtype=float)
+        active = np.flatnonzero(~disabled)
+        for agent in active:
+            origins[agent], rotations[agent] = sensor_pose(env, agent)
+        target = targets[0]
+        local = np.einsum("nij,nj->ni", rotations[active], target - origins[active])
+        ranges = np.linalg.norm(local, axis=1)
+        horizontal = np.linalg.norm(local[:, :2], axis=1)
+        azimuth = np.rad2deg(np.arctan2(local[:, 1], local[:, 0]))
+        elevation = np.rad2deg(np.arctan2(local[:, 2], np.maximum(horizontal, 1e-12)))
+        in_range = (ranges >= cfg.lidar_min_range) & (ranges <= cfg.lidar_target_detection_range)
+        in_fov = (
+            (np.abs(azimuth) <= cfg.lidar_horizontal_fov_deg / 2)
+            & (elevation >= cfg.lidar_vertical_min_deg)
+            & (elevation <= cfg.lidar_vertical_max_deg)
+        )
+        los = np.array(
+            [env.has_line_of_sight_3d(origins[agent], target) for agent in active],
+            dtype=bool,
+        )
+        report["in_range"][active, 0] = in_range
+        report["in_fov"][active, 0] = in_fov
+        report["line_of_sight"][active, 0] = los
+        report["visible"][active, 0] = in_range & in_fov & los
+        report["building_occluded"][active, 0] = in_range & in_fov & ~los
+        return report
     for agent in range(n_uavs):
         if disabled[agent]:
             continue

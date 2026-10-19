@@ -6,9 +6,13 @@
 
 - 环境：3 架 Hummingbird，1 个目标，5 栋建筑；双机进入 1 m 捕获球后成功。
 - 决策频率：5 Hz，`decision_dt=0.2 s`；物理步 `physics_dt=0.01 s`；每回合最多 300 决策步，即 60 仿真秒。
-- 正式训练：每个算法/消融 3000 回合，training seeds 11、12、13。
+- 正式训练（v2 样本效率协议）：每个算法/消融 **1000** 回合，training seeds 11、12、13；在 250/500/750/1000 保存预算快照。
+- 探索/BC 衰减步数随 `episodes` 缩放：`min(150000, max(20000, episodes*100))`。
+- 主方法未定：`mappo_dagger` 与 `A5` 并列；按 Medium 捕获率（并列时 Hard）预注册择优。
+- 可见度消融优先 **A4c**（关 visibility 权重但共用 Medium MPC prior）；历史 A4（换 prior）仅保留对照。
 - 四档测试：所有方法使用相同的 seed 7000000–7000199；不改变 checkpoint。
 - 几何 LiDAR fallback 默认开启。Isaac native LiDAR 暂不用于该基准。
+- 弱通信 / 搜索–追逃联训不在本协议内。
 - 旧单机捕获 v4 checkpoint、运动学 checkpoint、运动学 prior 不允许用于本协议。
 
 ## 环境启动
@@ -35,6 +39,34 @@ python train_isaac_pursuit.py mappo \
 ```
 
 只有确认 `final.pt` 和 `history.json` 正常生成后，才开始正式数据收集/训练。
+
+## Isaac Viewport 可视化（短演示）
+
+正式 suite / 长训保持 **headless**。需要弹出 Kit Viewport 时（有显示器或 X11），用专用播放入口：
+
+```bash
+# 需要 DISPLAY / WAYLAND_DISPLAY；无显示器的 SSH 训练机不要开 --visualize
+python play_isaac_pursuit.py \
+  --method mpc \
+  --env-config configs/pursuit_v2/radar5_dual_medium.json \
+  --seed 7000000 \
+  --visualize
+
+# 学到的策略
+python play_isaac_pursuit.py \
+  --method matd3 \
+  --checkpoint "$HOME/runs/isaac_dual_A5_seed11/final.pt" \
+  --env-config configs/pursuit_v2/radar5_dual_medium.json \
+  --visualize --speed 1.5
+```
+
+`--visualize` 等价于打开 GUI kit（`omni.isaac.sim.python.kit`）并关闭 headless；会叠加捕获球、雷达量程圈与短轨迹（`isaac_pursuit_viewport_overlay.py`）。无 GUI 时继续用 HTML 回放（`pursuit_visualization.py`），不要把 HTML 说成 RTX Viewport。`train_isaac_pursuit.py` / `evaluate_isaac_pursuit.py` 也接受 `--visualize`，但不要用于 suite。
+
+无显示时快速自检 CLI 解析：
+
+```bash
+python -m unittest test_isaac_viewport_overlay.py
+```
 
 ## PhysX 专家数据和 DAgger 初始化
 

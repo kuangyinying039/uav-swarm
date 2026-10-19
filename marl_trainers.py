@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import os
+from pathlib import Path
 import time
 from typing import Callable
 
@@ -75,6 +76,8 @@ class TrainConfig:
     log_interval: int = 10
     checkpoint_interval: int = 100
     checkpoint_path: str = ""
+    # Sample-efficiency protocol: save frozen snapshots at these completed episode counts.
+    episode_budget_checkpoints: tuple = ()
     target_kl: float = 0.03
     use_assignment_head: bool = False
     assignment_entropy_coef: float = 0.005
@@ -833,9 +836,12 @@ class MAPPOTrainer:
                         logps.append(dist.log_prob(action))
                     if assignment_logps is not None:
                         logps = [logps[i] + assignment_logps[i] for i in range(self.n_agents)]
-                result = env.step_joint(
-                    np.asarray(actions, dtype=float if self.continuous_actions else int)
-                )
+                executed = np.asarray(actions, dtype=float if self.continuous_actions else int)
+                # Optional hook (MAPPO residual / hybrid): policy samples stay in
+                # the buffer for correct on-policy log-probs; env sees composed cmds.
+                if hasattr(self, "execution_actions"):
+                    executed = np.asarray(self.execution_actions(executed, env), dtype=executed.dtype)
+                result = env.step_joint(executed)
                 reward = float(result["reward"])
                 total_reward += reward
                 total_collisions += int(result.get("collisions", 0))
@@ -1061,6 +1067,13 @@ class MAPPOTrainer:
                 completed % max(1, self.cfg.checkpoint_interval) == 0 or completed == self.cfg.episodes
             ):
                 self.save_checkpoint(self.cfg.checkpoint_path, episode=completed, history=history)
+            budgets = tuple(int(x) for x in getattr(self.cfg, "episode_budget_checkpoints", ()) or ())
+            if self.cfg.checkpoint_path and budgets and completed in budgets:
+                budget_dir = Path(self.cfg.checkpoint_path).resolve().parent / "budgets"
+                budget_dir.mkdir(parents=True, exist_ok=True)
+                budget_path = budget_dir / f"ep{completed:04d}.pt"
+                self.save_checkpoint(str(budget_path), episode=completed, history=history)
+                print(f"[MAPPO] budget checkpoint → {budget_path}", flush=True)
         self.start_episode = self.cfg.episodes
         self.restored_history = history
         return history

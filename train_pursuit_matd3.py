@@ -98,6 +98,18 @@ def build_parser():
     parser.add_argument("--checkpoint-interval", type=int, default=50)
     parser.add_argument("--step-checkpoint-interval", type=int,
                         help="Also save checkpoints every N environment steps; zero disables")
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Parallel kinematic scenes for training (≥2 uses vectorized collection)",
+    )
+    parser.add_argument(
+        "--vector-backend",
+        choices=("subproc", "sync"),
+        default="subproc",
+        help="subproc: multi-core speedup; sync: same-process API debug",
+    )
     return parser
 
 
@@ -304,9 +316,25 @@ def main():
         trainer.save_checkpoint(args.out / "initial.pt", episode=0)
         if trainer.validation_seeds:
             trainer.validate(0, evaluate_policy)
-    history = trainer.train(rng)
+    if args.num_envs > 1:
+        if mix_cfgs:
+            parser.error("--num-envs>1 currently requires a single --env-config (no mix)")
+        from pursuit_vector_env import SubprocVectorPursuitEnv, SyncVectorPursuitEnv
+
+        if args.vector_backend == "subproc":
+            vec = SubprocVectorPursuitEnv(env_cfg, args.num_envs, seed=args.seed)
+        else:
+            vec = SyncVectorPursuitEnv.from_config(env_cfg, args.num_envs, seed=args.seed)
+        trainer.demo_metadata["num_envs"] = int(args.num_envs)
+        trainer.demo_metadata["vector_backend"] = args.vector_backend
+        try:
+            history = trainer.train_vectorized(rng, vec, target_episodes=cfg.episodes)
+        finally:
+            vec.close()
+    else:
+        history = trainer.train(rng)
     write_pursuit_outputs(args.out, history, [])
-    print(json.dumps({"episodes": len(history), "env_steps": trainer.env_steps, "updates": trainer.total_updates}, indent=2))
+    print(json.dumps({"episodes": len(history), "env_steps": trainer.env_steps, "updates": trainer.total_updates, "num_envs": args.num_envs}, indent=2))
 
 
 if __name__ == "__main__":

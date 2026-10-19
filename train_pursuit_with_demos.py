@@ -183,6 +183,48 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.train_seed_bank = []
         self.validation_seed_bank = []
         self.seed_bank_version = SEED_BANK_VERSION
+        self.residual_cfg = None
+        self._residual_teacher = None
+        self._residual_env_steps = 0
+
+    def set_residual(self, cfg):
+        """Compose policy deltas/actions with a classical base before env.step.
+
+        For on-policy MAPPO prefer ``mode='residual'`` so the buffer stores δ
+        while the environment receives ``base + w·δ``. Blend mode is mainly for
+        eval-time hybrids; if used in training it still keeps PPO log-probs on
+        the pre-compose policy sample (approximate).
+        """
+        from pursuit_residual import ResidualComposeConfig, make_base_policy
+
+        if cfg is None:
+            self.residual_cfg = None
+            self._residual_teacher = None
+            self.demo_metadata.pop("residual", None)
+            return
+        if not isinstance(cfg, ResidualComposeConfig):
+            cfg = ResidualComposeConfig(**cfg)
+        self.residual_cfg = cfg
+        self._residual_teacher = make_base_policy(cfg.base)
+        self.demo_metadata["residual"] = {
+            "base": cfg.base,
+            "mode": cfg.mode,
+            "weight": float(cfg.weight),
+            "weight_final": None if cfg.weight_final is None else float(cfg.weight_final),
+        }
+
+    def execution_actions(self, policy_actions, env):
+        if self.residual_cfg is None or self._residual_teacher is None:
+            return policy_actions
+        from pursuit_residual import compose_actions
+
+        logic = getattr(env, "env", env)
+        if hasattr(env, "bridges") and len(getattr(env, "bridges", [])) == 1:
+            logic = env.bridges[0].env
+        base = np.asarray(self._residual_teacher.actions(logic), dtype=np.float32)
+        weight = self.residual_cfg.weight_at(self._residual_env_steps)
+        self._residual_env_steps += 1
+        return compose_actions(base, policy_actions, self.residual_cfg, weight=weight)
 
     def reset_actor_optimizer(self):
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=self.actor_base_lr, eps=1e-5)
@@ -289,8 +331,11 @@ class PursuitDemoTrainer(MAPPOTrainer):
         return row
 
     def validate_capture(self, episode):
-        result = evaluate(self, QuadrotorPursuitConfig(**self.environment_config), self.validation_seeds, ["mappo"])
-        metrics = result["summary"]["mappo"]
+        if getattr(self, "physical_metrics_fn", None) is not None and self.validation_seeds:
+            metrics = self.physical_metrics_fn()
+        else:
+            result = evaluate(self, QuadrotorPursuitConfig(**self.environment_config), self.validation_seeds, ["mappo"])
+            metrics = result["summary"]["mappo"]
         score = (metrics["capture_rate"], -metrics["mean_censored_steps"], metrics['mean_return'])
         self.validation_records.append({"episode": episode, **metrics})
         if score > self.best_capture_score:
@@ -399,10 +444,13 @@ class PursuitDemoTrainer(MAPPOTrainer):
 
 
 @torch.no_grad()
-def deterministic_action(trainer, obs):
+def deterministic_action(trainer, obs, env=None):
     vectors, adjacency, graph = observation_tensors(obs, trainer.device, trainer.cfg)
     means, _ = trainer.actor(vectors, adjacency, graph).chunk(2, dim=-1)
-    return means.tanh().cpu().numpy()
+    action = means.tanh().cpu().numpy()
+    if env is not None and hasattr(trainer, "execution_actions"):
+        return trainer.execution_actions(action, env)
+    return action
 
 
 def observation_tensors(obs, device, cfg):

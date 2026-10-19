@@ -725,7 +725,11 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
         else:
             self.occlusion_waypoint_dwell[target_index] += 1
             chosen_direction = current_evaluation[1]
-        return _unit(0.25 * repulsion + 0.75 * chosen_direction, repulsion)
+        direction = _unit(0.25 * repulsion + 0.75 * chosen_direction, repulsion)
+        # Parent ``_unit`` falls back to a planar [1, 0] when both vectors vanish.
+        if np.asarray(direction).reshape(-1).size == 2:
+            direction = np.r_[np.asarray(direction, dtype=float).reshape(-1), 0.0]
+        return np.asarray(direction, dtype=float).reshape(-1)
 
     def _covering_building_height(self, xy: np.ndarray, margin: float = 0.0) -> float | None:
         heights = [

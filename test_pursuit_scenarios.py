@@ -41,7 +41,7 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(layouts, {'one_side_triangle'})
 
     def test_five_building_evaluation_seeds_have_visible_starts(self):
-        path = Path(__file__).parent / "configs/pursuit_v2/previous_models_current_radar.json"
+        path = Path(__file__).parent / "configs/pursuit_v2/radar5_dual_nominal.json"
         overrides = json.loads(path.read_text(encoding="utf-8"))
         for seed in range(7000000, 7000020):
             with self.subTest(seed=seed):
@@ -88,6 +88,7 @@ class ScenarioTests(unittest.TestCase):
             "radar5_dual_nominal.json",
             "radar5_dual_medium.json",
             "radar5_dual_hard.json",
+            "radar5_dual_severe.json",
             "radar5_dual_extreme.json",
         )
         configs = [QuadrotorPursuitConfig(**json.loads((root / name).read_text(encoding="utf-8")))
@@ -99,9 +100,12 @@ class ScenarioTests(unittest.TestCase):
             self.assertEqual(cfg.building_state_capacity, reference.building_state_capacity)
             self.assertEqual(cfg.policy_observation_version, reference.policy_observation_version)
         self.assertLess(configs[2].target_speed, configs[3].target_speed)
-        self.assertEqual(configs[3].lidar_detection_probability, 0.8)
+        self.assertLess(configs[3].target_speed, configs[4].target_speed)
+        self.assertEqual(configs[4].lidar_detection_probability, 0.8)
         self.assertLess(configs[3].lidar_target_detection_range, configs[2].lidar_target_detection_range)
+        self.assertLess(configs[4].lidar_target_detection_range, configs[3].lidar_target_detection_range)
         self.assertGreater(configs[3].handoff_formation_min_distance, configs[2].handoff_formation_min_distance)
+        self.assertGreater(configs[4].handoff_formation_min_distance, configs[3].handoff_formation_min_distance)
         env = QuadrotorPursuitEnv.__new__(QuadrotorPursuitEnv)
         env.cfg = QuadrotorPursuitConfig(building_count=0, capture_required_uavs=2, seed=3)
         env.disabled_uavs = np.zeros(env.cfg.n_uavs, dtype=bool)

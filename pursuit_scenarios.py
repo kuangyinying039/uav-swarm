@@ -84,9 +84,14 @@ def velocity_step(velocity, desired, dt, cfg):
 
 
 def command_velocity(direction, cfg):
-    direction = np.asarray(direction)
-    horizontal = direction[:2]/max(np.linalg.norm(direction[:2]), 1e-9)
-    return np.r_[horizontal*cfg.target_speed, np.clip(direction[2], -1, 1)*cfg.target_vertical_speed]
+    direction = np.asarray(direction, dtype=float).reshape(-1)
+    # Occlusion / search helpers may emit planar directions; pad to 3-D.
+    if direction.size == 2:
+        direction = np.r_[direction, 0.0]
+    elif direction.size < 2:
+        direction = np.zeros(3, dtype=float)
+    horizontal = direction[:2] / max(np.linalg.norm(direction[:2]), 1e-9)
+    return np.r_[horizontal * cfg.target_speed, np.clip(direction[2], -1, 1) * cfg.target_vertical_speed]
 
 
 def safe_segment(env, start, end):

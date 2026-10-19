@@ -12,6 +12,7 @@ from pursuit.data.replay_buffer import JointReplayBuffer, mix_batches
 from pursuit.data.transition_dataset import (
     TRANSITION_DATASET_V2,
     collect_teacher_transitions,
+    flatten_successful_transitions,
     make_transition,
     teacher_step,
     validate_transition_dataset,
@@ -174,6 +175,38 @@ class PursuitMatd3Tests(unittest.TestCase):
         self.assertAlmostEqual(stats["demo_bc_weight"], 0.625)
         self.assertAlmostEqual(stats["prior_batch_fraction"], 0.5)
 
+    def test_td3_bc_anchor_and_critic_clip_o2o_package(self):
+        trainer = self.trainer(
+            demo_bc_weight=1.0,
+            demo_bc_final_weight=1.0,
+            demo_bc_decay_steps=100,
+            td3_bc_alpha=2.5,
+            bc_on_batch=True,
+            actor_anchor_weight=1.0,
+            actor_anchor_final_weight=0.5,
+            actor_anchor_decay_steps=10,
+            critic_return_clip=5.0,
+        )
+        env = QuadrotorPursuitEnv(self.env_cfg)
+        obs = env.observe_search()
+        action = trainer.deterministic_action(obs)
+        trainer.set_actor_anchor({k: v.detach().clone() for k, v in trainer.actor.state_dict().items()})
+        result = env.step_joint(action)
+        row = make_transition(
+            obs, action, result, {}, np.ones(env.cfg.n_uavs, dtype=bool), ~env.disabled_uavs
+        )
+        for _ in range(8):
+            trainer.online_replay.add(row)
+        trainer.env_steps = 5
+        stats = update_matd3(trainer, trainer.online_replay.sample(4, trainer.device), update_actor=True)
+        self.assertTrue(stats["updated_actor"])
+        self.assertIsNotNone(stats["td3_bc_lambda"])
+        self.assertGreater(stats["td3_bc_lambda"], 0.0)
+        self.assertIsNotNone(stats["demo_bc_loss"])
+        self.assertIsNotNone(stats["actor_anchor_loss"])
+        self.assertAlmostEqual(stats["actor_anchor_weight"], 0.75)
+        self.assertLessEqual(stats["target_q_mean"], 5.0 + 1e-5)
+
     def test_critic_pretraining_preserves_actor_and_anneals_exploration(self):
         trainer = self.trainer(
             critic_pretrain_updates=3,
@@ -271,6 +304,62 @@ class PursuitMatd3Tests(unittest.TestCase):
             self.assertTrue((trainer.output_directory / "best_capture.pt").exists())
             self.assertTrue(trainer.validation_records[1]["considered_for_best"])
             self.assertAlmostEqual(trainer.best_capture_score[0], 0.50)
+
+    def test_capture_drop_rolls_actor_back_to_best(self):
+        trainer = self.trainer()
+        with tempfile.TemporaryDirectory() as folder:
+            trainer.output_directory = Path(folder)
+            trainer.validation_seeds = [4]
+            rates = iter((0.80, 0.70, 0.70))
+
+            def fake_evaluate(action_fn, env_cfg, seeds, method_name="matd3"):
+                del action_fn, env_cfg, seeds
+                return {
+                    "summary": {
+                        method_name: {
+                            "capture_rate": next(rates),
+                            "mean_censored_steps": 80.0,
+                            "mean_return": 1.0,
+                        }
+                    }
+                }
+
+            trainer.env_steps = 1000
+            trainer.validate(50, fake_evaluate)
+            kept = {key: value.detach().cpu().clone() for key, value in trainer.actor.state_dict().items()}
+            with torch.no_grad():
+                for parameter in trainer.actor.parameters():
+                    parameter.add_(1.0)
+            trainer.validate(100, fake_evaluate)
+            trainer.validate(150, fake_evaluate)
+            for key, value in kept.items():
+                self.assertTrue(torch.equal(trainer.actor.state_dict()[key], value))
+            self.assertEqual(trainer.safeguard_rollbacks, 1)
+            self.assertTrue(trainer.validation_records[-1]["actor_rollback"])
+            self.assertLess(trainer.actor_optim.param_groups[0]["lr"], trainer.cfg.actor_lr)
+
+    def test_success_replay_keeps_captures_only(self):
+        trainer = self.trainer(success_replay_only=True)
+        env = QuadrotorPursuitEnv(self.env_cfg)
+        obs = env.observe_search()
+        action = np.zeros((env.cfg.n_uavs, env.continuous_action_dim()), dtype=np.float32)
+        result = env.step_joint(action)
+        row = make_transition(
+            obs, action, result, {}, np.ones(env.cfg.n_uavs, dtype=bool), ~env.disabled_uavs
+        )
+        trainer._stage_transition(row)
+        trainer._commit_staged(False)
+        self.assertEqual(len(trainer.online_replay), 0)
+        self.assertEqual(trainer.discarded_failure_steps, 1)
+        trainer._stage_transition(row)
+        trainer._commit_staged(True)
+        self.assertEqual(len(trainer.online_replay), 1)
+        self.assertEqual(trainer.retained_success_episodes, 1)
+        dataset = {
+            "episodes": [[{"id": 0}], [{"id": 1}, {"id": 2}]],
+            "report": [{"success": False}, {"success": True}],
+        }
+        self.assertEqual(flatten_successful_transitions(dataset), [{"id": 1}, {"id": 2}])
 
     def test_evaluate_demo_bc_checkpoint_does_not_require_prior_dataset(self):
         trainer = self.trainer(
