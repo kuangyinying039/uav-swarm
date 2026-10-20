@@ -12,7 +12,7 @@ import torch
 from artifact_paths import artifact_path
 from isaac_pursuit_backend import IsaacPursuitEnv
 from marl_trainers import TrainConfig, seed_everything
-from pursuit_baselines_3d import CooperativeGuidanceMPC3D
+from pursuit_baselines_3d import BASELINES_3D
 from quadrotor_pursuit_env import QuadrotorPursuitConfig
 from train_pursuit_with_demos import (
     PursuitDemoTrainer,
@@ -28,6 +28,7 @@ def build_parser():
     parser.add_argument("--env-config", type=Path,
                         default=Path("configs/pursuit_v2/radar5_dual_medium.json"))
     parser.add_argument("--out", type=artifact_path, required=True)
+    parser.add_argument("--teacher", choices=("mpc", "frpn"), default="mpc")
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--demo-seed", type=int, default=2_000_000)
     parser.add_argument("--bc-episodes", type=int, default=50)
@@ -116,8 +117,8 @@ def main():
         trainer.demo_metadata.update({
             "execution_backend": "isaac_physx",
             "physics_dt": float(env.physics_dt),
-            "initialization_type": "isaac_mpc_dagger",
-            "teacher": "mpc",
+            "initialization_type": f"isaac_{args.teacher}_dagger",
+            "teacher": args.teacher,
             "bc_seed": int(args.demo_seed),
         })
         progress_path = args.out / "dagger_progress.pt"
@@ -156,7 +157,7 @@ def main():
             if bc_pretrained:
                 trainer.save_checkpoint(actor_path, episode=0, history=[])
 
-        expert = CooperativeGuidanceMPC3D()
+        expert = BASELINES_3D[args.teacher]()
         for episode in range(len(expert_episodes), args.bc_episodes):
             seed = args.demo_seed + episode
             observation = env.reset(seed=seed)
@@ -172,7 +173,7 @@ def main():
                     break
             expert_episodes.append(trajectory)
             save_progress()
-            print(f"[isaac-mpc-bc] episode={episode + 1}/{args.bc_episodes} steps={len(trajectory)}", flush=True)
+            print(f"[isaac-{args.teacher}-bc] episode={episode + 1}/{args.bc_episodes} steps={len(trajectory)}", flush=True)
         trainer.demo_episodes = expert_episodes
         if not bc_pretrained:
             pretrain(trainer, expert_episodes, args.bc_updates, args.batch_size, args.seed)
@@ -241,7 +242,7 @@ def main():
             "execution_backend": "isaac_physx",
             "env_config": cfg.__dict__,
             "episodes": expert_episodes,
-            "teacher": "mpc",
+            "teacher": args.teacher,
         }, args.out / "expert_episodes.pt")
         _atomic_torch_save({
             "execution_backend": "isaac_physx",
@@ -258,6 +259,7 @@ def main():
         (args.out / "imitation_manifest.json").write_text(json.dumps({
             "execution_backend": "isaac_physx",
             "environment": cfg.__dict__,
+            "teacher": args.teacher,
             "bc_episodes": args.bc_episodes,
             "bc_updates": args.bc_updates,
             "dagger_rounds": args.dagger_rounds,

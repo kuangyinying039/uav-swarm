@@ -23,7 +23,7 @@ def build_parser():
         type=int,
         default=1,
         help="Isaac PhysX parallel scenes in one process (GridCloner). "
-        "MATD3 uses train_vectorized when >1; MAPPO stays single-scene for now.",
+        "MAPPO and MATD3 both use train_vectorized when >1.",
     )
     parser.add_argument("--env-config", type=Path,
                         default=Path("configs/pursuit_v2/radar5_dual_hard.json"))
@@ -67,6 +67,12 @@ def build_parser():
         type=int,
         default=20,
         help="Held-out Hard episodes scored by physical capture for best_capture.pt (0 disables)",
+    )
+    parser.add_argument(
+        "--validation-interval",
+        type=int,
+        default=100,
+        help="Run the held-out physical capture test every this many episodes",
     )
     parser.add_argument("--episodes", type=int, default=3000)
     parser.add_argument("--max-steps", type=int, default=0,
@@ -154,6 +160,7 @@ def _variant_config(variant, args, env_cfg):
         device=args.device,
         checkpoint_interval=10,
     )
+    values["validation_interval"] = int(args.validation_interval)
     decay = _scaled_decay_steps(args.episodes)
     if variant == "A6":
         values.update(
@@ -212,20 +219,53 @@ def _bind_training_domains(env):
 
 
 def _physical_validation_metrics(env, apply_medium, action_fn, seeds):
-    """Held-out rollouts on the training level using the physical-capture scorer."""
+    """Held-out rollouts on the training level using the physical-capture scorer.
+
+    ``action_fn(obs, env_index=0)`` must return a ``(n_uavs, 4)`` action. With
+    ``num_envs>1`` only env 0 is scored; other clones receive policy actions so
+    PhysX can advance the shared world step.
+    """
     apply_medium()
     captured, returns, steps = [], [], []
+    num_envs = int(getattr(env, "num_envs", 1) or 1)
     for seed in seeds:
-        env.reset(seed=int(seed))
-        obs = env.observe_search()
+        if num_envs > 1:
+            obs_list = env.reset(seeds=[int(seed) + i for i in range(num_envs)])
+        else:
+            reset_obs = env.reset(seed=int(seed))
+            obs = reset_obs if isinstance(reset_obs, dict) else env.observe_search()
+            if not isinstance(obs, dict):
+                obs = env.observe_search()
+            obs_list = [obs]
         total = 0.0
         result = {"capture_success": False}
         taken = 0
         for taken in range(1, int(env.cfg.search_steps) + 1):
-            result = env.step_joint(action_fn(obs))
-            obs = result["obs"]
-            total += float(result["reward"])
-            if result.get("terminated") or result.get("truncated"):
+            if num_envs == 1:
+                result = env.step_joint(action_fn(obs_list[0], env_index=0))
+                obs_list = [result["obs"]]
+                reward = float(result["reward"])
+                done = bool(result.get("terminated") or result.get("truncated"))
+            else:
+                actions = np.stack(
+                    [action_fn(obs_list[i], env_index=i) for i in range(num_envs)],
+                    axis=0,
+                )
+                results = env.step_joint(actions)
+                result = dict(results[0])
+                info = result.get("info") or {}
+                if result.get("_episode_done") and info.get("final_obs") is not None:
+                    # Score the terminal transition, not the auto-reset observation.
+                    if "capture_success" in info:
+                        result["capture_success"] = bool(info["capture_success"])
+                    if "final_terminated" in info:
+                        result["terminated"] = bool(info["final_terminated"])
+                        result["truncated"] = bool(info.get("final_truncated", False))
+                reward = float(result["reward"])
+                done = bool(result.get("_episode_done") or result.get("terminated") or result.get("truncated"))
+                obs_list = [item["obs"] for item in results]
+            total += reward
+            if done:
                 break
         captured.append(bool(result.get("capture_success", False)))
         returns.append(total)
@@ -303,16 +343,26 @@ def _run_mappo(args, env):
         episode_budget_checkpoints=_parse_budget_checkpoints(args.budget_checkpoints, args.episodes),
     )
     apply_domain, apply_medium, mix = _bind_training_domains(env)
+    num_envs = int(getattr(args, "num_envs", 1) or 1)
 
     def env_factory(episode=0):
         apply_domain(episode)
-        env.reset(seed=args.seed * 100_000 + int(episode))
+        if num_envs > 1:
+            env.reset(
+                seeds=[
+                    args.seed * 100_000 + int(episode) + i for i in range(num_envs)
+                ]
+            )
+        else:
+            env.reset(seed=args.seed * 100_000 + int(episode))
         return env
 
     trainer = PursuitDemoTrainer(env_factory, config)
+    trainer.seed = int(args.seed)
     trainer.output_directory = args.out
     trainer.validation_seeds = _isaac_validation_seeds(args)
     trainer.validation_seed_bank = list(trainer.validation_seeds)
+    trainer.on_vector_episode_complete = apply_domain
     # Stronger demo retention so DAgger warm-start is not washed out by on-policy noise.
     if args.variant in ("mappo_dagger", "mappo_plus"):
         trainer.demo_weight = 0.35 if plus else 0.15
@@ -330,10 +380,16 @@ def _run_mappo(args, env):
             trainer.set_residual(residual)
     from train_pursuit_with_demos import deterministic_action
 
+    def _validation_action(obs, env_index=0):
+        logic = env
+        if num_envs > 1 and hasattr(env, "bridges"):
+            logic = env.bridges[int(env_index)].env
+        return deterministic_action(trainer, obs, env=logic)
+
     trainer.physical_metrics_fn = lambda: _physical_validation_metrics(
         env,
         apply_medium,
-        lambda obs: deterministic_action(trainer, obs, env=env),
+        _validation_action,
         trainer.validation_seeds,
     )
     trainer.demo_metadata["train_domains"] = list(TRAIN_DOMAINS)
@@ -389,18 +445,24 @@ def _run_mappo(args, env):
             raise ValueError(f"{path} was collected in a different environment profile")
         setattr(trainer, attribute, dataset["episodes"])
         trainer.demo_metadata[f"{attribute}_path"] = str(path)
+    trainer.validation_interval = int(args.validation_interval)
+    trainer.demo_metadata["num_envs"] = num_envs
     if trainer.validation_seeds and int(getattr(trainer, "start_episode", 0) or 0) == 0:
         try:
             trainer.validate_capture(0)
         except Exception as error:
             print(f"[mappo] pre-RL validation skipped: {error}", flush=True)
-    history = trainer.train()
+    if num_envs > 1:
+        history = trainer.train_vectorized(env)
+    else:
+        history = trainer.train()
     trainer.save_checkpoint(args.out / "final.pt", episode=trainer.cfg.episodes, history=history)
     write_pursuit_outputs(args.out, history, trainer.episode_traces)
     best = args.out / "best_capture.pt"
     return {
         "algorithm": "mappo",
         "episodes": len(history),
+        "num_envs": num_envs,
         "checkpoint": str(best if best.is_file() else args.out / "final.pt"),
         "best_capture": str(best) if best.is_file() else None,
     }
@@ -526,10 +588,10 @@ def main():
         args.variant = "mappo_plus" if args.algorithm == "mappo" else "A6"
     if args.episodes < 1 or args.hidden_dim < 1 or args.batch_size < 1 or args.max_steps < 0:
         parser.error("episodes, hidden-dim, and batch-size must be positive; max-steps cannot be negative")
+    if args.validation_interval < 1 or args.validation_episodes < 0:
+        parser.error("--validation-interval must be positive and --validation-episodes cannot be negative")
     if int(getattr(args, "num_envs", 1) or 1) < 1:
         parser.error("--num-envs must be >= 1")
-    if int(getattr(args, "num_envs", 1) or 1) > 1 and args.algorithm != "matd3":
-        parser.error("Isaac --num-envs>1 currently wires through MATD3 train_vectorized only")
     if args.algorithm == "mappo" and args.variant in ("mappo_dagger", "mappo_plus"):
         if not args.actor_init or not args.demos:
             parser.error(f"{args.variant} requires Isaac-trained --actor-init and --demos")

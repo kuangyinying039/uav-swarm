@@ -37,7 +37,11 @@ def _init_simulation_app(cfg) -> object:
     headless = bool(cfg["headless"])
     if not headless:
         _require_display_for_viewport()
+    # Keep Kit defaults close to OmniDrones/Isaac; only bump window for GUI demos.
     config = {"headless": headless, "anti_aliasing": 1}
+    if not headless:
+        config["width"] = 1440
+        config["height"] = 900
     exp_root = os.environ.get("EXP_PATH") or os.environ.get("ISAACSIM_PATH")
     if not exp_root:
         raise RuntimeError("EXP_PATH / ISAACSIM_PATH must be set before launching Isaac")
@@ -77,12 +81,19 @@ class IsaacPursuitEnv:
         native_lidar=False,
         num_envs: int = 1,
         env_spacing: float | None = None,
+        visual_model_scale: float | None = None,
     ):
         self.num_envs = int(num_envs)
         if self.num_envs < 1:
             raise ValueError("num_envs must be >= 1")
         self.cfg = replace(cfg, seed=int(seed))
         self._headless = headless
+        # GUI-only mesh enlargement; PhysX / capture radii stay on the real model.
+        # ~4×: readable from chase cam without drowning the scene / occluding cover.
+        if visual_model_scale is None:
+            self._visual_model_scale = 4.0 if not headless else 1.0
+        else:
+            self._visual_model_scale = max(float(visual_model_scale), 1e-3)
         # Native LiDAR path is single-env for now; multi-env uses geometric fallback.
         self._native_lidar_enabled = bool(native_lidar) and self.num_envs == 1
         self._env_spacing = (
@@ -147,10 +158,13 @@ class IsaacPursuitEnv:
         isaac_cfg.sim.gravity = [0.0, 0.0, -self.cfg.quadrotor_gravity]
         isaac_cfg.sim.device = "cuda:0"
         isaac_cfg.sim.use_gpu_pipeline = True
+        isaac_cfg.sim.use_gpu = True
         # Keep False so per-env Radar5 buildings/targets added after GridCloner
         # remain independently editable; GPU PhysX still batches num_envs>1.
         isaac_cfg.sim.replicate_physics = False
-        isaac_cfg.sim.use_flatcache = True
+        # GUI: disable flatcache so Viewport meshes track PhysX/Fabric poses.
+        # Training keeps flatcache for throughput.
+        isaac_cfg.sim.use_flatcache = bool(headless)
         isaac_cfg.env.num_envs = self.num_envs
         isaac_cfg.env.env_spacing = self._env_spacing
         isaac_cfg.task.env.num_envs = self.num_envs
@@ -220,13 +234,20 @@ class IsaacPursuitEnv:
         else:
             self.sensor_paths = [None] * (self.cfg.n_uavs * self.num_envs)
         self._initialize_scene_transforms()
+        self._apply_gui_visual_enlargement()
+        if not headless:
+            # Dome/key lights + compact pad framing (must run after scene prims).
+            self._apply_viewport_presentation()
         self._last_native_scan = None
         self._physics_initialized = False
         self._patch_multirotor_throttle_reset()
         self._patch_formation_episode_end()
         print(
             f"[isaac] num_envs={self.num_envs} env_spacing={self._env_spacing} "
-            f"replicate_physics={bool(isaac_cfg.sim.replicate_physics)}",
+            f"replicate_physics={bool(isaac_cfg.sim.replicate_physics)} "
+            f"gpu_pipeline={bool(isaac_cfg.sim.use_gpu_pipeline)} "
+            f"compact_pad={not headless} "
+            f"visual_model_scale={self._visual_model_scale}",
             flush=True,
         )
         self.reset(seed=seed)
@@ -440,6 +461,27 @@ class IsaacPursuitEnv:
             translate = xform.AddTranslateOp()
         return translate
 
+    @staticmethod
+    def _bind_building_material(stage, prim_path, color, opacity=1.0):
+        """Matte building / pad material for physical-sim look (RTX)."""
+        try:
+            from pxr import Gf, Sdf, UsdShade
+        except Exception:
+            return
+        mat_path = f"{prim_path}/Looks/BuildingMat"
+        shader_path = f"{mat_path}/Shader"
+        material = UsdShade.Material.Define(stage, mat_path)
+        shader = UsdShade.Shader.Define(stage, shader_path)
+        alpha = float(np.clip(opacity, 0.05, 1.0))
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+        shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(alpha)
+        # Higher roughness + slight darkening avoids top-down washout under dome light.
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.85)
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(stage.GetPrimAtPath(prim_path)).Bind(material)
+
     def _create_scene_prims(self):
         """Create ground / target / buildings under every GridCloner env cell.
 
@@ -455,18 +497,45 @@ class IsaacPursuitEnv:
         self._target_paths = []
         self._target_translates = []
         self._building_ops = []  # list[env][building] -> (translate, scale)
+        # Near-black slate — stays dark under dome light, clear in top-down.
+        building_palette = [
+            (0.08, 0.09, 0.11),
+            (0.06, 0.07, 0.09),
+            (0.10, 0.09, 0.08),
+            (0.07, 0.08, 0.10),
+        ]
+        # Fully opaque physical buildings (GUI + headless).
+        building_opacity = 1.0
+        # Pad only slightly beyond the Radar5 grid (25 m + 1.5 m each side).
+        ground_margin = 1.5
+        ground_extent = float(self.cfg.grid_size) + 2.0 * ground_margin
+        ground_half = ground_extent / 2.0
+        ground_center = float(self.cfg.grid_size) / 2.0
+        # Shrink Isaac's huge ground to our map instead of deleting it (avoids black void).
+        if not self._headless:
+            self._fit_default_ground_plane(stage)
         for env_index in range(self.num_envs):
             root = f"/World/envs/env_{env_index}"
             ground = UsdGeom.Cube.Define(stage, f"{root}/radar5_ground")
-            ground.CreateDisplayColorAttr([(0.10, 0.14, 0.17)])
+            # Bright pad on top of the fitted Isaac ground (map + margin only).
+            ground.CreateDisplayColorAttr([(0.86, 0.89, 0.94)])
             ground_translate, ground_scale = self._translate_scale_ops(ground.GetPrim())
-            ground_translate.Set(Gf.Vec3d(self.cfg.grid_size / 2, self.cfg.grid_size / 2, -0.08))
-            ground_scale.Set(Gf.Vec3f(self.cfg.grid_size / 2, self.cfg.grid_size / 2, 0.08))
+            # Slightly above Isaac ground so the pale pad is what you see in-map.
+            ground_translate.Set(Gf.Vec3d(ground_center, ground_center, 0.02))
+            ground_scale.Set(Gf.Vec3f(ground_half, ground_half, 0.02))
+            if not self._headless:
+                self._bind_building_material(
+                    stage, f"{root}/radar5_ground", (0.86, 0.89, 0.94), 1.0
+                )
 
             target_path = f"{root}/radar5_target"
             target = UsdGeom.Sphere.Define(stage, target_path)
-            target.CreateRadiusAttr(self.cfg.target_diameter / 2.0)
-            target.CreateDisplayColorAttr([(0.95, 0.22, 0.10)])
+            # Original target modeling (physical diameter); GUI slightly larger for readability.
+            visual_r = float(self.cfg.target_diameter) / 2.0
+            if not self._headless:
+                visual_r = max(visual_r, 0.45)
+            target.CreateRadiusAttr(float(visual_r))
+            target.CreateDisplayColorAttr([(0.92, 0.12, 0.12)])
             add_update_semantics(target.GetPrim(), "radar5_target", "class")
             UsdPhysics.CollisionAPI.Apply(target.GetPrim())
             rigid = UsdPhysics.RigidBodyAPI.Apply(target.GetPrim())
@@ -477,14 +546,78 @@ class IsaacPursuitEnv:
             env_buildings = []
             for building_index in range(self.cfg.building_count):
                 path = f"{root}/radar5_building_{building_index}"
+                color = building_palette[building_index % len(building_palette)]
                 building = UsdGeom.Cube.Define(stage, path)
-                building.CreateDisplayColorAttr([(0.10, 0.42, 0.52)])
+                building.CreateDisplayColorAttr([color])
+                building.CreateDisplayOpacityAttr([float(building_opacity)])
+                if not self._headless:
+                    self._bind_building_material(stage, path, color, building_opacity)
                 UsdPhysics.CollisionAPI.Apply(building.GetPrim())
                 env_buildings.append(self._translate_scale_ops(building.GetPrim()))
             self._building_ops.append(env_buildings)
         # Back-compat aliases for single-env overlays / smoke scripts.
         self._target_path = self._target_paths[0]
         self._target_translate = self._target_translates[0]
+
+    def _apply_gui_visual_enlargement(self) -> None:
+        """Enlarge Hummingbird body meshes for GUI only (capture radii / control unchanged).
+
+        Scales USD Mesh geom under each drone. Lee / capture still use bridge or
+        articulation root poses, not mesh extent; target keeps its original sphere model.
+        """
+        if self._headless or abs(self._visual_model_scale - 1.0) < 1e-6:
+            return
+        try:
+            import omni.usd
+            from pxr import Gf, Usd, UsdGeom
+        except Exception as exc:
+            print(f"[isaac] visual enlargement skipped: {exc}", flush=True)
+            return
+        stage = omni.usd.get_context().get_stage()
+        scale = float(self._visual_model_scale)
+        scaled = 0
+
+        def _set_scale(prim) -> bool:
+            nonlocal scaled
+            xform = UsdGeom.Xformable(prim)
+            scale_op = None
+            for op in xform.GetOrderedXformOps():
+                if op.GetOpType() == UsdGeom.XformOp.TypeScale:
+                    scale_op = op
+                    break
+            if scale_op is None:
+                scale_op = xform.AddScaleOp()
+            try:
+                current = scale_op.Get()
+                if current is None:
+                    current = Gf.Vec3f(1.0, 1.0, 1.0)
+                # Idempotent-ish: if already magnified, leave it.
+                if float(current[0]) >= scale * 0.9:
+                    return False
+                scale_op.Set(
+                    Gf.Vec3f(
+                        float(current[0]) * scale,
+                        float(current[1]) * scale,
+                        float(current[2]) * scale,
+                    )
+                )
+                scaled += 1
+                return True
+            except Exception:
+                return False
+
+        for drone_path in self.sim_env.drone.prim_paths:
+            root = stage.GetPrimAtPath(str(drone_path))
+            if not root.IsValid():
+                continue
+            for prim in Usd.PrimRange(root):
+                if prim.IsA(UsdGeom.Mesh):
+                    _set_scale(prim)
+        print(
+            f"[isaac] GUI Hummingbird mesh scale={scale} meshes={scaled} "
+            f"(target model original; capture radii unchanged)",
+            flush=True,
+        )
 
     def _initialize_scene_transforms(self):
         from pxr import Gf
@@ -504,6 +637,226 @@ class IsaacPursuitEnv:
             x0, y0, x1, y1 = map(float, rect)
             translate.Set(Gf.Vec3d((x0 + x1) / 2, (y0 + y1) / 2, float(height) / 2))
             scale.Set(Gf.Vec3f((x1 - x0) / 2, (y1 - y0) / 2, float(height) / 2))
+
+    def _fit_default_ground_plane(self, stage) -> None:
+        """Keep Isaac ground visible (for lighting) but cover it with our compact pad.
+
+        Fully hiding ``defaultGroundPlane`` previously left a black void under RTX.
+        The bright ``radar5_ground`` pad (grid + margin) sits on top; chase-cam
+        framing is scaled to ``grid_size`` so the arena does not feel infinite.
+        """
+        try:
+            from pxr import UsdGeom
+
+            for path in (
+                "/World/defaultGroundPlane",
+                "/World/defaultGroundPlane/GroundPlane",
+                "/World/defaultGroundPlane/CollisionPlane",
+            ):
+                prim = stage.GetPrimAtPath(path)
+                if not prim.IsValid():
+                    continue
+                try:
+                    UsdGeom.Imageable(prim).MakeVisible()
+                except Exception:
+                    pass
+            print(
+                f"[isaac] ground: Isaac plane + compact pad "
+                f"({float(self.cfg.grid_size):.0f}m+1.5m margin)",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[isaac] fit defaultGroundPlane skipped: {exc}", flush=True)
+
+    def _apply_viewport_presentation(self) -> None:
+        """Dome + key light and a quieter stage for GUI demos (no-op if USD fails)."""
+        try:
+            import omni.usd
+            from pxr import Gf, UsdGeom, UsdLux
+        except Exception as exc:  # pragma: no cover - depends on Kit
+            print(f"[isaac] viewport presentation skipped: {exc}", flush=True)
+            return
+        stage = omni.usd.get_context().get_stage()
+        self._fit_default_ground_plane(stage)
+        mid = float(self.cfg.grid_size) * 0.5
+        alt = float(self.cfg.initial_altitude)
+        try:
+            origin = self._world_origin(0)
+        except Exception:
+            origin = np.zeros(3, dtype=float)
+
+        dome_path = "/World/radar5_dome_light"
+        if not stage.GetPrimAtPath(dome_path):
+            dome = UsdLux.DomeLight.Define(stage, dome_path)
+            # Bright dome so pale buildings / pad are not a black void.
+            dome.CreateIntensityAttr(1600.0)
+            dome.CreateColorAttr(Gf.Vec3f(0.90, 0.93, 0.98))
+        else:
+            try:
+                stage.GetPrimAtPath(dome_path).GetAttribute("inputs:intensity").Set(1600.0)
+            except Exception:
+                pass
+
+        key_path = "/World/radar5_key_light"
+        if not stage.GetPrimAtPath(key_path):
+            key = UsdLux.DistantLight.Define(stage, key_path)
+            key.CreateIntensityAttr(2400.0)
+            key.CreateColorAttr(Gf.Vec3f(1.0, 0.97, 0.92))
+            key.CreateAngleAttr(1.2)
+            xform = UsdGeom.Xformable(key.GetPrim())
+            rotate = xform.AddRotateXYZOp()
+            rotate.Set(Gf.Vec3f(-42.0, 28.0, 8.0))
+
+        fill_path = "/World/radar5_fill_light"
+        if not stage.GetPrimAtPath(fill_path):
+            fill = UsdLux.DistantLight.Define(stage, fill_path)
+            fill.CreateIntensityAttr(900.0)
+            fill.CreateColorAttr(Gf.Vec3f(0.80, 0.86, 0.95))
+            xform = UsdGeom.Xformable(fill.GetPrim())
+            rotate = xform.AddRotateXYZOp()
+            rotate.Set(Gf.Vec3f(-18.0, -55.0, 0.0))
+
+        try:
+            from omni.isaac.core.utils.viewports import set_camera_view
+
+            # Frame the Radar5 pad (grid + margin), not the old infinite arena.
+            g = float(self.cfg.grid_size)
+            focus = [float(origin[0] + mid), float(origin[1] + mid), float(origin[2] + alt)]
+            set_camera_view(
+                eye=[focus[0] + 0.65 * g, focus[1] - 0.55 * g, focus[2] + 0.40 * g],
+                target=focus,
+            )
+        except Exception as exc:
+            print(f"[isaac] initial camera skipped: {exc}", flush=True)
+
+        try:
+            import carb
+
+            settings = carb.settings.get_settings()
+            settings.set("/app/viewport/grid/enabled", False)
+            # Mild translucency for GUI peek-through; still looks like solid concrete.
+            try:
+                settings.set("/rtx/translucency/enabled", True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        print(
+            f"[isaac] viewport presentation applied "
+            f"(pad={float(self.cfg.grid_size):.0f}m+margin, solid buildings)",
+            flush=True,
+        )
+
+    def _world_origin(self, env_index: int = 0) -> np.ndarray:
+        """GridCloner cell origin in world XYZ for ``env_index``."""
+        offsets = self._env_offsets()
+        row = offsets[env_index]
+        if torch.is_tensor(row):
+            return row.detach().float().cpu().numpy().reshape(3)
+        return np.asarray(row, dtype=np.float64).reshape(3)
+
+    # Named chase-camera presets as fractions of grid_size (fits 25 m pad + margin).
+    CAMERA_PRESET_FRAC = {
+        # Elevated diagonal side — stays around the task map, not a huge arena.
+        "side": (0.65, -0.55, 0.40),
+        "side_left": (-0.65, -0.55, 0.40),
+        "oblique": (0.55, -0.70, 0.48),
+        "high": (0.20, -0.28, 0.85),
+        # Overhead with slight tilt so roof edges / walls stay readable (not washed flat).
+        "top": (0.18, -0.18, 1.10),
+    }
+
+    def camera_eye_target(
+        self,
+        *,
+        env_index: int = 0,
+        eye_offset: tuple[float, float, float] | None = None,
+        view: str = "side",
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return ``(eye, focus)`` for the named chase-camera preset, or None if invalid."""
+        physical = np.asarray(self._physical_state(env_index), dtype=float)
+        target = np.asarray(self._target_position(env_index), dtype=float)
+        # PhysX blow-ups leave NaNs; fall back to Radar5 bridge kinematics so the
+        # camera keeps tracking through recovery instead of freezing on buildings.
+        if not np.isfinite(physical).all():
+            physical = np.asarray(
+                self.bridges[env_index].env.quadrotor_states, dtype=float
+            )
+        if not np.isfinite(physical).all() or not np.isfinite(target).all():
+            return None
+        origin = self._world_origin(env_index)
+        # Bias focus slightly toward the target so the chase stays centered while
+        # pursuers remain in frame; keeps camera out of building corners.
+        pursuer_mean = physical[:, :3].mean(axis=0)
+        focus = 0.40 * pursuer_mean + 0.60 * target + origin
+        if eye_offset is None:
+            g = float(self.cfg.grid_size)
+            frac = self.CAMERA_PRESET_FRAC.get(str(view), self.CAMERA_PRESET_FRAC["side"])
+            eye_offset = (frac[0] * g, frac[1] * g, frac[2] * g)
+        eye = focus + np.asarray(eye_offset, dtype=float)
+        return eye, focus
+
+    def follow_camera(
+        self,
+        *,
+        env_index: int = 0,
+        eye_offset: tuple[float, float, float] | None = None,
+        view: str = "side",
+    ) -> None:
+        """Chase cam. Default ``side`` keeps height readable and cuts occlusion."""
+        try:
+            from omni.isaac.core.utils.viewports import set_camera_view
+        except Exception:
+            return
+        pair = self.camera_eye_target(
+            env_index=env_index, eye_offset=eye_offset, view=view
+        )
+        if pair is None:
+            return
+        eye, focus = pair
+        try:
+            set_camera_view(eye=eye.tolist(), target=focus.tolist())
+        except Exception:
+            pass
+
+    def apply_replay_frame(self, pursuer_states, target_xyz, *, env_index: int = 0) -> None:
+        """Pose-only frame for trajectory replay (no Lee / PhysX control step)."""
+        bridge = self.bridges[env_index].env
+        states = np.asarray(pursuer_states, dtype=np.float64).reshape(self.cfg.n_uavs, 13)
+        target = np.asarray(target_xyz, dtype=np.float64).reshape(3)
+        bridge.quadrotor_states[:] = states
+        bridge.positions[:] = states[:, :2]
+        bridge.altitudes[:] = states[:, 2]
+        bridge.dynamic_targets[0] = target[:2]
+        bridge.target_altitudes[0] = float(target[2])
+        self._teleport_pursuers_from_bridge([env_index])
+        self._write_target_pose(env_index)
+        try:
+            if hasattr(self.sim_env, "sim") and hasattr(self.sim_env.sim, "forward"):
+                self.sim_env.sim.forward()
+        except Exception:
+            pass
+        try:
+            import omni.timeline
+
+            timeline = omni.timeline.get_timeline_interface()
+            if timeline.is_stopped() or not timeline.is_playing():
+                timeline.play()
+        except Exception:
+            pass
+
+    def _bridge_capture_gap(self, env_index: int = 0) -> float:
+        """Kinematic 2nd-nearest gap from Radar5 bridge (PhysX-independent HUD)."""
+        env = self.bridges[env_index].env
+        state = np.asarray(env.quadrotor_states, dtype=float)
+        target = self._target_position(env_index)
+        active = ~np.asarray(env.disabled_uavs, dtype=bool)
+        required = int(self.cfg.capture_required_uavs)
+        if np.count_nonzero(active) < required or not np.isfinite(state).all():
+            return float(self.cfg.grid_size)
+        distances = np.linalg.norm(state[:, :3] - target[None, :], axis=1)
+        required_distance = float(np.partition(distances[active], required - 1)[required - 1])
+        return float(max(required_distance - self.cfg.capture_radius, 0.0))
 
     def _physical_state_batch(self):
         """Radar5 pursuer states in env-local frames, shape (N, 3, 13).
@@ -643,6 +996,16 @@ class IsaacPursuitEnv:
 
     def _teleport_pursuers_from_bridge(self, env_indices=None):
         # World poses = Radar5 local xyz + GridCloner env origin.
+        # Articulation root writes require a live physics view; if the timeline
+        # is stopped Isaac falls back to USD setGlobalPose (illegal under Direct GPU).
+        try:
+            import omni.timeline
+
+            timeline = omni.timeline.get_timeline_interface()
+            if timeline.is_stopped() or not timeline.is_playing():
+                timeline.play()
+        except Exception:
+            pass
         if env_indices is None:
             env_indices = list(range(self.num_envs))
         env_ids = torch.as_tensor(env_indices, device=self.sim_env.device, dtype=torch.long)
@@ -666,6 +1029,57 @@ class IsaacPursuitEnv:
             env_ids,
         )
         self._clear_drone_dynamics(env_ids)
+
+    def _resync_pursuer_visuals(self, batch_states=None) -> None:
+        """Push current PhysX pursuer poses so the Kit Viewport shows Hummingbirds."""
+        if batch_states is None:
+            batch_states = self._physical_state_batch()
+        if not np.isfinite(batch_states).all():
+            return
+        try:
+            import omni.timeline
+
+            timeline = omni.timeline.get_timeline_interface()
+            if timeline.is_stopped() or not timeline.is_playing():
+                timeline.play()
+        except Exception:
+            pass
+        env_ids = torch.arange(self.num_envs, device=self.sim_env.device, dtype=torch.long)
+        offsets = self._env_offsets()[env_ids].unsqueeze(1)
+        positions = (
+            torch.as_tensor(batch_states[:, :, :3], dtype=torch.float32, device=self.sim_env.device)
+            + offsets
+        )
+        orientations = torch.as_tensor(
+            batch_states[:, :, 6:10], dtype=torch.float32, device=self.sim_env.device
+        )
+        try:
+            self.sim_env.drone.set_world_poses(positions, orientations, env_ids)
+        except Exception as exc:
+            print(f"[isaac] visual resync skipped: {exc}", flush=True)
+
+    def _recover_corrupt_envs(self, env_indices) -> None:
+        """Re-seat Hummingbirds from Radar5 bridge state after a PhysX NaN blow-up."""
+        if not env_indices:
+            return
+        print(f"[isaac] recovering corrupt envs={list(env_indices)}", flush=True)
+        try:
+            import omni.timeline
+
+            timeline = omni.timeline.get_timeline_interface()
+            if timeline.is_stopped() or not timeline.is_playing():
+                timeline.play()
+        except Exception:
+            pass
+        # Prefer bridge kinematic poses (finite) over NaN PhysX rows.
+        self._teleport_pursuers_from_bridge(list(env_indices))
+        try:
+            if hasattr(self.sim_env, "sim") and hasattr(self.sim_env.sim, "forward"):
+                self.sim_env.sim.forward()
+        except Exception:
+            pass
+        for env_index in env_indices:
+            self._write_target_pose(env_index)
 
     def _reset_env_indices(self, env_indices, seeds=None):
         """Soft-reset selected parallel scenes (bridges + teleports + USD)."""
@@ -811,8 +1225,36 @@ class IsaacPursuitEnv:
 
     def _finalize_env_result(self, env_index, result, safety_reasons, *, physics_failed=False):
         physical = self._physical_state(env_index)
-        if physics_failed or not np.isfinite(physical).all():
-            # Emit a safe truncated transition; caller will soft-reset the clone.
+        physx_broken = bool(physics_failed or not np.isfinite(physical).all())
+        # Viewport play: keep the episode alive on PhysX blow-ups. Report the
+        # Radar5 kinematic gap (not the grid_size=25 sentinel) so HUD/logs stay
+        # meaningful while articulations are reseated.
+        if physx_broken and not self._headless:
+            result = dict(result)
+            bridge_gap = self._bridge_capture_gap(env_index)
+            result["reward"] = float(result.get("reward", 0.0))
+            result["reward_components"] = dict(result.get("reward_components", {}))
+            result["reward_components"]["isaac_physics_recovered"] = 1.0
+            result["capture_success"] = False
+            result["minimum_capture_gap"] = bridge_gap
+            result["safety_reasons"] = safety_reasons
+            result["controller_feasible_rate"] = 0.0
+            result["execution_mode"] = "isaac_lee_velocity"
+            result["sensor_mode"] = (
+                "isaac_lidar" if self._native_lidar_enabled else "geometric_lidar_fallback"
+            )
+            bridge_state = np.asarray(
+                self.bridges[env_index].env.quadrotor_states, dtype=float
+            )
+            result["quadrotor_states"] = np.nan_to_num(bridge_state, nan=0.0).tolist()
+            result["terminated"] = False
+            result["truncated"] = False
+            result["physics_failed"] = False
+            self._safety_reasons[env_index] = safety_reasons
+            self._episode_return[env_index] += float(result["reward"])
+            return result
+        if physx_broken:
+            # Headless: emit a safe truncated transition; caller soft-resets.
             result = dict(result)
             result["reward"] = float(result.get("reward", 0.0))
             result["reward_components"] = dict(result.get("reward_components", {}))
@@ -933,14 +1375,25 @@ class IsaacPursuitEnv:
                 f"total_fails={self._physics_fail_count}",
                 flush=True,
             )
+            # Viewport demos: recover articulations from Radar5 bridge state and
+            # continue the episode instead of truncating (avoids step-11 flash-quit).
+            if not self._headless:
+                recovered = [i for i in range(self.num_envs) if corrupt[i]]
+                self._recover_corrupt_envs(recovered)
+                batch_states = self._physical_state_batch()
+                corrupt = self._corrupt_env_mask(batch_states)
+        # Do not re-push world poses every step: under Direct-GPU PhysX that
+        # path can re-corrupt articulations and spam recovery. Recover-only.
         self._sync_bridge(batch=batch_states)
 
         results = []
         done_indices = []
         for env_index, bridge in enumerate(self.bridges):
             physics_failed = bool(corrupt[env_index])
-            if physics_failed:
-                # Skip Radar5 advance on corrupted physics; emit truncated failure.
+            # Headless: skip Radar5 on corrupt PhysX (truncate). GUI: keep advancing
+            # the chase from bridge kinematics so the target does not "freeze" and
+            # gap does not stick at the grid_size=25 sentinel.
+            if physics_failed and self._headless:
                 result = {
                     "reward": 0.0,
                     "reward_components": {},
@@ -950,18 +1403,23 @@ class IsaacPursuitEnv:
                     "obs": bridge.observe(),
                 }
             else:
+                if physics_failed and not self._headless:
+                    # Reseat again from last finite bridge poses before advancing.
+                    self._recover_corrupt_envs([env_index])
                 result = bridge.advance()
                 self._write_target_pose(env_index)
                 # Pursuer states were synced before advance; do not rebuild the
                 # expensive hetero-graph observation a second time.
                 if result.get("obs") is None:
-                    bridge.sync_pursuers(batch_states[env_index])
+                    if not physics_failed:
+                        bridge.sync_pursuers(batch_states[env_index])
                     result["obs"] = bridge.observe()
                 if env_index == 0:
                     self._read_native_lidar()
             self._steps[env_index] += 1
+            fatal_physics = physics_failed and self._headless
             result = self._finalize_env_result(
-                env_index, result, safety_all[env_index], physics_failed=physics_failed
+                env_index, result, safety_all[env_index], physics_failed=fatal_physics
             )
             done = bool(result["terminated"] or result["truncated"])
             result["_episode_done"] = done

@@ -21,7 +21,7 @@ from torch import nn
 
 from marl_trainers import (
     MAPPOTrainer, TrainConfig, FlatMLP, seed_everything,
-    tensorize_heterogeneous_graph,
+    tensorize_heterogeneous_graph, capture_env_frame, episode_task_metrics,
 )
 from pursuit_graph_encoder import (
     PURSUIT_GRAPH_VERSION, PursuitGraphActor, pursuit_graph_from_flat_observation,
@@ -286,6 +286,640 @@ class PursuitDemoTrainer(MAPPOTrainer):
         result["ppo_update_seconds"] = time.perf_counter() - started
         return result
 
+    @staticmethod
+    def _logic_env_at(vec_env, index: int):
+        if hasattr(vec_env, "envs"):
+            return vec_env.envs[index]
+        if hasattr(vec_env, "bridges"):
+            return vec_env.bridges[index].env
+        raise TypeError("vector env must expose envs[] or bridges[].env")
+
+    @staticmethod
+    def _empty_slot_diagnostics():
+        return {
+            "environment_seconds": 0.0,
+            "controller_rates": [],
+            "safety_metrics": {
+                key: []
+                for key in (
+                    "safety_correction_rate",
+                    "safety_correction_magnitude",
+                    "emergency_stop_rate",
+                )
+            },
+            "safety_reason_counts": {},
+            "reward_totals": {},
+            "closest_capture_gap": float("inf"),
+            "lidar_rates": [],
+            "visibility_totals": {},
+            "visibility_steps": 0,
+            "total_reward": 0.0,
+            "total_collisions": 0,
+            "total_uav_collisions": 0,
+            "total_obstacle_conflicts": 0,
+            "total_pair_conflicts": 0,
+            "outage_rates": [],
+            "disabled_rates": [],
+            "safety_intervention_rates": [],
+            "action_agreement_rates": [],
+            "total_new_cells": 0,
+            "total_revisit_gain": 0.0,
+            "stagnant_agent_rates": [],
+            "total_new_crashes": 0,
+            "first_detection_step": None,
+            "target_loss_count": 0,
+            "target_reacquisition_count": 0,
+            "last_target_loss_step": None,
+            "target_reacquisition_delays": [],
+            "direct_visibility_steps": 0,
+            "capture_time": 0,
+            "track_position_rmse_steps": [],
+            "track_velocity_rmse_steps": [],
+            "track_nees_steps": [],
+            "track_nees_consistency_steps": [],
+            "track_age_steps": [],
+            "valid_track_rate_steps": [],
+            "assignment_search_rates": [],
+            "assignment_switch_rates": [],
+            "total_track_messages": 0,
+            "total_track_communication_bytes": 0,
+            "total_active_uav_exposure": 0,
+            "mpc_feasible_rates": [],
+            "total_path_length": 0.0,
+            "total_control_smoothness_cost": 0.0,
+            "trace": [],
+        }
+
+    def _accumulate_vector_diagnostics(self, diag, result, *, step_index: int, env_seconds: float):
+        diag["environment_seconds"] += float(env_seconds)
+        accumulate_visibility(diag["visibility_totals"], result)
+        diag["visibility_steps"] += 1
+        for key, value in result.get("reward_components", {}).items():
+            if key not in ("pursuit", "estimation"):
+                diag["reward_totals"][key] = diag["reward_totals"].get(key, 0.0) + float(value)
+        diag["closest_capture_gap"] = min(
+            diag["closest_capture_gap"],
+            float(result.get("minimum_capture_gap", float("inf"))),
+        )
+        diag["controller_rates"].append(result.get("controller_feasible_rate", 0.0))
+        for key in diag["safety_metrics"]:
+            diag["safety_metrics"][key].append(result.get(key, 0.0))
+        for reasons in result.get("safety_reasons", []):
+            for reason in reasons:
+                diag["safety_reason_counts"][reason] = diag["safety_reason_counts"].get(reason, 0) + 1
+        if "lidar_detection_ratio" in result:
+            diag["lidar_rates"].append(result["lidar_detection_ratio"])
+
+        reward = float(result["reward"])
+        diag["total_reward"] += reward
+        diag["total_collisions"] += int(result.get("collisions", 0))
+        diag["total_uav_collisions"] += int(result.get("uav_collisions", 0))
+        diag["total_obstacle_conflicts"] += int(result.get("obstacle_conflicts", 0))
+        diag["total_pair_conflicts"] += int(result.get("pair_conflicts", 0))
+        diag["outage_rates"].append(float(result.get("outage_rate", 0.0)))
+        diag["disabled_rates"].append(float(result.get("disabled_rate", 0.0)))
+        diag["safety_intervention_rates"].append(float(result.get("safety_intervention_rate", 0.0)))
+        diag["action_agreement_rates"].append(float(result.get("action_agreement_rate", 1.0)))
+        diag["total_new_cells"] += int(result.get("new_cells", 0))
+        diag["total_revisit_gain"] += float(result.get("revisit_gain", 0.0))
+        diag["stagnant_agent_rates"].append(
+            float(result.get("stagnant_agents", 0)) / max(self.n_agents, 1)
+        )
+        diag["total_new_crashes"] += int(result.get("new_crashes", 0))
+        directly_visible = bool(result.get("direct_target_visible", 0.0))
+        diag["direct_visibility_steps"] += int(directly_visible)
+        if directly_visible and diag["first_detection_step"] is None:
+            diag["first_detection_step"] = step_index + 1
+        diag["target_loss_count"] += int(bool(result.get("target_lost", 0.0)))
+        diag["target_reacquisition_count"] += int(bool(result.get("target_reacquired", 0.0)))
+        if bool(result.get("target_lost", 0.0)):
+            diag["last_target_loss_step"] = step_index + 1
+        if bool(result.get("target_reacquired", 0.0)) and diag["last_target_loss_step"] is not None:
+            diag["target_reacquisition_delays"].append(
+                step_index + 1 - diag["last_target_loss_step"]
+            )
+            diag["last_target_loss_step"] = None
+        if bool(result.get("capture_success", 0.0)) and diag["capture_time"] == 0:
+            diag["capture_time"] = step_index + 1
+        for key, destination_key in (
+            ("track_position_rmse", "track_position_rmse_steps"),
+            ("track_velocity_rmse", "track_velocity_rmse_steps"),
+            ("mean_track_nees", "track_nees_steps"),
+            ("track_nees_consistency_rate", "track_nees_consistency_steps"),
+            ("mean_track_age", "track_age_steps"),
+            ("valid_track_rate", "valid_track_rate_steps"),
+            ("assignment_search_rate", "assignment_search_rates"),
+            ("assignment_switch_rate", "assignment_switch_rates"),
+        ):
+            metric_value = float(result.get(key, np.nan))
+            if np.isfinite(metric_value):
+                diag[destination_key].append(metric_value)
+        diag["total_track_messages"] += int(result.get("track_messages", 0))
+        diag["total_track_communication_bytes"] += int(
+            result.get("track_communication_bytes", 0)
+        )
+        diag["total_active_uav_exposure"] += int(
+            result.get("active_uav_exposure", self.n_agents)
+        )
+        if "mpc_feasible_rate" in result:
+            diag["mpc_feasible_rates"].append(float(result["mpc_feasible_rate"]))
+        diag["total_path_length"] += float(result.get("step_path_length", 0.0))
+        diag["total_control_smoothness_cost"] += float(
+            result.get("control_smoothness_cost", 0.0)
+        )
+        return reward
+
+    def _sample_continuous_step(self, obs, logic_env):
+        """Sample one continuous MAPPO step; returns (executed, rollout_fields)."""
+        obs_vec = torch.as_tensor(obs["agent_observations"], dtype=torch.float32, device=self.device)
+        adjacency = torch.as_tensor(obs["comm_adjacency"], dtype=torch.bool, device=self.device)
+        hetero_graph = (
+            tensorize_heterogeneous_graph(obs["hetero_graph"], self.device)
+            if self.cfg.use_gat and self.cfg.use_hetero_entities
+            else None
+        )
+        state = torch.as_tensor(obs["state_vector"], dtype=torch.float32, device=self.device)
+        masks = torch.as_tensor(obs["action_masks"], dtype=torch.bool, device=self.device)
+        all_policy_outputs = self.actor(obs_vec, adjacency, hetero_graph)
+        value = self._value_estimate(obs_vec, state)
+        means, log_stds = torch.chunk(all_policy_outputs, 2, dim=-1)
+        log_stds = torch.clamp(log_stds, -5.0, self.cfg.continuous_log_std_max)
+        distributions = torch.distributions.Normal(means, torch.exp(log_stds))
+        raw_samples = distributions.rsample()
+        squashed = torch.tanh(raw_samples)
+        corrected_logps = (
+            distributions.log_prob(raw_samples)
+            - torch.log(torch.clamp(1.0 - squashed.pow(2), min=1e-6))
+        ).sum(dim=-1)
+        actions = squashed.detach().cpu().numpy()
+        policy_samples = [raw_samples[i].detach() for i in range(self.n_agents)]
+        logps = [corrected_logps[i] for i in range(self.n_agents)]
+        executed = np.asarray(actions, dtype=float)
+        if hasattr(self, "execution_actions"):
+            executed = np.asarray(self.execution_actions(executed, logic_env), dtype=executed.dtype)
+        return executed, {
+            "obs_vec": obs_vec,
+            "adjacency": adjacency,
+            "hetero_graph": hetero_graph,
+            "state": state,
+            "masks": masks,
+            "actions": actions,
+            "policy_samples": policy_samples,
+            "logps": logps,
+            "value": value,
+        }
+
+    def _append_rollout_transition(self, rollout, fields, transition_result, *, truncated_override=False):
+        next_obs = transition_result["obs"]
+        next_state = torch.as_tensor(
+            next_obs["state_vector"], dtype=torch.float32, device=self.device
+        )
+        terminated = bool(transition_result.get("terminated", False))
+        truncated = bool(transition_result.get("truncated", False)) or bool(truncated_override)
+        reward = float(transition_result["reward"]) * self.cfg.reward_scale
+        rollout.append(
+            (
+                fields["obs_vec"],
+                fields["adjacency"],
+                fields["hetero_graph"],
+                fields["state"],
+                fields["masks"],
+                fields["actions"],
+                fields["policy_samples"],
+                torch.stack(fields["logps"]).detach(),
+                fields["value"].detach(),
+                reward,
+                next_state,
+                terminated,
+                truncated,
+                1.0 - float(transition_result.get("coverage", 0.0)),
+                torch.as_tensor(
+                    next_obs["agent_observations"],
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                None,
+            )
+        )
+        return terminated, truncated
+
+    def _apply_slot_diagnostics_to_self(self, diag, logic_env):
+        self.active_env = logic_env
+        self.environment_seconds = diag["environment_seconds"]
+        self.controller_rates = diag["controller_rates"]
+        self.safety_metrics = diag["safety_metrics"]
+        self.safety_reason_counts = diag["safety_reason_counts"]
+        self.reward_totals = diag["reward_totals"]
+        self.closest_capture_gap = diag["closest_capture_gap"]
+        self.lidar_rates = diag["lidar_rates"]
+        self.visibility_totals = diag["visibility_totals"]
+        self.visibility_steps = diag["visibility_steps"]
+
+    def _history_row_from_slot(
+        self,
+        diag,
+        logic_env,
+        result,
+        update_stats,
+        *,
+        episode,
+        rollout_limit,
+        steps=None,
+        env_already_reset=False,
+    ):
+        steps = int(steps if steps is not None else getattr(logic_env, "t", 0) or 0)
+        if steps <= 0:
+            steps = int(len(diag.get("trace") or []) or 1)
+        captured = float(result.get("capture_success", 0.0))
+        if env_already_reset:
+            # Auto-reset already replaced the live env; use terminal flags only.
+            task_progress = {
+                "target_discovery_rate": captured,
+                "target_tracking_rate": captured,
+                "target_completion_rate": captured,
+                "belief_decisiveness": float("nan"),
+                "belief_brier_score": float("nan"),
+                "task_success": captured,
+            }
+            coverage = float(result.get("coverage", 0.0))
+        else:
+            task_progress = episode_task_metrics(logic_env)
+            coverage = float(logic_env.coverage()) if hasattr(logic_env, "coverage") else 0.0
+        row = {
+            "episode": episode,
+            "reward": diag["total_reward"],
+            "coverage": coverage,
+            **task_progress,
+            "collisions": diag["total_collisions"],
+            "uav_collisions": diag["total_uav_collisions"],
+            "obstacle_conflicts": diag["total_obstacle_conflicts"],
+            "pair_conflicts": diag["total_pair_conflicts"],
+            "collision_rate": float(diag["total_collisions"] / max(steps, 1)),
+            "outage_rate": float(np.mean(diag["outage_rates"])) if diag["outage_rates"] else 0.0,
+            "disabled_rate": float(np.mean(diag["disabled_rates"])) if diag["disabled_rates"] else 0.0,
+            "safety_intervention_rate": (
+                float(np.mean(diag["safety_intervention_rates"]))
+                if diag["safety_intervention_rates"]
+                else 0.0
+            ),
+            "action_agreement_rate": (
+                float(np.mean(diag["action_agreement_rates"]))
+                if diag["action_agreement_rates"]
+                else 1.0
+            ),
+            "new_cells": diag["total_new_cells"],
+            "revisit_gain": diag["total_revisit_gain"],
+            "stagnant_agent_rate": (
+                float(np.mean(diag["stagnant_agent_rates"])) if diag["stagnant_agent_rates"] else 0.0
+            ),
+            "new_crashes": diag["total_new_crashes"],
+            "capture_success": float(result.get("capture_success", 0.0)),
+            "capture_hold_count": int(result.get("capture_hold_count", 0)),
+            "capture_close_uavs": int(result.get("capture_close_uavs", 0)),
+            "capture_angular_span_deg": float(result.get("capture_angular_span_deg", 0.0)),
+            "direct_target_visible": float(result.get("direct_target_visible", 0.0)),
+            "first_onboard_contact_time": int(diag["first_detection_step"] or (rollout_limit + 1)),
+            "first_detection_time": int(diag["first_detection_step"] or (rollout_limit + 1)),
+            "capture_time": int(diag["capture_time"] or (rollout_limit + 1)),
+            "target_loss_count": int(diag["target_loss_count"]),
+            "target_reacquisition_count": int(diag["target_reacquisition_count"]),
+            "mean_reacquisition_time": (
+                float(np.mean(diag["target_reacquisition_delays"]))
+                if diag["target_reacquisition_delays"]
+                else np.nan
+            ),
+            "continuous_visibility_ratio": float(
+                diag["direct_visibility_steps"] / max(steps, 1)
+            ),
+            "track_position_rmse": float(
+                np.sqrt(np.mean(np.square(diag["track_position_rmse_steps"])))
+                if diag["track_position_rmse_steps"]
+                else np.nan
+            ),
+            "track_velocity_rmse": float(
+                np.sqrt(np.mean(np.square(diag["track_velocity_rmse_steps"])))
+                if diag["track_velocity_rmse_steps"]
+                else np.nan
+            ),
+            "mean_track_nees": (
+                float(np.mean(diag["track_nees_steps"])) if diag["track_nees_steps"] else np.nan
+            ),
+            "track_nees_consistency_rate": (
+                float(np.mean(diag["track_nees_consistency_steps"]))
+                if diag["track_nees_consistency_steps"]
+                else np.nan
+            ),
+            "mean_track_age": (
+                float(np.mean(diag["track_age_steps"])) if diag["track_age_steps"] else np.nan
+            ),
+            "valid_track_rate": (
+                float(np.mean(diag["valid_track_rate_steps"]))
+                if diag["valid_track_rate_steps"]
+                else 0.0
+            ),
+            "track_messages": int(diag["total_track_messages"]),
+            "track_communication_bytes": int(diag["total_track_communication_bytes"]),
+            "assignment_search_rate": (
+                float(np.mean(diag["assignment_search_rates"]))
+                if diag["assignment_search_rates"]
+                else 1.0
+            ),
+            "assignment_switch_rate": (
+                float(np.mean(diag["assignment_switch_rates"]))
+                if diag["assignment_switch_rates"]
+                else 0.0
+            ),
+            "collision_exposure_rate": float(
+                diag["total_collisions"] / max(diag["total_active_uav_exposure"], 1)
+            ),
+            "mpc_feasible_rate": (
+                float(np.mean(diag["mpc_feasible_rates"]))
+                if diag["mpc_feasible_rates"]
+                else np.nan
+            ),
+            "path_length": float(diag["total_path_length"]),
+            "control_smoothness_cost": float(diag["total_control_smoothness_cost"]),
+            "weight_target": float("nan"),
+            "weight_exploration": float("nan"),
+            "weight_revisit": float("nan"),
+            "weight_connectivity": float("nan"),
+            "weight_safety": float("nan"),
+            "steps": steps,
+            "num_envs": int(getattr(self, "_vector_num_envs", 1) or 1),
+            **update_stats,
+        }
+        return row
+
+    def _soft_reset_vector_slot(self, vec_env, observations, index, *, seed):
+        if hasattr(vec_env, "_reset_env_indices"):
+            vec_env._reset_env_indices([index], seeds=[int(seed)])
+            observations[index] = vec_env.bridges[index].observe()
+            return
+        if hasattr(vec_env, "envs"):
+            env = vec_env.envs[index]
+            env.cfg.seed = int(seed)
+            env.rng = np.random.default_rng(int(seed))
+            env.reset()
+            observations[index] = env.observe_search()
+            return
+        raise TypeError("vector env cannot soft-reset individual slots")
+
+    def _flush_vector_batch(
+        self, batch, history, *, completed, target, num_envs, started_at, episode_wall
+    ):
+        """Run on-policy PPO for trajectories collected under one frozen policy."""
+        for item in batch:
+            if completed >= target:
+                break
+            completed += 1
+            update_stats = self._update(item["rollout"], completed - 1)
+            self.episode_traces.append(
+                {"episode": completed, "frames": item["diag"]["trace"], "mode": "3d"}
+            )
+            self.episode_traces = self.episode_traces[-3:]
+            self._apply_slot_diagnostics_to_self(item["diag"], item["logic_env"])
+            self._finalize_use_closest_gap = bool(item["env_already_reset"])
+            self._finalize_disabled_count = item["disabled_count"]
+            if item["env_already_reset"] and item["terminal_gap"] < float("inf"):
+                self.closest_capture_gap = min(self.closest_capture_gap, item["terminal_gap"])
+            row = self._history_row_from_slot(
+                item["diag"],
+                item["logic_env"],
+                item["capture_result"],
+                update_stats,
+                episode=completed,
+                rollout_limit=item["rollout_limit"],
+                steps=item["episode_steps"],
+                env_already_reset=item["env_already_reset"],
+            )
+            row = self.finalize_pursuit_row(row)
+            if item["env_already_reset"] and np.isfinite(item["terminal_gap"]):
+                row["minimum_capture_gap"] = item["terminal_gap"]
+            self._finalize_use_closest_gap = False
+            self._finalize_disabled_count = None
+            history.append(row)
+            callback = getattr(self, "on_vector_episode_complete", None)
+            if callable(callback):
+                callback(completed)
+
+            episode_seconds = time.perf_counter() - episode_wall
+            if (
+                completed == 1
+                or completed % max(1, self.cfg.log_interval) == 0
+                or completed >= target
+            ):
+                elapsed = time.perf_counter() - started_at
+                run_count = max(completed - int(getattr(self, "_vector_start_episode", 0)), 1)
+                eta = elapsed / run_count * max(target - completed, 0)
+                rmse = row.get("track_position_rmse", float("nan"))
+                print(
+                    f"[MAPPO] episode={completed}/{target} reward={row['reward']:.2f} "
+                    f"env={row.get('environment_seconds', 0.0):.2f}s "
+                    f"ppo={row.get('ppo_update_seconds', 0.0):.2f}s "
+                    f"capture={row['capture_success']:.0f} "
+                    f"first_obs_step={row['first_onboard_contact_time']} "
+                    f"visibility={row['continuous_visibility_ratio']:.3f} "
+                    f"target_losses={row['target_loss_count']} "
+                    f"capture_rate_50={np.mean([r['capture_success'] for r in history[-50:]]):.3f} "
+                    f"track_rmse={rmse:.3f} "
+                    f"entropy={row.get('entropy', float('nan')):.3f} "
+                    f"num_envs={num_envs} "
+                    f"time={episode_seconds:.2f}s eta={eta / 3600:.2f}h",
+                    flush=True,
+                )
+
+            if self.cfg.checkpoint_path and (
+                completed % max(1, self.cfg.checkpoint_interval) == 0 or completed >= target
+            ):
+                self.save_checkpoint(self.cfg.checkpoint_path, episode=completed, history=history)
+            budgets = tuple(
+                int(x) for x in getattr(self.cfg, "episode_budget_checkpoints", ()) or ()
+            )
+            if self.cfg.checkpoint_path and budgets and completed in budgets:
+                budget_dir = Path(self.cfg.checkpoint_path).resolve().parent / "budgets"
+                budget_dir.mkdir(parents=True, exist_ok=True)
+                budget_path = budget_dir / f"ep{completed:04d}.pt"
+                self.save_checkpoint(str(budget_path), episode=completed, history=history)
+                print(f"[MAPPO] budget checkpoint → {budget_path}", flush=True)
+            if completed >= target:
+                break
+        return completed
+
+    def train_vectorized(self, vec_env, *, target_episodes=None):
+        """Collect from Isaac/kinematic vector envs with on-policy PPO.
+
+        All ``num_envs`` scenes step in lockstep under a frozen policy (using
+        ``info['final_obs']`` on auto-reset). When the first scene finishes an
+        episode, that trajectory is PPO-updated once; every other in-flight or
+        simultaneously-finished trajectory is discarded and soft-reset so
+        likelihood parity stays valid. PhysX still runs N-way in parallel for
+        most of each episode wall-clock.
+        """
+        if not self.continuous_actions:
+            raise ValueError("train_vectorized currently supports continuous pursuit MAPPO only")
+        target = int(self.cfg.episodes if target_episodes is None else target_episodes)
+        completed = int(self.start_episode)
+        self._vector_start_episode = completed
+        history = list(self.restored_history)
+        base_seed = int(getattr(self, "seed", None) or self.environment_config.get("seed", 0))
+        num_envs = int(vec_env.num_envs)
+        self._vector_num_envs = num_envs
+        observations = vec_env.reset(
+            seeds=[base_seed * 100_000 + completed + i for i in range(num_envs)]
+        )
+        print(
+            f"[MAPPO-VEC] device={self.device} num_envs={num_envs} "
+            f"episodes={completed + 1}..{target}",
+            flush=True,
+        )
+        started_at = time.perf_counter()
+        step_limit = int(self.cfg.max_steps or 0)
+        if step_limit <= 0:
+            step_limit = int(getattr(getattr(vec_env, "cfg", None), "search_steps", 0) or 0)
+        local_steps = np.zeros(num_envs, dtype=np.int32)
+        rollouts = [[] for _ in range(num_envs)]
+        diagnostics = [self._empty_slot_diagnostics() for _ in range(num_envs)]
+        pending_fields = [None] * num_envs
+        finished_batch = []
+        next_episode_seed = completed
+
+        while completed < target:
+            episode_wall = time.perf_counter()
+            actions = []
+            for index in range(num_envs):
+                logic_env = self._logic_env_at(vec_env, index)
+                executed, fields = self._sample_continuous_step(observations[index], logic_env)
+                pending_fields[index] = fields
+                actions.append(executed)
+            actions = np.stack(actions, axis=0)
+            step_started = time.perf_counter()
+            results = vec_env.step_joint(actions)
+            vector_seconds = time.perf_counter() - step_started
+            per_env_seconds = vector_seconds / max(num_envs, 1)
+
+            for index, result in enumerate(results):
+                logic_env = self._logic_env_at(vec_env, index)
+                fields = pending_fields[index]
+                transition_result = dict(result)
+                info = result.get("info") or {}
+                if result.get("_episode_done") and info.get("final_obs") is not None:
+                    transition_result["obs"] = info["final_obs"]
+                    if "final_terminated" in info:
+                        transition_result["terminated"] = bool(info["final_terminated"])
+                        transition_result["truncated"] = bool(info.get("final_truncated", False))
+                    else:
+                        captured = bool(
+                            info.get("capture_success", result.get("capture_success", False))
+                        )
+                        transition_result["terminated"] = captured
+                        transition_result["truncated"] = not captured
+                local_steps[index] += 1
+                force_done = step_limit > 0 and int(local_steps[index]) >= step_limit
+                truncated_override = bool(
+                    force_done and not bool(transition_result.get("terminated", False))
+                )
+                self._accumulate_vector_diagnostics(
+                    diagnostics[index],
+                    transition_result,
+                    step_index=int(local_steps[index]) - 1,
+                    env_seconds=per_env_seconds,
+                )
+                terminated, truncated = self._append_rollout_transition(
+                    rollouts[index],
+                    fields,
+                    transition_result,
+                    truncated_override=truncated_override,
+                )
+                diagnostics[index]["trace"].append(
+                    capture_env_frame(logic_env, transition_result, fields["actions"])
+                )
+
+                if result.get("_episode_done") or force_done or terminated or truncated:
+                    capture_result = dict(transition_result)
+                    capture_result["capture_success"] = bool(
+                        info.get(
+                            "capture_success",
+                            transition_result.get(
+                                "capture_success", result.get("capture_success", False)
+                            ),
+                        )
+                    )
+                    episode_steps = int(local_steps[index])
+                    env_already_reset = bool(
+                        result.get("_episode_done") and info.get("final_obs") is not None
+                    )
+                    terminal_gap = float(
+                        transition_result.get(
+                            "minimum_capture_gap",
+                            diagnostics[index]["closest_capture_gap"],
+                        )
+                    )
+                    finished_batch.append(
+                        {
+                            "rollout": rollouts[index],
+                            "diag": diagnostics[index],
+                            "logic_env": logic_env,
+                            "capture_result": capture_result,
+                            "episode_steps": episode_steps,
+                            "rollout_limit": step_limit or episode_steps,
+                            "env_already_reset": env_already_reset,
+                            "terminal_gap": terminal_gap,
+                            "disabled_count": (
+                                int(np.count_nonzero(getattr(logic_env, "disabled_uavs", [])))
+                                if not env_already_reset
+                                else int(result.get("disabled_count", 0) or 0)
+                            ),
+                        }
+                    )
+                    rollouts[index] = []
+                    diagnostics[index] = self._empty_slot_diagnostics()
+                    local_steps[index] = 0
+                    next_episode_seed += 1
+                    if force_done and not result.get("_episode_done"):
+                        self._soft_reset_vector_slot(
+                            vec_env,
+                            observations,
+                            index,
+                            seed=base_seed * 100_000 + next_episode_seed + index,
+                        )
+                    else:
+                        observations[index] = result["obs"]
+                else:
+                    observations[index] = result["obs"]
+
+            if not finished_batch or completed >= target:
+                continue
+
+            # One on-policy update per flush. Remaining finished/partial rollouts
+            # were collected under the pre-update policy and must be dropped.
+            to_flush = finished_batch[:1]
+            finished_batch = []
+            completed = self._flush_vector_batch(
+                to_flush,
+                history,
+                completed=completed,
+                target=target,
+                num_envs=num_envs,
+                started_at=started_at,
+                episode_wall=episode_wall,
+            )
+            for index in range(num_envs):
+                rollouts[index] = []
+                diagnostics[index] = self._empty_slot_diagnostics()
+                local_steps[index] = 0
+                next_episode_seed += 1
+                self._soft_reset_vector_slot(
+                    vec_env,
+                    observations,
+                    index,
+                    seed=base_seed * 100_000 + next_episode_seed + index,
+                )
+
+        self.start_episode = target
+        self.restored_history = history
+        self.pursuit_history = list(history)
+        return history
+
     def finalize_pursuit_row(self, row):
         if self.episode_traces:
             self.episode_traces[-1].update(mode="3d")
@@ -298,13 +932,24 @@ class PursuitDemoTrainer(MAPPOTrainer):
             row["lidar_detection_ratio"] = float(np.mean(self.lidar_rates))
         row["target_observation_ratio"] = row.get("continuous_visibility_ratio")
         row.update(finalize_visibility(self.visibility_totals, self.visibility_steps))
-        row["minimum_capture_gap"] = self.active_env.minimum_capture_gap()
+        if getattr(self, "_finalize_use_closest_gap", False):
+            gap = self.closest_capture_gap
+            row["minimum_capture_gap"] = (
+                float(gap) if np.isfinite(gap) else float(self.active_env.minimum_capture_gap())
+            )
+        else:
+            row["minimum_capture_gap"] = self.active_env.minimum_capture_gap()
         row["demo_loss_weight"] = self.demo_loss_weight(row["episode"] - 1)
         row["reference_kl_weight"] = self.reference_kl_weight if self.reference_actor is not None else 0.0
         row["safeguard_rollbacks"] = self.safeguard_rollbacks
         row["reward_components"] = dict(self.reward_totals)
         row["closest_capture_gap"] = self.closest_capture_gap
-        row["disabled_uavs_final"] = int(np.count_nonzero(self.active_env.disabled_uavs))
+        disabled_override = getattr(self, "_finalize_disabled_count", None)
+        row["disabled_uavs_final"] = (
+            int(disabled_override)
+            if disabled_override is not None
+            else int(np.count_nonzero(self.active_env.disabled_uavs))
+        )
         if self.output_directory:
             diagnostic = {"episode": row["episode"], "reward": row["reward"],
                           "component_sum": sum(self.reward_totals.values()),

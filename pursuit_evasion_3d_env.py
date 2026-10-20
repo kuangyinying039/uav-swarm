@@ -729,6 +729,37 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
         # Parent ``_unit`` falls back to a planar [1, 0] when both vectors vanish.
         if np.asarray(direction).reshape(-1).size == 2:
             direction = np.r_[np.asarray(direction, dtype=float).reshape(-1), 0.0]
+        try:
+            from pursuit_scenarios import command_velocity, resolve_evader_motion
+        except ImportError:
+            from .pursuit_scenarios import command_velocity, resolve_evader_motion
+        nearest = float(np.min(distances))
+        dt = float(getattr(self, "current_decision_dt", c.decision_dt))
+        velocity = np.array(
+            [*self.target_velocity[target_index], self.target_vertical_velocity[target_index]],
+            dtype=float,
+        )
+        _, _, status = resolve_evader_motion(
+            self, target, velocity, command_velocity(direction, c), dt
+        )
+        # A blocked cover waypoint is not a place to wait. Close pursuers
+        # make the evader leave that waypoint and run away from them.
+        pursuers_close = nearest < float(getattr(c, "evader_repulsion_radius", 10.0))
+        speed_now = float(np.linalg.norm(velocity))
+        direction = np.asarray(direction, dtype=float).reshape(-1)
+        planar = float(np.linalg.norm(direction[:2])) if direction.size >= 2 else 0.0
+        leaving = float(np.dot(_unit(direction), repulsion))
+        # Occlusion may pick a near-zero "hover behind cover" command. Under
+        # pressure that becomes freeze-to-capture; force a flee heading.
+        frozen_under_pressure = pursuers_close and (
+            status == "stopped" or speed_now < 0.15 or planar < 0.25
+        )
+        if frozen_under_pressure or (pursuers_close and leaving < 0.35):
+            climb = np.array([repulsion[0], repulsion[1], 0.9], dtype=float)
+            escape = climb if nearest < 6.0 else repulsion
+            self.occlusion_waypoints[target_index] = target + escape * lookahead
+            self.occlusion_waypoint_dwell[target_index] = 0
+            direction = escape
         return np.asarray(direction, dtype=float).reshape(-1)
 
     def _covering_building_height(self, xy: np.ndarray, margin: float = 0.0) -> float | None:

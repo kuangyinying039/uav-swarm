@@ -147,10 +147,10 @@ interventions 和 intervention-free episode rate。单目标情况下 `target_vi
 | 参数 | Dual Nominal | Dual Medium | Dual Hard | Dual Extreme |
 |---|---:|---:|---:|---:|
 | `capture_required_uavs` | 2 | 2 | 2 | 2 |
-| 三角初始距 (m) | 6–8 | 7.5–9.5 | 9.5–11 | 11–13 |
-| 目标水平速 (m/s) | 1.82 | 2.15 | 2.35 | 2.60 |
+| 三角初始距 (m) | 6–8 | 7.5–9.5 | 9.5–11 | 10.25–12.25 |
+| 目标水平速 (m/s) | 1.48 | 1.50 | 1.60 | 1.76 |
 | 雷达检出概率 | 0.90 | 0.85 | 0.80 | 0.80 |
-| 雷达量程 (m) | 12 | 12 | 12 | 9 |
+| 雷达量程 (m) | 12 | 12 | 12 | 10 |
 
 配置：`configs/pursuit_v2/radar5_dual_{nominal,medium,hard,extreme}.json`。
 观测/动作维度与旧 Radar5 一致，可零样本跨档评估；但捕获成功标签变了，**必须重采**

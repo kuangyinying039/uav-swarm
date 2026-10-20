@@ -128,7 +128,8 @@ td{padding:4px;border-bottom:1px solid #e8ebef}.legend{margin-top:14px;line-heig
 <div class="controls"><button id="play">Pause</button><button id="restart">Restart</button>
 <label class="wide">Frame <input id="slider" type="range" min="0" value="0" style="width:75%"></label>
 <label>Speed <select id="speed"><option value="180">0.5×</option><option value="90" selected>1×</option><option value="45">2×</option></select></label>
-<label>View <select id="view"><option value="top">Top</option><option value="iso">3-D/isometric</option></select></label></div>
+<label>View <select id="view"><option value="top">Top</option><option value="iso">3-D/isometric</option></select></label>
+<label class="wide"><input id="showLidar" type="checkbox"> Show lidar FOV (slower)</label></div>
 <table id="stats"></table><div class="legend">
 <div><span class="sw" style="background:#2455bd"></span>UAV / trajectory</div>
 <div><span class="sw" style="background:#d9272e"></span>evader / trajectory</div>
@@ -139,13 +140,16 @@ td{padding:4px;border-bottom:1px solid #e8ebef}.legend{margin-top:14px;line-heig
 <script>
 const trace=__TRACE__, frames=trace.frames||[], cvs=document.getElementById('scene'),ctx=cvs.getContext('2d');
 const slider=document.getElementById('slider'),play=document.getElementById('play'),view=document.getElementById('view');
+const showLidar=document.getElementById('showLidar');
 if(trace.mode==='3d')view.value='iso';
 slider.max=Math.max(0,frames.length-1);let k=0,running=true,last=0;
 const colors=['#1649b7','#ec8b19','#169c62','#8a3fc5','#008b9a','#ba3d8c'];
+const TRAIL_LEN=60; // sliding window — full-history trails caused end-of-episode stutter
 function resize(){const r=cvs.getBoundingClientRect(),d=devicePixelRatio||1;cvs.width=r.width*d;cvs.height=r.height*d;ctx.setTransform(d,0,0,d,0,0);draw()}
 function project(p,z,G,W,H,mode){if(mode==='iso'){const s=Math.min(W/(G*1.55),H/(G*1.12));return [W*.5+(p[0]-p[1])*s*.72,H*.83-(p[0]+p[1])*s*.32-(z||0)*s*.72,s]}const s=Math.min((W-60)/G,(H-60)/G);return [30+p[0]*s,H-30-p[1]*s,s]}
 function line(a,b,color,w=1,dash=[]){ctx.save();ctx.strokeStyle=color;ctx.lineWidth=w;ctx.setLineDash(dash);ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();ctx.restore()}
 function draw(){if(!frames.length)return;const f=frames[k],W=cvs.clientWidth,H=cvs.clientHeight,G=f.grid_size||25,mode=view.value;
+const trail0=Math.max(0,k-TRAIL_LEN+1);
 ctx.clearRect(0,0,W,H);ctx.fillStyle='#fbfcfe';ctx.fillRect(0,0,W,H);
 // floor grid
 for(let i=0;i<=G;i+=2){line(project([i,0],0,G,W,H,mode),project([i,G],0,G,W,H,mode),'#e8ebf0');line(project([0,i],0,G,W,H,mode),project([G,i],0,G,W,H,mode),'#e8ebf0')}
@@ -154,19 +158,19 @@ for(let i=0;i<=G;i+=2){line(project([i,0],0,G,W,H,mode),project([i,G],0,G,W,H,mo
  const base=pts.map(p=>project(p,0,G,W,H,mode)),top=pts.map(p=>project(p,h,G,W,H,mode));ctx.fillStyle='#747b86aa';ctx.beginPath();base.forEach((p,n)=>n?ctx.lineTo(...p):ctx.moveTo(...p));ctx.closePath();ctx.fill();
  if(mode==='iso'&&h){ctx.fillStyle='#535b68bb';ctx.beginPath();top.forEach((p,n)=>n?ctx.lineTo(...p):ctx.moveTo(...p));ctx.closePath();ctx.fill();for(let n=0;n<4;n++)line(base[n],top[n],'#414854',1.2)}
 });
-// trails
-for(let a=0;a<(f.positions||[]).length;a++){ctx.beginPath();for(let q=0;q<=k;q++){const fr=frames[q],p=project(fr.positions[a],(fr.altitudes||[])[a]||0,G,W,H,mode);q?ctx.lineTo(...p):ctx.moveTo(...p)}ctx.strokeStyle=colors[a%colors.length]+'aa';ctx.lineWidth=2;ctx.stroke()}
-ctx.beginPath();for(let q=0;q<=k;q++){const fr=frames[q],p=project(fr.targets[0],(fr.target_altitudes||[])[0]||0,G,W,H,mode);q?ctx.lineTo(...p):ctx.moveTo(...p)}ctx.strokeStyle='#d9272ecc';ctx.lineWidth=2.5;ctx.stroke();
+// trails (recent window only — O(TRAIL_LEN) per frame)
+for(let a=0;a<(f.positions||[]).length;a++){ctx.beginPath();for(let q=trail0;q<=k;q++){const fr=frames[q],p=project(fr.positions[a],(fr.altitudes||[])[a]||0,G,W,H,mode);q>trail0?ctx.lineTo(...p):ctx.moveTo(...p)}ctx.strokeStyle=colors[a%colors.length]+'aa';ctx.lineWidth=2;ctx.stroke()}
+ctx.beginPath();for(let q=trail0;q<=k;q++){const fr=frames[q],p=project(fr.targets[0],(fr.target_altitudes||[])[0]||0,G,W,H,mode);q>trail0?ctx.lineTo(...p):ctx.moveTo(...p)}ctx.strokeStyle='#d9272ecc';ctx.lineWidth=2.5;ctx.stroke();
 // communication
 const adj=f.comm_adjacency||[];for(let i=0;i<adj.length;i++)for(let j=i+1;j<adj.length;j++)if(adj[i][j]>0){line(project(f.positions[i],(f.altitudes||[])[i]||0,G,W,H,mode),project(f.positions[j],(f.altitudes||[])[j]||0,G,W,H,mode),'#25a55f99',2,[6,4])}
 // line-of-sight status to the evader
 const vis=f.direct_visibility||[];(f.positions||[]).forEach((p,i)=>{line(project(p,(f.altitudes||[])[i]||0,G,W,H,mode),project(f.targets[0],(f.target_altitudes||[])[0]||0,G,W,H,mode),(vis[i]&&vis[i][0])?'#25a55faa':'#d9272e55',1.3,(vis[i]&&vis[i][0])?[]:[3,5])});
-// Lidar coverage boundaries in the actual mounted sensor frame, not point clouds.
-(f.lidar_poses||[]).forEach(pose=>{for(const elevation of f.lidar_vertical_fov_deg){ctx.beginPath();
-for(let j=0;j<=48;j++){const az=(-.5+j/48)*f.lidar_horizontal_fov_deg*Math.PI/180,el=elevation*Math.PI/180;
-const local=[f.lidar_range*Math.cos(el)*Math.cos(az),f.lidar_range*Math.cos(el)*Math.sin(az),f.lidar_range*Math.sin(el)];
+// Lidar FOV is opt-in: drawing every frame caused late-episode stutter on long episodes.
+if(showLidar&&showLidar.checked){(f.lidar_poses||[]).forEach(pose=>{const elevs=f.lidar_vertical_fov_deg||[];for(const elevation of elevs){ctx.beginPath();
+for(let j=0;j<=24;j++){const az=(-.5+j/24)*(f.lidar_horizontal_fov_deg||90)*Math.PI/180,el=elevation*Math.PI/180;
+const local=[(f.lidar_range||10)*Math.cos(el)*Math.cos(az),(f.lidar_range||10)*Math.cos(el)*Math.sin(az),(f.lidar_range||10)*Math.sin(el)];
 const p=pose.origin.map((v,d)=>v+pose.rotation[d].reduce((s,a,k)=>s+a*local[k],0)),q=project(p,p[2],G,W,H,mode);
-j?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1])}ctx.strokeStyle='#4aa3df66';ctx.lineWidth=1;ctx.stroke()}});
+j?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1])}ctx.strokeStyle='#4aa3df66';ctx.lineWidth=1;ctx.stroke()}});}
 // beliefs
 const beliefs=f.target_belief_mean||[],cov=f.target_belief_covariance||[];beliefs.forEach((b,i)=>{if(!b.length)return;const p=project(b[0],b[0][2]||0,G,W,H,mode),s=p[2],P=(cov[i]&&cov[i][0])||[],vx=(P[0]&&P[0][0])||.1,vy=(P[1]&&P[1][1])||.1,cx=Math.sqrt(Math.max(vx,.02))*s*2,cy=Math.sqrt(Math.max(vy,.02))*s*2;ctx.save();ctx.strokeStyle='#6f42c1aa';ctx.setLineDash([4,3]);ctx.beginPath();ctx.ellipse(p[0],p[1],cx,cy,0,0,Math.PI*2);ctx.stroke();ctx.restore()});
 const hasDistanceCapture=f.capture_radius!==undefined;
@@ -175,8 +179,8 @@ const tp=project(f.targets[0],(f.target_altitudes||[])[0]||0,G,W,H,mode);{const 
 // UAVs
 (f.positions||[]).forEach((p,i)=>{const q=project(p,(f.altitudes||[])[i]||0,G,W,H,mode);ctx.fillStyle=colors[i%colors.length];ctx.beginPath();ctx.moveTo(q[0]+9,q[1]);ctx.lineTo(q[0]-7,q[1]-6);ctx.lineTo(q[0]-7,q[1]+6);ctx.closePath();ctx.fill();ctx.fillStyle='#111';const z=(f.altitudes||[]).length?' z='+(f.altitudes[i]||0).toFixed(1):'';ctx.fillText('U'+(i+1)+z,q[0]+9,q[1]-7)});
 const meanZ=(f.altitudes||[]).length?(f.altitudes.reduce((a,b)=>a+b,0)/f.altitudes.length).toFixed(2):'fixed';
-document.getElementById('stats').innerHTML=[['Mode',trace.mode==='3d'?'3-D continuous':'2-D fixed altitude'],['Control',f.execution_mode||'velocity_yaw_rate'],['Sensor',f.sensor_mode||'lidar'],['Step',f.step],['Step reward',(f.reward||0).toFixed(3)],['Mean UAV altitude',meanZ],['Evader altitude',(f.target_altitudes||[]).length?(f.target_altitudes[0]||0).toFixed(2):'fixed'],['Observed',String((f.direct_visibility||[]).some(r=>r[0]))],...(f.sensor_mode==='lidar'?[['Lidar vertical FOV',f.lidar_vertical_fov_deg.join(' to ')+' deg'],['Detection fraction',((f.lidar_detection_ratio||0)*100).toFixed(1)+'%']]:[]),...(hasDistanceCapture?[['Capture gap',Number(f.minimum_capture_gap).toFixed(3)],['Controller feasible',((f.controller_feasible_rate??0)*100).toFixed(1)+'%'],['Safety interventions',f.continuous_safety_interventions||0]]:[['Capture hold',f.capture_hold_count||0],['Close UAVs',f.capture_close_uavs||0],['Angular span',(f.capture_angular_span_deg||0).toFixed(1)+'°']]),['Captured',f.capture_success?'YES':'no'],['View',mode]].map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');slider.value=k}
+document.getElementById('stats').innerHTML=[['Mode',trace.mode==='3d'?'3-D continuous':'2-D fixed altitude'],['Control',f.execution_mode||'velocity_yaw_rate'],['Sensor',f.sensor_mode||'lidar'],['Step',f.step],['Step reward',(f.reward||0).toFixed(3)],['Mean UAV altitude',meanZ],['Evader altitude',(f.target_altitudes||[]).length?(f.target_altitudes[0]||0).toFixed(2):'fixed'],['Observed',String((f.direct_visibility||[]).some(r=>r[0]))],...(f.sensor_mode==='lidar'?[['Lidar vertical FOV',(f.lidar_vertical_fov_deg||[]).join(' to ')+' deg'],['Detection fraction',((f.lidar_detection_ratio||0)*100).toFixed(1)+'%']]:[]),...(hasDistanceCapture?[['Capture gap',Number(f.minimum_capture_gap||0).toFixed(3)],['Controller feasible',((f.controller_feasible_rate??0)*100).toFixed(1)+'%'],['Safety interventions',f.continuous_safety_interventions||0]]:[['Capture hold',f.capture_hold_count||0],['Close UAVs',f.capture_close_uavs||0],['Angular span',(f.capture_angular_span_deg||0).toFixed(1)+'°']]),['Captured',f.capture_success?'YES':'no'],['View',mode]].map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');slider.value=k}
 function tick(t){if(running&&t-last>+document.getElementById('speed').value){k=(k+1)%frames.length;last=t;draw()}requestAnimationFrame(tick)}
-play.onclick=()=>{running=!running;play.textContent=running?'Pause':'Play'};document.getElementById('restart').onclick=()=>{k=0;draw()};slider.oninput=()=>{k=+slider.value;draw()};view.onchange=draw;
+play.onclick=()=>{running=!running;play.textContent=running?'Pause':'Play'};document.getElementById('restart').onclick=()=>{k=0;draw()};slider.oninput=()=>{k=+slider.value;draw()};view.onchange=draw;if(showLidar)showLidar.onchange=draw;
 addEventListener('resize',resize);resize();requestAnimationFrame(tick);
 </script></body></html>"""

@@ -102,6 +102,53 @@ def safe_segment(env, start, end):
             and env.has_line_of_sight_3d(start, end))
 
 
+def _integrate_evader_step(start, velocity, desired, dt, cfg):
+    next_velocity = velocity_step(velocity, desired, dt, cfg)
+    proposed = np.asarray(start, dtype=float) + 0.5 * (np.asarray(velocity, dtype=float) + next_velocity) * dt
+    return proposed, next_velocity
+
+
+def resolve_evader_motion(env, start, velocity, desired, dt):
+    """Advance one evader step. A heading into a building slides along it.
+
+    Returns ``(position, velocity, status)`` with status ``clear``, ``slide``,
+    or ``stopped``. Stopping is only the fallback when no tangent step fits.
+    """
+    c = env.cfg
+    start = np.asarray(start, dtype=float)
+    velocity = np.asarray(velocity, dtype=float)
+    desired = np.asarray(desired, dtype=float)
+    proposed, next_velocity = _integrate_evader_step(start, velocity, desired, dt, c)
+    if safe_segment(env, start, proposed):
+        return proposed, next_velocity, "clear"
+    # The lagged response cannot turn off a wall in one step. Drop the
+    # component that entered the obstacle and keep a tangent (or a short retreat).
+    blocked = proposed - start
+    horizontal = blocked[:2]
+    horizontal_norm = float(np.linalg.norm(horizontal))
+    options = []
+    if horizontal_norm > 1e-8:
+        normal = horizontal / horizontal_norm
+        tangent_speed = velocity[:2] - normal * float(np.dot(velocity[:2], normal))
+        if float(np.linalg.norm(tangent_speed)) > 0.3:
+            options.append(tangent_speed)
+        sideways = np.array([-normal[1], normal[0]])
+        options.append(sideways * c.target_speed)
+        options.append(-sideways * c.target_speed)
+        options.append(-normal * min(c.target_speed, 1.0))
+    for horizontal_velocity in options:
+        trial = np.array([horizontal_velocity[0], horizontal_velocity[1], 0.0], dtype=float)
+        speed = float(np.linalg.norm(trial[:2]))
+        if speed > c.target_speed:
+            trial[:2] *= c.target_speed / speed
+        for scale in (1.0, 0.5, 0.25):
+            end = start + trial * scale * dt
+            moved = float(np.linalg.norm(end[:2] - start[:2]))
+            if moved > 1e-3 and safe_segment(env, start, end):
+                return end, trial * scale, "slide"
+    return start.copy(), np.zeros(3), "stopped"
+
+
 def predictive_escape(env, target_index):
     c = env.cfg
     dt = float(getattr(env, 'current_decision_dt', c.decision_dt))
@@ -117,6 +164,19 @@ def predictive_escape(env, target_index):
     peers, peer_velocity = observed[active], env._evader_estimated_velocity[active]
     target = np.r_[env.dynamic_targets[target_index], env.target_altitudes[target_index]]
     current_velocity = np.r_[env.target_velocity[target_index], env.target_vertical_velocity[target_index]]
+    hidden_now = 0
+    nearest_now = 0.0
+    if len(peers):
+        hidden_now = sum(not env.has_line_of_sight_3d(peer, target) for peer in peers)
+        nearest_now = float(np.min(np.linalg.norm(peers - target, axis=1)))
+    # Inside this radius a waiting evader is pressured to move. Farther out it may wait.
+    react_distance = float(getattr(c, "evader_repulsion_radius", 10.0))
+    closing_speed = 0.0
+    if len(peers):
+        offset = peers - target
+        distance = np.maximum(np.linalg.norm(offset, axis=1), 1e-6)
+        closing_speed = float(np.max(np.sum(-peer_velocity * offset, axis=1) / distance))
+        closing_speed = max(0.0, closing_speed)
     best, best_score = np.zeros(3), -np.inf
     directions = [np.zeros(3)]
     directions += [np.array([np.cos(a), np.sin(a), z]) for a in np.linspace(-np.pi, np.pi, 24, endpoint=False) for z in (-.8, 0., .8)]
@@ -124,36 +184,102 @@ def predictive_escape(env, target_index):
         position, velocity = target.copy(), current_velocity.copy()
         desired = command_velocity(direction, c)
         clearance = np.inf
-        hidden = 0
+        hidden = hidden_now
+        moved_steps = 0
+        future_peers = peers
         for k in range(c.evader_prediction_steps):
-            next_velocity = velocity_step(velocity, desired, dt, c)
-            trial = position+.5*(velocity+next_velocity)*dt
-            if not safe_segment(env, position, trial):
+            nxt, velocity, status = resolve_evader_motion(env, position, velocity, desired, dt)
+            if status == "stopped":
                 break
+            moved_steps += 1
             future_peers = peers + peer_velocity*((k+1)*dt)
             if len(peers):
-                clearance = min(clearance, float(np.min(np.linalg.norm(future_peers-trial, axis=1))))
-                hidden = sum(not env.has_line_of_sight_3d(peer, trial) for peer in future_peers)
-            position, velocity = trial, next_velocity
-        else:
-            clearance = clearance if np.isfinite(clearance) else 0.
-            terminal_clearance = float(np.min(np.linalg.norm(future_peers-position, axis=1))) if len(peers) else 0.
-            score = (clearance + .35*terminal_clearance + float(getattr(c, "occlusion_blocked_weight", 1.2))*hidden
-                     - .01*np.linalg.norm(desired-current_velocity))
-            if score > best_score:
-                best, best_score = direction, score
+                clearance = min(clearance, float(np.min(np.linalg.norm(future_peers-nxt, axis=1))))
+                hidden = sum(not env.has_line_of_sight_3d(peer, nxt) for peer in future_peers)
+            position = nxt
+        hovering = float(np.linalg.norm(desired[:2])) < 0.25 * c.target_speed
+        if moved_steps == 0 and not hovering:
+            continue
+        clearance = clearance if np.isfinite(clearance) else nearest_now
+        terminal_clearance = float(np.min(np.linalg.norm(future_peers-position, axis=1))) if len(peers) else 0.
+        # Staying hidden adds nothing. A pursuer that is close or closing makes waiting costly.
+        hover_penalty = 0.0
+        if hovering:
+            hover_penalty = 0.35 * max(0.0, react_distance - nearest_now) + 1.2 * closing_speed
+        score = (clearance + .35*terminal_clearance
+                 + float(getattr(c, "occlusion_blocked_weight", 1.2))*(hidden - hidden_now)
+                 - .01*np.linalg.norm(desired-current_velocity)
+                 - hover_penalty)
+        if score > best_score:
+            best, best_score = direction, score
     return best
+
+
+def _pressure_escape_directions(env, start, target_index):
+    """Fallback headings when a cover waypoint wedges the evader under pressure."""
+    c = env.cfg
+    active = ~np.asarray(env.disabled_uavs, dtype=bool)
+    pursuers = np.column_stack([env.positions[active], env.altitudes[active]])
+    if len(pursuers) == 0:
+        return [np.array([1.0, 0.0, 0.0])]
+    delta = start[None, :] - pursuers
+    distances = np.linalg.norm(delta, axis=1)
+    weights = 1.0 / np.maximum(distances, 0.5) ** 2
+    repulsion = np.sum(delta / np.maximum(distances[:, None], 1e-8) * weights[:, None], axis=0)
+    repulsion = repulsion / max(float(np.linalg.norm(repulsion)), 1e-8)
+    nearest = float(np.min(distances))
+    options = [
+        np.array([repulsion[0], repulsion[1], 1.0]),
+        repulsion,
+        np.array([repulsion[0], repulsion[1], 0.85]),
+        np.array([repulsion[0], repulsion[1], -0.55]),
+        np.array([-repulsion[1], repulsion[0], 0.55]),
+        np.array([repulsion[1], -repulsion[0], 0.55]),
+        np.array([-repulsion[0], -repulsion[1], 0.75]),
+    ]
+    # Dense ring so a soft corner cannot kill every candidate.
+    for angle in np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False):
+        options.append(np.array([np.cos(angle), np.sin(angle), 0.35]))
+        options.append(np.array([np.cos(angle), np.sin(angle), 0.9]))
+    if nearest < float(getattr(c, "evader_repulsion_radius", 10.0)):
+        options.insert(0, np.array([repulsion[0], repulsion[1], 1.0]))
+    return options
 
 
 def advance_evader(env, target_index, direction, dt):
     c = env.cfg
     start = np.r_[env.dynamic_targets[target_index], env.target_altitudes[target_index]]
     velocity = np.r_[env.target_velocity[target_index], env.target_vertical_velocity[target_index]]
-    next_velocity = velocity_step(velocity, command_velocity(direction, c), dt, c)
-    proposed = start+.5*(velocity+next_velocity)*dt
-    if not safe_segment(env, start, proposed):
-        # Residual map-contact guard, not a planned instantaneous reversal/climb.
-        proposed, next_velocity = start, np.zeros(3)
-        env.evader_safety_interventions = getattr(env, 'evader_safety_interventions', 0)+1
+    proposed, next_velocity, status = resolve_evader_motion(
+        env, start, velocity, command_velocity(direction, c), dt)
+    active = ~np.asarray(env.disabled_uavs, dtype=bool)
+    pursuers = np.column_stack([env.positions[active], env.altitudes[active]])
+    nearest = (
+        float(np.min(np.linalg.norm(pursuers - start[None, :], axis=1)))
+        if len(pursuers)
+        else float("inf")
+    )
+    moved = float(np.linalg.norm(proposed - start))
+    # Hover/"clear" with ~0 displacement under pressure is the freeze-to-capture bug.
+    # Treat it like a hard stop and force leave-corner escape.
+    react = float(getattr(c, "evader_repulsion_radius", 10.0))
+    stalled = moved < max(0.02, 0.08 * c.target_speed * dt)
+    if status == "stopped" or (nearest < react and stalled):
+        if status == "stopped":
+            env.evader_safety_interventions = getattr(env, "evader_safety_interventions", 0) + 1
+        if nearest < react:
+            for escape in _pressure_escape_directions(env, start, target_index):
+                trial_pos, trial_vel, trial_status = resolve_evader_motion(
+                    env, start, velocity, command_velocity(escape, c), dt
+                )
+                trial_moved = float(np.linalg.norm(trial_pos - start))
+                if trial_status != "stopped" and trial_moved >= max(0.02, 0.08 * c.target_speed * dt):
+                    proposed, next_velocity, status = trial_pos, trial_vel, trial_status
+                    if hasattr(env, "occlusion_waypoints"):
+                        env.occlusion_waypoints[target_index] = proposed + escape * max(
+                            c.target_speed, 1.0
+                        )
+                        env.occlusion_waypoint_dwell[target_index] = 0
+                    break
     env.dynamic_targets[target_index], env.target_altitudes[target_index] = proposed[:2], proposed[2]
     env.target_velocity[target_index], env.target_vertical_velocity[target_index] = next_velocity[:2], next_velocity[2]

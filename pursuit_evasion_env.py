@@ -308,7 +308,10 @@ class PursuitEvasionEnv(WeakCommBeliefGraphEnv):
         c = self.cfg
         rectangles = []
         protected = np.vstack([self.positions.astype(float), self.dynamic_targets])
-        for _ in range(c.building_count * 12):
+        # Keep at least 2 m clear between building footprints so occlusion
+        # corridors stay readable in the Viewport (and in LOS geometry).
+        gap = 2.0
+        for _ in range(c.building_count * 80):
             if len(rectangles) >= c.building_count:
                 break
             width, height = self.rng.uniform(c.building_min_size, c.building_max_size, size=2)
@@ -316,6 +319,16 @@ class PursuitEvasionEnv(WeakCommBeliefGraphEnv):
             y0 = float(self.rng.uniform(1.0, max(1.01, c.grid_size - height - 1.0)))
             rect = (x0, y0, x0 + width, y0 + height)
             if any(_point_in_rect(point, _expand_rect(rect, 0.8)) for point in protected):
+                continue
+            if any(
+                not (
+                    rect[2] + gap <= other[0]
+                    or other[2] + gap <= rect[0]
+                    or rect[3] + gap <= other[1]
+                    or other[3] + gap <= rect[1]
+                )
+                for other in rectangles
+            ):
                 continue
             rectangles.append(rect)
         return rectangles

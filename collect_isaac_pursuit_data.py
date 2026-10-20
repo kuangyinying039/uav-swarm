@@ -1,4 +1,4 @@
-"""Collect MPC transition/demonstration data in the Isaac PhysX backend."""
+"""Collect teacher transition data in the Isaac PhysX backend."""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-config", type=Path,
                         default=Path("configs/pursuit_v2/radar5_dual_medium.json"))
-    parser.add_argument("--teacher", choices=("mpc",), default="mpc")
+    parser.add_argument("--teacher", choices=("mpc", "frpn"), default="mpc")
     parser.add_argument("--demo-seed", type=int, default=2_000_000)
     parser.add_argument("--rollouts", type=int, default=200)
     parser.add_argument("--dataset", type=artifact_path, required=True)

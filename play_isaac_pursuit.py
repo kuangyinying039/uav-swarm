@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -40,9 +41,38 @@ def build_parser():
     parser.add_argument("--speed", type=float, default=1.0, help="Playback slowdown (>1 slower)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--native-lidar", action="store_true")
-    parser.add_argument("--trail-len", type=int, default=40)
+    parser.add_argument("--trail-len", type=int, default=80)
+    parser.add_argument(
+        "--evader-policy",
+        choices=("occlusion", "repulsive"),
+        default=None,
+        help="Override env-config evader (repulsive flees instead of camping walls)",
+    )
+    parser.add_argument(
+        "--show-radar-rings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw lidar detection spheres on each UAV (same style as capture sphere)",
+    )
+    parser.add_argument(
+        "--follow-camera",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-frame pursuer/target each step (default on; use --no-follow-camera for free look)",
+    )
+    parser.add_argument(
+        "--visual-scale",
+        type=float,
+        default=4.0,
+        help="GUI-only Hummingbird mesh scale (physics unchanged)",
+    )
+    parser.add_argument(
+        "--body-markers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draw wireframe spheres on UAV/target (default off)",
+    )
     add_isaac_display_flags(parser, default_headless=True)
-    # Default this script toward visualization when flag set; without --visualize stays headless.
     return parser
 
 
@@ -60,10 +90,13 @@ def main():
     cfg = QuadrotorPursuitConfig(**json.loads(args.env_config.read_text(encoding="utf-8")))
     if cfg.capture_required_uavs != 2 or cfg.execution_reward_version != 5:
         raise ValueError(f"{args.env_config} is not dual-capture reward-v5")
+    if args.evader_policy is not None:
+        cfg = replace(cfg, evader_policy=str(args.evader_policy))
 
     print(
         f"[play] method={args.method} seed={args.seed} headless={headless} "
-        f"visualize={not headless}",
+        f"visualize={not headless} follow_camera={bool(args.follow_camera)} "
+        f"evader={cfg.evader_policy}",
         flush=True,
     )
     env = IsaacPursuitEnv(
@@ -71,23 +104,17 @@ def main():
         seed=args.seed,
         headless=headless,
         native_lidar=args.native_lidar,
+        visual_model_scale=float(args.visual_scale) if not headless else 1.0,
     )
     overlay = PursuitViewportOverlay(
         env,
         trail_len=args.trail_len,
         enabled=not headless,
+        show_radar_rings=bool(args.show_radar_rings) and not headless,
+        show_target_wireframe=True,
+        show_body_markers=bool(args.body_markers) and not headless,
+        follow_camera=bool(args.follow_camera) and not headless,
     )
-    if not headless:
-        try:
-            from omni.isaac.core.utils.viewports import set_camera_view
-
-            mid = float(cfg.grid_size) * 0.5
-            set_camera_view(
-                eye=[mid + 18.0, mid - 18.0, 16.0],
-                target=[mid, mid, float(cfg.initial_altitude)],
-            )
-        except Exception as exc:
-            print(f"[play] camera view skipped: {exc}", flush=True)
     try:
         action_fn, policy = load_policy(args.method, args.checkpoint, env, args.device)
         for episode in range(args.episodes):

@@ -5,10 +5,11 @@
 # MAPPO mappo_plus: stronger demo retention + return norm + held-out best_capture
 #
 # Usage:
-#   bash run_isaac_rl_improved.sh matd3-a6 [seed=11] [num_envs=4] [episodes=1000]
-#   bash run_isaac_rl_improved.sh mappo-plus [seed=11] [episodes=1000]
+#   bash run_isaac_rl_improved.sh matd3-a6 [seed=11] [num_envs=16] [episodes=1000]
+#   bash run_isaac_rl_improved.sh mappo-plus [seed=11] [num_envs=16] [episodes=1000]
 #   bash run_isaac_rl_improved.sh eval-matd3 RUN_DIR
 #   bash run_isaac_rl_improved.sh eval-mappo RUN_DIR
+# Override default parallel width with ISAAC_NUM_ENVS.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="${RUN_ROOT:-$HOME/runs}"
@@ -16,7 +17,7 @@ DATA="${DATA_ROOT:-$ROOT/isaac_dual_data}"
 MEDIUM="configs/pursuit_v2/radar5_dual_medium.json"
 CMD="${1:-}"
 SEED="${2:-11}"
-NUM_ENVS="${3:-4}"
+NUM_ENVS="${3:-${ISAAC_NUM_ENVS:-16}}"
 EPISODES="${4:-1000}"
 
 ACTOR="${DATA}/dagger_seed${SEED}/best_imitation.pt"
@@ -41,10 +42,11 @@ case "$CMD" in
       2>&1 | tee "$OUT/train.log"
     ;;
   mappo-plus)
-    OUT="$ROOT/isaac_dual_mappo_plus_seed${SEED}"
+    OUT="$ROOT/isaac_dual_mappo_plus_seed${SEED}_n${NUM_ENVS}"
     mkdir -p "$OUT"
     python train_isaac_pursuit.py mappo \
       --variant mappo_plus \
+      --num-envs "$NUM_ENVS" \
       --env-config "$MEDIUM" \
       --actor-init "$ACTOR" \
       --demos "$DEMOS" \

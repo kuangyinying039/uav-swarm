@@ -147,6 +147,43 @@ class ScenarioTests(unittest.TestCase):
         env.target_velocity[:] *= -1
         np.testing.assert_allclose(before, env.agent_observation_vectors())
 
+    def test_evader_slides_along_a_building_when_pursuers_are_close(self):
+        from pursuit_scenarios import advance_evader, predictive_escape
+
+        env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(seed=1))
+        rect = next(
+            rect for rect in env.buildings
+            if 2.0 < rect[0] and rect[2] < env.cfg.grid_size - 2.0 and rect[1] > 2.0
+        )
+        x0, y0, x1, _y1 = rect
+        target_xy = np.array([(x0 + x1) * 0.5, y0 - 0.35])
+        altitude = 4.0
+        env.dynamic_targets[0] = target_xy
+        env.target_altitudes[0] = altitude
+        env.target_velocity[0] = [0.0, 0.4]
+        env.target_vertical_velocity[0] = 0.0
+        start = np.r_[target_xy, altitude]
+        advance_evader(env, 0, np.array([0.0, 1.0, 0.0]), env.cfg.decision_dt)
+        end = np.r_[env.dynamic_targets[0], env.target_altitudes[0]]
+        self.assertGreater(np.linalg.norm(end[:2] - start[:2]), 0.05)
+        self.assertFalse(env._point_inside_building_prism(end, margin=0.2))
+        self.assertGreater(np.linalg.norm(env.target_velocity[0]), 0.2)
+
+        env.dynamic_targets[0] = target_xy
+        env.target_altitudes[0] = altitude
+        env.target_velocity[0] = 0.0
+        env.target_vertical_velocity[0] = 0.0
+        env._evader_previous_observation = None
+        env.positions[:] = [target_xy[0], target_xy[1] - 4.0]
+        env.altitudes[:] = altitude
+        env.disabled_uavs[:] = False
+        speeds = []
+        for _ in range(25):
+            direction = predictive_escape(env, 0)
+            advance_evader(env, 0, direction, env.cfg.decision_dt)
+            speeds.append(float(np.linalg.norm(env.target_velocity[0])))
+        self.assertGreater(float(np.median(speeds[-10:])), 0.8)
+
 
 if __name__ == '__main__':
     unittest.main()
