@@ -57,6 +57,7 @@ scripts/__pycache__/
 # Ad-hoc analysis dumps (regenerate from eval JSON)
 postlc_hybrid_*.png
 postlc-hybrid-eval-analysis.canvas.tsx
+suite_manifest_*.json
 
 # OS / temp
 *.tmp
