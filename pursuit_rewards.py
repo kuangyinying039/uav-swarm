@@ -64,9 +64,10 @@ def clearance_costs(positions, active, cfg, obstacles):
 def shaped_rewards(previous, current, active_before, active_after, cfg, terminal=False):
     """Discount-consistent potentials, zero at *all* episode terminal states.
 
-    Nearest-agent progress matches any-one-UAV capture; mean progress and
-    altitude-aware enclosure encourage the other UAVs to assist. No teacher
-    actions or target-truth observations are injected into the actor.
+    Single-UAV capture retains its nearest-agent potential. Multi-UAV capture
+    uses the mean potential of the required number of closest active pursuers,
+    so shaping tracks the actual team capture condition. Mean progress still
+    gives the third UAV a coordination signal.
     """
     old_log, _, old_enclosure = previous
     new_log, _, enclosure = current
@@ -76,12 +77,23 @@ def shaped_rewards(previous, current, active_before, active_after, cfg, terminal
         new_potential = np.zeros_like(new_potential)
         enclosure = 0.
     progress = cfg.reward_gamma*new_potential-old_potential
-    return {
+    rewards = {
         "individual_approach": cfg.individual_approach_weight * float(progress.mean()),
-        "nearest_approach": cfg.nearest_approach_weight * float(cfg.reward_gamma*new_potential.max()-old_potential.max()),
         "target_proximity": 0.0,
         "encirclement_progress": cfg.encirclement_progress_weight * (cfg.reward_gamma*enclosure-old_enclosure),
-    }, progress
+    }
+    required = int(cfg.capture_required_uavs)
+    if required == 1:
+        rewards["nearest_approach"] = cfg.nearest_approach_weight * float(
+            cfg.reward_gamma * new_potential.max() - old_potential.max()
+        )
+    else:
+        old_team = float(np.sort(old_potential)[-required:].mean())
+        new_team = float(np.sort(new_potential)[-required:].mean())
+        rewards["capture_team_progress"] = cfg.capture_team_progress_weight * (
+            cfg.reward_gamma * new_team - old_team
+        )
+    return rewards, progress
 
 
 def visibility_potential(team_visible, uav_visibility_ratio):

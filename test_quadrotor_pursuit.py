@@ -133,7 +133,14 @@ class QuadrotorPursuitTests(unittest.TestCase):
         self.assertEqual(crashed, {0, 1})
 
     def test_distance_capture_boundary_height_and_disabled(self):
-        env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(seed=15, building_count=0))
+        env = QuadrotorPursuitEnv(
+            QuadrotorPursuitConfig(
+                seed=15,
+                building_count=0,
+                capture_required_uavs=1,
+                execution_reward_version=4,
+            )
+        )
         env.quadrotor_states[:, :3] = [[5, 5, 5], [15, 15, 5], [20, 20, 5]]
         env.dynamic_targets[0] = [5, 5]
         for height, expected in [(5.999, True), (6.0, True), (6.001, False)]:
@@ -179,7 +186,7 @@ class QuadrotorPursuitTests(unittest.TestCase):
         self.assertIn("visibility_progress", result["reward_components"])
         captured, count, _ = env._capture_geometry()
         self.assertEqual(env.cfg.capture_mode, "single_distance")
-        self.assertEqual(env.cfg.capture_required_uavs, 1)
+        self.assertEqual(env.cfg.capture_required_uavs, 2)
 
 
 if __name__ == "__main__":

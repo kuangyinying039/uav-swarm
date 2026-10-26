@@ -10,10 +10,11 @@ from pursuit_baselines_3d import CooperativeGuidanceMPC3D
 class ScenarioTests(unittest.TestCase):
     def test_limits_and_capture_contract(self):
         cfg = QuadrotorPursuitConfig()
+        self.assertAlmostEqual(cfg.building_min_gap, 0.25)
         self.assertAlmostEqual(cfg.target_speed/cfg.max_horizontal_velocity, 1.3)
         self.assertGreater(cfg.target_vertical_speed, cfg.max_vertical_velocity)
         self.assertEqual((cfg.capture_radius, cfg.target_diameter, cfg.capture_required_uavs,
-                          cfg.capture_hold_steps), (1., .5, 1, 1))
+                          cfg.capture_hold_steps), (1., .5, 2, 1))
         self.assertEqual(QuadrotorPursuitConfig(target_diameter=.7).capture_radius, 1.4)
         velocity = np.zeros(3)
         for _ in range(100):
@@ -40,7 +41,7 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(layouts, {'one_side_triangle'})
 
     def test_five_building_evaluation_seeds_have_visible_starts(self):
-        path = Path(__file__).parent / "configs/pursuit_v2/previous_models_current_radar.json"
+        path = Path(__file__).parent / "configs/pursuit_v2/radar5_dual_nominal.json"
         overrides = json.loads(path.read_text(encoding="utf-8"))
         for seed in range(7000000, 7000020):
             with self.subTest(seed=seed):
@@ -81,6 +82,46 @@ class ScenarioTests(unittest.TestCase):
         self.assertLess(configs[1].handoff_formation_min_distance,
                         configs[2].handoff_formation_min_distance)
 
+    def test_radar5_dual_profiles_require_two_uavs_and_include_extreme(self):
+        root = Path(__file__).parent / "configs/pursuit_v2"
+        names = (
+            "radar5_dual_nominal.json",
+            "radar5_dual_medium.json",
+            "radar5_dual_hard.json",
+            "radar5_dual_severe.json",
+            "radar5_dual_extreme.json",
+        )
+        configs = [QuadrotorPursuitConfig(**json.loads((root / name).read_text(encoding="utf-8")))
+                   for name in names]
+        reference = configs[0]
+        for cfg in configs:
+            self.assertEqual(cfg.capture_required_uavs, 2)
+            self.assertEqual(cfg.n_uavs, reference.n_uavs)
+            self.assertEqual(cfg.building_state_capacity, reference.building_state_capacity)
+            self.assertEqual(cfg.policy_observation_version, reference.policy_observation_version)
+        self.assertLess(configs[2].target_speed, configs[3].target_speed)
+        self.assertLess(configs[3].target_speed, configs[4].target_speed)
+        self.assertEqual(configs[4].lidar_detection_probability, 0.8)
+        self.assertLess(configs[3].lidar_target_detection_range, configs[2].lidar_target_detection_range)
+        self.assertLess(configs[4].lidar_target_detection_range, configs[3].lidar_target_detection_range)
+        self.assertGreater(configs[3].handoff_formation_min_distance, configs[2].handoff_formation_min_distance)
+        self.assertGreater(configs[4].handoff_formation_min_distance, configs[3].handoff_formation_min_distance)
+        env = QuadrotorPursuitEnv.__new__(QuadrotorPursuitEnv)
+        env.cfg = QuadrotorPursuitConfig(building_count=0, capture_required_uavs=2, seed=3)
+        env.disabled_uavs = np.zeros(env.cfg.n_uavs, dtype=bool)
+        env.quadrotor_states = np.zeros((env.cfg.n_uavs, 13), dtype=float)
+        env.dynamic_targets = np.array([[5.0, 5.0]])
+        env.target_altitudes = np.array([5.0])
+        env.quadrotor_states[:, :3] = [[5, 5, 5], [15, 15, 5], [20, 20, 5]]
+        captured, count, _ = QuadrotorPursuitEnv._capture_geometry(env)
+        self.assertEqual(count, 1)
+        self.assertFalse(captured)
+        env.quadrotor_states[1, :3] = [5.2, 5.0, 5.0]
+        captured, count, _ = QuadrotorPursuitEnv._capture_geometry(env)
+        self.assertEqual(count, 2)
+        self.assertTrue(captured)
+        self.assertAlmostEqual(QuadrotorPursuitEnv.minimum_capture_gap(env), 0.0)
+
     def test_mpc_agent_does_not_read_other_local_target_estimates(self):
         env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(building_count=0))
         before = CooperativeGuidanceMPC3D().actions(env)[0]
@@ -105,6 +146,43 @@ class ScenarioTests(unittest.TestCase):
         env.target_altitudes[:] += 2
         env.target_velocity[:] *= -1
         np.testing.assert_allclose(before, env.agent_observation_vectors())
+
+    def test_evader_slides_along_a_building_when_pursuers_are_close(self):
+        from pursuit_scenarios import advance_evader, predictive_escape
+
+        env = QuadrotorPursuitEnv(QuadrotorPursuitConfig(seed=1))
+        rect = next(
+            rect for rect in env.buildings
+            if 2.0 < rect[0] and rect[2] < env.cfg.grid_size - 2.0 and rect[1] > 2.0
+        )
+        x0, y0, x1, _y1 = rect
+        target_xy = np.array([(x0 + x1) * 0.5, y0 - 0.35])
+        altitude = 4.0
+        env.dynamic_targets[0] = target_xy
+        env.target_altitudes[0] = altitude
+        env.target_velocity[0] = [0.0, 0.4]
+        env.target_vertical_velocity[0] = 0.0
+        start = np.r_[target_xy, altitude]
+        advance_evader(env, 0, np.array([0.0, 1.0, 0.0]), env.cfg.decision_dt)
+        end = np.r_[env.dynamic_targets[0], env.target_altitudes[0]]
+        self.assertGreater(np.linalg.norm(end[:2] - start[:2]), 0.05)
+        self.assertFalse(env._point_inside_building_prism(end, margin=0.2))
+        self.assertGreater(np.linalg.norm(env.target_velocity[0]), 0.2)
+
+        env.dynamic_targets[0] = target_xy
+        env.target_altitudes[0] = altitude
+        env.target_velocity[0] = 0.0
+        env.target_vertical_velocity[0] = 0.0
+        env._evader_previous_observation = None
+        env.positions[:] = [target_xy[0], target_xy[1] - 4.0]
+        env.altitudes[:] = altitude
+        env.disabled_uavs[:] = False
+        speeds = []
+        for _ in range(25):
+            direction = predictive_escape(env, 0)
+            advance_evader(env, 0, direction, env.cfg.decision_dt)
+            speeds.append(float(np.linalg.norm(env.target_velocity[0])))
+        self.assertGreater(float(np.median(speeds[-10:])), 0.8)
 
 
 if __name__ == '__main__':

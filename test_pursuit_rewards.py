@@ -21,6 +21,19 @@ class RewardTests(unittest.TestCase):
         reverse,_ = shaped_rewards(b,a,self.active,self.active,self.c)
         self.assertLess(reverse['individual_approach'], 0)
 
+    def test_dual_capture_team_progress_uses_two_closest_uavs(self):
+        before = self.features([[2,0,0],[8,0,0],[10,0,0]])
+        third_only_closer = self.features([[2,0,0],[8,0,0],[9,0,0]])
+        second_closer = self.features([[2,0,0],[7,0,0],[10,0,0]])
+        before_reward, _ = shaped_rewards(before,before,self.active,self.active,self.c)
+        third_reward, _ = shaped_rewards(before,third_only_closer,self.active,self.active,self.c)
+        second_reward, _ = shaped_rewards(before,second_closer,self.active,self.active,self.c)
+        self.assertAlmostEqual(third_reward["capture_team_progress"],
+                               before_reward["capture_team_progress"])
+        self.assertGreater(second_reward["capture_team_progress"],
+                           third_reward["capture_team_progress"])
+        self.assertNotIn("nearest_approach", second_reward)
+
     def test_close_progress_stronger_and_no_singularity(self):
         close = np.log(2/1.5)
         far = np.log(8/7.5)
@@ -62,7 +75,13 @@ class RewardTests(unittest.TestCase):
                 reward,_ = shaped_rewards(a,b,self.active,self.active,self.c,terminal=step == len(path)-2)
                 total += self.c.reward_gamma**step*sum(reward.values())
             initial = np.exp(-self.c.capture_radius*np.expm1(path[0][0])/self.c.approach_distance_scale)
-            expected = -(self.c.individual_approach_weight*initial.mean()+self.c.nearest_approach_weight*initial.max()+self.c.encirclement_progress_weight*path[0][2])
+            required = self.c.capture_required_uavs
+            team_initial = np.sort(initial)[-required:].mean()
+            expected = -(
+                self.c.individual_approach_weight * initial.mean()
+                + self.c.capture_team_progress_weight * team_initial
+                + self.c.encirclement_progress_weight * path[0][2]
+            )
             self.assertAlmostEqual(total,expected)
 
     def test_boundary_cost_is_continuous_bounded_and_zero_away(self):

@@ -53,8 +53,16 @@ def mean_actor_state_from_checkpoint(payload):
 class Matd3Trainer:
     def __init__(self, env_factory, cfg: Matd3Config, seed=0):
         probe = env_factory()
-        if not isinstance(probe, QuadrotorPursuitEnv):
-            raise ValueError("MATD3 trainer is restricted to quadrotor pursuit")
+        required_env_members = (
+            "cfg", "observe_search", "step_joint", "minimum_capture_gap",
+            "obs_dim", "state_dim", "continuous_action_dim",
+        )
+        missing_env_members = [name for name in required_env_members if not hasattr(probe, name)]
+        if missing_env_members:
+            raise TypeError(
+                "MATD3 trainer environment is missing required members: "
+                f"{missing_env_members}"
+            )
         if not np.isclose(cfg.gamma, probe.cfg.reward_gamma, atol=1e-10):
             raise ValueError("MATD3 gamma must equal environment reward_gamma")
         if cfg.utd < 1 or cfg.policy_delay < 1:
@@ -69,6 +77,7 @@ class Matd3Trainer:
             raise ValueError("exploration decay steps must be positive and critic pretraining non-negative")
         self.env_factory = env_factory
         self.cfg = cfg
+        self.seed = int(seed)
         self.device = resolve_device(cfg.device)
         self.n_agents = probe.cfg.n_uavs
         self.obs_dim = probe.obs_dim()
@@ -89,6 +98,7 @@ class Matd3Trainer:
         self.actor_target = deepcopy(self.actor).to(self.device).eval()
         for parameter in self.actor_target.parameters():
             parameter.requires_grad_(False)
+        self.actor_anchor = None
         joint_dim = self.n_agents * self.action_dim
         self.critic = TwinCentralizedQ(self.state_dim, joint_dim, cfg.critic_hidden, cfg.critic_layers).to(self.device)
         self.critic_target = deepcopy(self.critic).to(self.device).eval()
@@ -98,6 +108,9 @@ class Matd3Trainer:
         self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
         self.online_replay = JointReplayBuffer(cfg.replay_size, seed=seed)
         self.prior_replay = JointReplayBuffer(cfg.replay_size, seed=seed + 1)
+        self._pending_episodes = {}
+        self.retained_success_episodes = 0
+        self.discarded_failure_steps = 0
         self.env_steps = 0
         self.total_updates = 0
         self.start_episode = 0
@@ -105,19 +118,108 @@ class Matd3Trainer:
         self.validation_records = []
         self.best_capture_score = (-1.0, -float("inf"), -float("inf"))
         self.best_actor_state = None
+        self.best_actor_target_state = None
+        self.best_critic_state = None
+        self.best_critic_target_state = None
+        self.safeguard_drop = 0.05
+        self.safeguard_patience = 2
+        self.safeguard_bad_validations = 0
+        self.safeguard_rollbacks = 0
+        self.min_actor_lr = 1e-5
         self.output_directory = None
         self.validation_seeds = []
         self.train_seed_bank = []
         self.validation_seed_bank = []
         self.demo_metadata = {}
+        self.critic_return_clip = cfg.critic_return_clip
         self.algorithm_name = "hgat_matd3" if cfg.use_gat else "matd3"
+        # Optional classical+RL hybrid (blend/residual). None = pure RL actions.
+        self.residual_cfg = None
+        self._residual_teacher = None
 
     def load_actor_weights(self, state_dict):
         self.actor.load_state_dict(state_dict)
         self.actor_target.load_state_dict(state_dict)
+        self.set_actor_anchor(state_dict)
+
+    def set_actor_anchor(self, state_dict):
+        """Freeze a behavior/expert policy used as an offline-to-online anchor."""
+        if float(self.cfg.actor_anchor_weight) <= 0.0 and float(self.cfg.actor_anchor_final_weight) <= 0.0:
+            return
+        self.actor_anchor = deepcopy(self.actor).to(self.device).eval()
+        self.actor_anchor.load_state_dict(state_dict)
+        for parameter in self.actor_anchor.parameters():
+            parameter.requires_grad_(False)
+        self.demo_metadata["actor_anchor"] = True
+
+    def set_residual(self, cfg):
+        """Compose RL actions with a classical base (MPC/APF/FRPN) each step."""
+        from pursuit_residual import ResidualComposeConfig, make_base_policy
+
+        if cfg is None:
+            self.residual_cfg = None
+            self._residual_teacher = None
+            self.demo_metadata.pop("residual", None)
+            return
+        if not isinstance(cfg, ResidualComposeConfig):
+            cfg = ResidualComposeConfig(**cfg)
+        self.residual_cfg = cfg
+        self._residual_teacher = make_base_policy(cfg.base)
+        self.demo_metadata["residual"] = {
+            "base": cfg.base,
+            "mode": cfg.mode,
+            "weight": float(cfg.weight),
+            "weight_final": None if cfg.weight_final is None else float(cfg.weight_final),
+            "weight_decay_steps": int(cfg.weight_decay_steps),
+        }
+
+    def current_residual_weight(self) -> float | None:
+        if self.residual_cfg is None:
+            return None
+        return float(self.residual_cfg.weight_at(self.env_steps))
+
+    def _compose_with_base(self, rl_actions, env):
+        if self.residual_cfg is None or env is None or self._residual_teacher is None:
+            return rl_actions
+        from pursuit_residual import compose_actions
+
+        # Isaac vector clones expose the Radar5 logic env on ``.env`` / bridges.
+        logic = getattr(env, "env", env)
+        if hasattr(env, "bridges") and len(getattr(env, "bridges", [])) == 1:
+            logic = env.bridges[0].env
+        base = np.asarray(self._residual_teacher.actions(logic), dtype=np.float32)
+        return compose_actions(
+            base,
+            rl_actions,
+            self.residual_cfg,
+            weight=self.current_residual_weight(),
+        )
+
+    def _stage_transition(self, row, slot=0):
+        """Queue a transition. Success-only mode commits it after the episode outcome is known."""
+        if not self.cfg.success_replay_only:
+            self.online_replay.add(row)
+            return
+        self._pending_episodes.setdefault(int(slot), []).append(row)
+
+    def _commit_staged(self, captured, slot=0):
+        if not self.cfg.success_replay_only:
+            return
+        rows = self._pending_episodes.pop(int(slot), [])
+        if not captured:
+            self.discarded_failure_steps += len(rows)
+            return
+        for row in rows:
+            self.online_replay.add(row)
+        self.retained_success_episodes += 1
 
     def load_prior(self, dataset):
-        rows = flatten_transitions(dataset)
+        if self.cfg.success_replay_only:
+            from pursuit.data.transition_dataset import flatten_successful_transitions
+
+            rows = flatten_successful_transitions(dataset)
+        else:
+            rows = flatten_transitions(dataset)
         if len(rows) > self.prior_replay.capacity:
             self.prior_replay = JointReplayBuffer(len(rows), seed=1)
         self.prior_replay.add_dataset(rows)
@@ -125,17 +227,33 @@ class Matd3Trainer:
         self.demo_metadata["prior_episodes"] = len(dataset["episodes"])
         self.demo_metadata["prior_successes"] = sum(1 for row in dataset["report"] if row["success"])
         self.demo_metadata["prior_teacher"] = dataset.get("teacher")
+        # B3C: clip critic targets using the best episodic return in the offline set.
+        if self.cfg.critic_return_clip is None:
+            returns = []
+            for row in dataset.get("report") or []:
+                for key in ("return", "episode_return", "total_reward", "reward"):
+                    if key in row and row[key] is not None:
+                        returns.append(float(row[key]))
+                        break
+            if returns:
+                self.critic_return_clip = float(max(returns))
+                self.demo_metadata["critic_return_clip"] = self.critic_return_clip
 
     @torch.no_grad()
-    def deterministic_action(self, obs):
+    def deterministic_action(self, obs, env=None):
         vectors, adjacency, graph = observation_tensors(obs, self.device)
-        return self.actor(vectors, adjacency, graph).tanh().cpu().numpy()
+        action = self.actor(vectors, adjacency, graph).tanh().cpu().numpy()
+        return self._compose_with_base(action, env)
 
     @torch.no_grad()
-    def explore_action(self, obs, rng):
-        action = self.deterministic_action(obs)
+    def explore_action(self, obs, rng, env=None):
+        # Noise is applied to the RL proposal before classical blending so the
+        # MPC floor is not washed out by exploration.
+        vectors, adjacency, graph = observation_tensors(obs, self.device)
+        action = self.actor(vectors, adjacency, graph).tanh().cpu().numpy()
         noise = rng.normal(0.0, self.current_exploration_std(), size=action.shape)
-        return np.clip(action + noise, -1.0, 1.0).astype(np.float32)
+        action = np.clip(action + noise, -1.0, 1.0).astype(np.float32)
+        return self._compose_with_base(action, env)
 
     def current_exploration_std(self):
         """Linearly anneal behavior noise after replay warmup."""
@@ -202,6 +320,11 @@ class Matd3Trainer:
             "validation_records": self.validation_records,
             "best_capture_score": self.best_capture_score,
             "best_actor_state": self.best_actor_state,
+            "best_actor_target_state": self.best_actor_target_state,
+            "best_critic_state": self.best_critic_state,
+            "best_critic_target_state": self.best_critic_target_state,
+            "safeguard_bad_validations": self.safeguard_bad_validations,
+            "safeguard_rollbacks": self.safeguard_rollbacks,
             "pursuit_graph_version": PURSUIT_GRAPH_VERSION if self.cfg.use_gat else None,
             "train_seed_bank": list(self.train_seed_bank),
             "validation_seed_bank": list(self.validation_seed_bank),
@@ -236,8 +359,47 @@ class Matd3Trainer:
         self.validation_records = list(payload.get("validation_records", []))
         self.best_capture_score = tuple(payload.get("best_capture_score", self.best_capture_score))
         self.best_actor_state = payload.get("best_actor_state")
+        self.best_actor_target_state = payload.get("best_actor_target_state")
+        self.best_critic_state = payload.get("best_critic_state")
+        self.best_critic_target_state = payload.get("best_critic_target_state")
+        self.safeguard_bad_validations = int(payload.get("safeguard_bad_validations", 0))
+        self.safeguard_rollbacks = int(payload.get("safeguard_rollbacks", 0))
+        if self.best_actor_state is not None and self.best_critic_state is None:
+            self._remember_best_modules()
         self.demo_metadata = dict(payload.get("demo_metadata", {}))
         return payload
+
+    def _remember_best_modules(self):
+        self.best_actor_state = {
+            key: value.detach().cpu().clone() for key, value in self.actor.state_dict().items()
+        }
+        self.best_actor_target_state = {
+            key: value.detach().cpu().clone() for key, value in self.actor_target.state_dict().items()
+        }
+        self.best_critic_state = {
+            key: value.detach().cpu().clone() for key, value in self.critic.state_dict().items()
+        }
+        self.best_critic_target_state = {
+            key: value.detach().cpu().clone() for key, value in self.critic_target.state_dict().items()
+        }
+        self.safeguard_bad_validations = 0
+
+    def _rollback_to_best(self):
+        """Restore the best capture snapshot and halve the actor learning rate."""
+        self.actor.load_state_dict(self.best_actor_state)
+        if self.best_actor_target_state is not None:
+            self.actor_target.load_state_dict(self.best_actor_target_state)
+        if self.best_critic_state is not None:
+            self.critic.load_state_dict(self.best_critic_state)
+        if self.best_critic_target_state is not None:
+            self.critic_target.load_state_dict(self.best_critic_target_state)
+        old_lr = float(self.actor_optim.param_groups[0]["lr"])
+        new_lr = max(old_lr * 0.5, self.min_actor_lr)
+        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=new_lr)
+        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=self.cfg.critic_lr)
+        self.safeguard_rollbacks += 1
+        self.safeguard_bad_validations = 0
+        return old_lr, new_lr
 
     def _sample_batch(self):
         if self.cfg.prior_fraction > 0 and len(self.prior_replay) < 1:
@@ -265,7 +427,8 @@ class Matd3Trainer:
 
         print(
             f"[HGAT-MATD3] device={self.device} episodes={self.start_episode + 1}..{self.cfg.episodes} "
-            f"prior_fraction={self.cfg.prior_fraction} utd={self.cfg.utd}",
+            f"prior_fraction={self.cfg.prior_fraction} utd={self.cfg.utd} "
+            f"residual_rl_weight={self.current_residual_weight()}",
             flush=True,
         )
         for episode in range(self.start_episode, self.cfg.episodes):
@@ -279,15 +442,19 @@ class Matd3Trainer:
             closest = float(env.minimum_capture_gap())
             last_stats = {}
             visibility_totals = {}
-            for step in range(env.cfg.search_steps):
+            step_limit = int(env.cfg.search_steps)
+            if int(getattr(self.cfg, "max_steps", 0) or 0) > 0:
+                step_limit = min(step_limit, int(self.cfg.max_steps))
+            for step in range(step_limit):
                 active = ~env.disabled_uavs
                 if self.env_steps < self.cfg.warmup_steps and self.cfg.warmup_policy == "random":
                     action = rng.uniform(-1.0, 1.0, size=(self.n_agents, self.action_dim)).astype(np.float32)
+                    action = self._compose_with_base(action, env)
                 else:
-                    action = self.explore_action(obs, rng)
+                    action = self.explore_action(obs, rng, env=env)
                 result = env.step_joint(action)
                 row = make_transition(obs, action, result, {}, active, ~env.disabled_uavs)
-                self.online_replay.add(row)
+                self._stage_transition(row)
                 self.env_steps += 1
                 last_stats = self._maybe_update() or last_stats
                 if (
@@ -313,6 +480,7 @@ class Matd3Trainer:
                 if result["terminated"] or result["truncated"]:
                     break
             captured = bool(result.get("capture_success", False))
+            self._commit_staged(captured)
             history_row = {
                 "episode": episode + 1,
                 "reward": total_reward,
@@ -332,6 +500,9 @@ class Matd3Trainer:
                 "actor_rl_loss": last_stats.get("actor_rl_loss"),
                 "demo_bc_loss": last_stats.get("demo_bc_loss"),
                 "demo_bc_weight": last_stats.get("demo_bc_weight"),
+                "actor_anchor_loss": last_stats.get("actor_anchor_loss"),
+                "actor_anchor_weight": last_stats.get("actor_anchor_weight"),
+                "td3_bc_lambda": last_stats.get("td3_bc_lambda"),
                 "q1_mean": last_stats.get("q1_mean"),
                 "q2_mean": last_stats.get("q2_mean"),
                 "target_q_mean": last_stats.get("target_q_mean"),
@@ -339,6 +510,8 @@ class Matd3Trainer:
                 "q_disagreement": last_stats.get("q_disagreement"),
                 "prior_batch_fraction": last_stats.get("prior_batch_fraction"),
                 "replay_size": len(self.online_replay),
+                "success_episodes_retained": self.retained_success_episodes,
+                "discarded_failure_steps": self.discarded_failure_steps,
                 "prior_size": len(self.prior_replay),
                 "env_steps": self.env_steps,
                 "matd3_updates": self.total_updates,
@@ -352,39 +525,216 @@ class Matd3Trainer:
                 print(
                     f"[matd3] episode={episode + 1} capture={captured} steps={step + 1} "
                     f"return={total_reward:.2f} replay={len(self.online_replay)} "
+                    f"success_episodes={self.retained_success_episodes} "
                     f"updates={self.total_updates} critic={last_stats.get('critic_loss')}",
                     flush=True,
                 )
                 write_reward_capture_chart(self.output_directory / "reward_capture.svg", self.history)
             if self.output_directory and (episode + 1) % self.cfg.checkpoint_interval == 0:
                 self.save_checkpoint(self.output_directory / "latest.pt", episode=episode + 1)
+            budgets = tuple(int(x) for x in getattr(self.cfg, "episode_budget_checkpoints", ()) or ())
+            if self.output_directory and budgets and (episode + 1) in budgets:
+                budget_path = self.output_directory / "budgets" / f"ep{episode + 1:04d}.pt"
+                self.save_checkpoint(budget_path, episode=episode + 1)
+                print(f"[matd3] budget checkpoint → {budget_path}", flush=True)
             if self.output_directory and self.validation_seeds and (episode + 1) % self.cfg.validation_interval == 0:
                 self.validate(episode + 1, evaluate_policy)
         if self.output_directory:
             self.save_checkpoint(self.output_directory / "final.pt", episode=self.cfg.episodes)
         return self.history
 
-    def validate(self, episode, evaluate_policy):
-        self.actor.eval()
-        result = evaluate_policy(
-            lambda obs, env: self.deterministic_action(obs),
-            QuadrotorPursuitConfig(**self.environment_config),
-            self.validation_seeds,
-            method_name="matd3",
+    def train_vectorized(self, rng, vec_env, *, target_episodes=None):
+        """Collect from a vectorized pursuit env until ``target_episodes`` complete.
+
+        Each vector step advances ``vec_env.num_envs`` scenes and can enqueue that
+        many transitions before the next policy update. Episode accounting uses
+        completed (terminated/truncated) counts, not outer loop iterations.
+        """
+        from pursuit.eval import evaluate_policy
+
+        target = int(self.cfg.episodes if target_episodes is None else target_episodes)
+        completed = int(self.start_episode)
+        observations = vec_env.reset(
+            seeds=[self.seed * 100_000 + completed + i for i in range(vec_env.num_envs)]
         )
+        print(
+            f"[HGAT-MATD3-VEC] device={self.device} num_envs={vec_env.num_envs} "
+            f"target_episodes={target} prior_fraction={self.cfg.prior_fraction}",
+            flush=True,
+        )
+        last_stats = {}
+        step_limit = int(getattr(self.cfg, "max_steps", 0) or 0)
+        local_steps = np.zeros(vec_env.num_envs, dtype=np.int32)
+        episode_returns = np.zeros(vec_env.num_envs, dtype=np.float64)
+        while completed < target:
+            actions = []
+            for i in range(vec_env.num_envs):
+                logic_env = None
+                if hasattr(vec_env, "envs"):
+                    logic_env = vec_env.envs[i]
+                elif hasattr(vec_env, "bridges"):
+                    logic_env = vec_env.bridges[i].env
+                if self.env_steps < self.cfg.warmup_steps and self.cfg.warmup_policy == "random":
+                    action = rng.uniform(-1.0, 1.0, size=(self.n_agents, self.action_dim)).astype(np.float32)
+                    action = self._compose_with_base(action, logic_env)
+                else:
+                    action = self.explore_action(observations[i], rng, env=logic_env)
+                actions.append(action)
+            actions = np.stack(actions, axis=0)
+            results = vec_env.step_joint(actions)
+            for index, result in enumerate(results):
+                active = np.ones(self.n_agents, dtype=bool)
+                if hasattr(vec_env, "envs"):
+                    active = ~vec_env.envs[index].disabled_uavs
+                # Auto-reset replaces result["obs"] with the next episode; store
+                # the terminal transition against info["final_obs"] instead.
+                transition_result = dict(result)
+                info = result.get("info") or {}
+                if result.get("_episode_done") and info.get("final_obs") is not None:
+                    transition_result["obs"] = info["final_obs"]
+                    if "final_terminated" in info:
+                        transition_result["terminated"] = bool(info["final_terminated"])
+                        transition_result["truncated"] = bool(info.get("final_truncated", False))
+                    else:
+                        captured = bool(
+                            info.get("capture_success", result.get("capture_success", False))
+                        )
+                        transition_result["terminated"] = captured
+                        transition_result["truncated"] = not captured
+                row = make_transition(
+                    observations[index],
+                    actions[index],
+                    transition_result,
+                    {},
+                    active,
+                    active,
+                )
+                self._stage_transition(row, slot=index)
+                self.env_steps += 1
+                last_stats = self._maybe_update() or last_stats
+                local_steps[index] += 1
+                episode_returns[index] += float(result.get("reward", 0.0))
+                force_done = step_limit > 0 and local_steps[index] >= step_limit
+                if result.get("_episode_done") or force_done:
+                    captured = bool(result.get("info", {}).get("capture_success", result.get("capture_success", False)))
+                    self._commit_staged(captured, slot=index)
+                    completed += 1
+                    ep_return = float(
+                        result.get("info", {}).get("episode_return", episode_returns[index])
+                    )
+                    history_row = {
+                        "episode": completed,
+                        "reward": ep_return,
+                        "capture_success": float(captured),
+                        "steps": int(local_steps[index]),
+                        "env_steps": self.env_steps,
+                        "matd3_updates": self.total_updates,
+                        "num_envs": int(vec_env.num_envs),
+                        "critic_loss": last_stats.get("critic_loss"),
+                        "actor_loss": last_stats.get("actor_loss"),
+                    }
+                    self.history.append(clean_history_row(history_row))
+                    local_steps[index] = 0
+                    episode_returns[index] = 0.0
+                    # If trainer-side step_limit fired without env auto-reset, soft-reset
+                    # that clone so vector collection stays aligned.
+                    if force_done and not result.get("_episode_done") and hasattr(vec_env, "reset"):
+                        try:
+                            if hasattr(vec_env, "_reset_env_indices"):
+                                seed = self.seed * 100_000 + completed + index
+                                vec_env._reset_env_indices([index], seeds=[seed])
+                                observations[index] = vec_env.bridges[index].observe()
+                                continue
+                        except Exception:
+                            pass
+                    if self.output_directory and (
+                        completed % max(int(vec_env.num_envs), 1) == 0 or completed >= target
+                    ):
+                        print(
+                            f"[matd3-vec] episode={completed}/{target} capture={captured} "
+                            f"replay={len(self.online_replay)} updates={self.total_updates}",
+                            flush=True,
+                        )
+                        write_reward_capture_chart(self.output_directory / "reward_capture.svg", self.history)
+                    if self.output_directory and completed % self.cfg.checkpoint_interval == 0:
+                        self.save_checkpoint(self.output_directory / "latest.pt", episode=completed)
+                    if (
+                        self.output_directory
+                        and self.validation_seeds
+                        and completed % self.cfg.validation_interval == 0
+                    ):
+                        self.validate(completed, evaluate_policy)
+                    if completed >= target:
+                        break
+                observations[index] = result["obs"]
+            if (
+                self.output_directory
+                and self.cfg.step_checkpoint_interval > 0
+                and self.env_steps % self.cfg.step_checkpoint_interval == 0
+            ):
+                self.save_checkpoint(
+                    self.output_directory / "checkpoints" / f"step_{self.env_steps:09d}.pt",
+                    episode=completed,
+                )
+        if self.output_directory:
+            self.save_checkpoint(self.output_directory / "final.pt", episode=target)
+        return self.history
+
+    def validate(self, episode, evaluate_policy, *, consider_for_best=None):
+        """Run held-out validation.
+
+        ``episode=0`` is the pre-RL snapshot (DAgger/BC init after critic
+        pretrain). It is logged and compared as a reference, but does **not**
+        compete for ``best_capture.pt`` — otherwise a warm-started actor that
+        later collapses under TD updates permanently owns the best checkpoint.
+        """
+        if consider_for_best is None:
+            consider_for_best = int(episode) > 0
+        self.actor.eval()
+        if getattr(self, "physical_metrics_fn", None) is not None and self.validation_seeds:
+            metrics = self.physical_metrics_fn()
+        else:
+            result = evaluate_policy(
+                lambda obs, env: self.deterministic_action(obs, env=env),
+                QuadrotorPursuitConfig(**self.environment_config),
+                self.validation_seeds,
+                method_name="matd3",
+            )
+            metrics = result["summary"]["matd3"]
         self.actor.train()
-        metrics = result["summary"]["matd3"]
         score = (metrics["capture_rate"], -metrics["mean_censored_steps"], metrics["mean_return"])
-        self.validation_records.append({"episode": episode, "env_steps": self.env_steps, **metrics})
-        if score > self.best_capture_score:
+        record = {
+            "episode": episode,
+            "env_steps": self.env_steps,
+            "pre_rl": int(episode) == 0 and int(self.env_steps) == 0,
+            "considered_for_best": bool(consider_for_best),
+            **metrics,
+        }
+        self.validation_records.append(record)
+        if consider_for_best and score > self.best_capture_score:
             self.best_capture_score = score
-            self.best_actor_state = {key: value.detach().cpu().clone() for key, value in self.actor.state_dict().items()}
+            self._remember_best_modules()
             self.save_checkpoint(self.output_directory / "best_capture.pt", episode=episode)
+        elif (
+            consider_for_best
+            and self.best_actor_state is not None
+            and metrics["capture_rate"] < self.best_capture_score[0] - self.safeguard_drop
+        ):
+            self.safeguard_bad_validations += 1
+            if self.safeguard_bad_validations >= self.safeguard_patience:
+                old_lr, new_lr = self._rollback_to_best()
+                record["actor_rollback"] = True
+                record["rollback_reason"] = "capture_rate_degradation"
+                record["actor_lr_before_rollback"] = old_lr
+                record["actor_lr_after_rollback"] = new_lr
+                self.save_checkpoint(self.output_directory / "rollback_latest.pt", episode=episode)
+        elif consider_for_best:
+            self.safeguard_bad_validations = 0
         (self.output_directory / "validation.json").write_text(
             json.dumps(self.validation_records, indent=2), encoding="utf-8"
         )
         print(
             f"[validation] episode={episode} capture_rate={metrics['capture_rate']:.3f} "
-            f"return={metrics['mean_return']:.2f}",
+            f"return={metrics['mean_return']:.2f} considered_for_best={bool(consider_for_best)}",
             flush=True,
         )

@@ -11,7 +11,7 @@ from artifact_paths import artifact_path, default_output
 from compare_pursuit_evaluations import FIELDS, load_row
 
 
-DIFFICULTY_ORDER = {"Nominal": 0, "Medium": 1, "Hard": 2}
+DIFFICULTY_ORDER = {"Nominal": 0, "Medium": 1, "Hard": 2, "Extreme": 3}
 
 
 def load_spec(spec):
@@ -31,10 +31,11 @@ def validate_matrix(rows, required_methods=()):
         raise ValueError(f"Duplicate difficulty/method inputs: {duplicates}")
     unknown = sorted({row["difficulty"] for row in rows} - set(DIFFICULTY_ORDER))
     if unknown:
-        raise ValueError(f"Unknown difficulties {unknown}; use Nominal, Medium, or Hard")
+        raise ValueError(f"Unknown difficulties {unknown}; use Nominal, Medium, Hard, or Extreme")
+    present = sorted({row["difficulty"] for row in rows}, key=DIFFICULTY_ORDER.get)
     missing = [
         f"{difficulty}:{method}"
-        for difficulty in DIFFICULTY_ORDER
+        for difficulty in present
         for method in required_methods
         if (difficulty, method) not in set(pairs)
     ]
@@ -52,7 +53,7 @@ def _points(rows, method, key, x0, y0, width, height, low, high):
         index = DIFFICULTY_ORDER.get(row["difficulty"])
         if index is None:
             continue
-        x = x0 + index * width / 2
+        x = x0 + index * width / max(len(DIFFICULTY_ORDER) - 1, 1)
         y = y0 + height * (1.0 - (float(row[key]) - low) / (high - low))
         points.append((x, y))
     return points
@@ -84,8 +85,8 @@ def write_svg(path, rows):
                 f'<text x="{x0-8}" y="{y+4:.1f}" text-anchor="end" font-size="10">'
                 f'{low+(high-low)*fraction:.2g}</text>'
             )
-        for index, difficulty in enumerate(("Nominal", "Medium", "Hard")):
-            x = x0 + index * panel_width / 2
+        for index, difficulty in enumerate(sorted(DIFFICULTY_ORDER, key=DIFFICULTY_ORDER.get)):
+            x = x0 + index * panel_width / max(len(DIFFICULTY_ORDER) - 1, 1)
             body.append(f'<text x="{x:.1f}" y="430" text-anchor="middle" font-size="11">{difficulty}</text>')
         for method_index, method in enumerate(methods):
             color = colors[method_index % len(colors)]
@@ -111,7 +112,7 @@ def main():
     parser.add_argument("--input", action="append", required=True, metavar="DIFFICULTY:LABEL=PATH")
     parser.add_argument(
         "--require-methods", nargs="+", default=(), metavar="LABEL",
-        help="Require every listed method at Nominal, Medium, and Hard",
+        help="Require every listed method at Nominal, Medium, Hard, and Extreme",
     )
     parser.add_argument("--out-dir", type=artifact_path, default=default_output("radar5_difficulty_comparison"))
     args = parser.parse_args()

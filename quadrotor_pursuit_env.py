@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -30,7 +30,7 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     action_mode: str = "world_velocity_xyz_and_yaw_rate_to_autopilot"
     scenario_version: int = 3
     policy_observation_version: int = 2
-    execution_reward_version: int = 4
+    execution_reward_version: int = 5
     target_speed: float = 1.82  # 1.3 times pursuer horizontal speed; simulation assumption
     target_vertical_speed: float = 1.04
     initial_distance_min: float = 6.0
@@ -62,9 +62,10 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     reward_gamma: float = 0.995
     approach_distance_scale: float = 12.0
     nearest_approach_weight: float = 4.0
+    capture_team_progress_weight: float = 4.0
     capture_mode: str = "single_distance"
     target_diameter: float = 0.5  # simulation equivalent, not a hardware measurement
-    capture_required_uavs: int = 1
+    capture_required_uavs: int | None = None
     capture_hold_steps: int = 1
     individual_approach_weight: float = 2.0
     target_proximity_weight: float = 0.0
@@ -101,8 +102,10 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
     lidar_mount_rpy_deg: tuple = (0.0, 0.0, 0.0)
 
     def __post_init__(self):
-        if self.execution_reward_version != 4:
-            raise ValueError("Use execution_reward_version=4 for lidar visibility shaping; recollect demonstrations")
+        if self.capture_required_uavs is None:
+            self.capture_required_uavs = 1 if self.execution_reward_version == 4 else 2
+        if self.execution_reward_version not in (4, 5):
+            raise ValueError("Unsupported pursuit reward version; recollect demonstrations")
         if not 0 < self.reward_gamma <= 1 or min(self.approach_distance_scale, self.boundary_reward_safe_distance, self.safety_buffer) <= 0:
             raise ValueError("Invalid shaping discount, distance scale, or safety buffer")
         if self.target_proximity_weight != 0:
@@ -110,7 +113,7 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
         if min(self.safety_correction_weight, self.boundary_proximity_weight, self.peer_proximity_weight,
                self.controller_rejection_penalty, self.obstacle_proximity_weight,
                self.individual_approach_weight, self.nearest_approach_weight, self.encirclement_progress_weight,
-               self.visibility_progress_weight) < 0:
+               self.capture_team_progress_weight, self.visibility_progress_weight) < 0:
             raise ValueError("Reward weights must be nonnegative")
         if min(self.encirclement_distance_scale, self.encirclement_height_scale,
                self.obstacle_reward_safe_distance, self.obstacle_reward_log_scale) <= 0:
@@ -158,8 +161,14 @@ class QuadrotorPursuitConfig(Pursuit3DConfig):
         if min(self.decision_dt, self.max_horizontal_velocity, self.max_vertical_velocity,
                self.max_reference_yaw_rate, self.quadrotor_gravity) <= 0:
             raise ValueError("Decision period, speeds, yaw-rate limit and gravity must be positive")
-        if self.n_targets != 1 or self.capture_mode != "single_distance" or self.capture_required_uavs != 1:
-            raise ValueError("Distance pursuit requires one evader and any one active UAV to capture it")
+        if self.n_targets != 1 or self.capture_mode != "single_distance":
+            raise ValueError("Distance pursuit requires one evader and single_distance capture")
+        if not 1 <= int(self.capture_required_uavs) <= int(self.n_uavs):
+            raise ValueError("capture_required_uavs must be in [1, n_uavs]")
+        if self.capture_required_uavs > 1 and self.execution_reward_version != 5:
+            raise ValueError("Multi-UAV capture shaping requires execution_reward_version=5")
+        if self.capture_required_uavs == 1 and self.execution_reward_version != 4:
+            raise ValueError("Single-UAV capture configs must use execution_reward_version=4")
         if self.evader_policy not in ("repulsive", "occlusion"):
             raise ValueError("Pursuit evader_policy must be repulsive or occlusion")
 
@@ -219,6 +228,12 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         self._lidar_mask_scan = -1
         self._lidar_detections = np.zeros((cfg.n_uavs, cfg.n_targets), dtype=bool)
         self._lidar_opening_scan = True
+        # Optional measurements supplied by an external simulator sensor.
+        # When populated, _target_measurement never consults the geometric
+        # lidar surrogate for policy observations.
+        self._external_sensor_scan = None
+        self._external_sensor_measurements = {}
+        self._external_sensor_visibility = np.zeros((cfg.n_uavs, cfg.n_targets), dtype=bool)
         self._visible_steps = 0
 
     def direct_visibility_mask(self):
@@ -245,6 +260,13 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
 
     def _target_measurement(self, agent, target_id):
         cfg = self.cfg
+        if self._external_sensor_scan is not None:
+            key = (int(agent), int(target_id))
+            if key not in self._external_sensor_measurements:
+                return None, 0.0
+            measurement, variance = self._external_sensor_measurements[key]
+            self._lidar_detections[agent, target_id] = True
+            return np.asarray(measurement, dtype=float).copy(), float(variance)
         if cfg.pursuit_target_observable:
             key = (agent, target_id)
             if self._game_measurement_steps.get(key) == self.t:
@@ -277,6 +299,41 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         self._lidar_detections[agent, target_id] = True
         return truth + self._lidar_rng.normal(0.0, sigma, 3), float(sigma*sigma)
 
+    def set_external_sensor_scan(self, scan_time, measurements, visibility, variances=None):
+        """Install one simulator sensor scan for the next policy observation.
+
+        ``measurements`` maps ``(uav, target)`` to world XYZ. Missing entries
+        mean no detection. The scan is immutable until the next call and is
+        tagged with the simulator timestamp for synchronization diagnostics.
+        """
+        scan_time = float(scan_time)
+        if not np.isfinite(scan_time):
+            raise ValueError("external sensor scan time must be finite")
+        mask = np.asarray(visibility, dtype=bool)
+        expected = (self.cfg.n_uavs, self.cfg.n_targets)
+        if mask.shape != expected:
+            raise ValueError(f"external sensor visibility must have shape {expected}")
+        self._external_sensor_scan = scan_time
+        self._external_sensor_visibility = mask.copy()
+        self._external_sensor_measurements = {}
+        variances = variances or {}
+        for key, value in measurements.items():
+            vector = np.asarray(value, dtype=float)
+            if vector.shape != (3,) or not np.isfinite(vector).all():
+                raise ValueError(f"invalid external sensor measurement for {key}")
+            variance = float(variances.get(key, 0.0))
+            if variance < 0 or not np.isfinite(variance):
+                raise ValueError(f"invalid external sensor variance for {key}")
+            self._external_sensor_measurements[(int(key[0]), int(key[1]))] = (vector, variance)
+
+    def clear_external_sensor_scan(self):
+        """Return policy sensing to the environment's geometric LiDAR model."""
+        self._external_sensor_scan = None
+        self._external_sensor_measurements = {}
+        self._external_sensor_visibility = np.zeros(
+            (self.cfg.n_uavs, self.cfg.n_targets), dtype=bool
+        )
+
     def _initialize_handoff_triangle_formation(self):
         super()._initialize_handoff_triangle_formation()
         self.initial_layout = "one_side_triangle"
@@ -298,6 +355,34 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         except ImportError:
             from .pursuit_scenarios import advance_evader
         advance_evader(self, target_index, direction, dt)
+
+    def thu_velocity_actions(self, policy_actions: np.ndarray) -> np.ndarray:
+        """Map normalized policy actions to THU-UAV VelController inputs.
+
+        Uses the current quadrotor yaw and ``current_decision_dt``. Safe to call
+        from an Isaac / THU-UAV adapter without importing the simulator here.
+        """
+        try:
+            from thu_uav_velocity_bridge import (
+                current_yaw_from_quadrotor_states,
+                limits_from_pursuit_config,
+                velocity_action_for_thu,
+            )
+        except ImportError:
+            from .thu_uav_velocity_bridge import (
+                current_yaw_from_quadrotor_states,
+                limits_from_pursuit_config,
+                velocity_action_for_thu,
+            )
+        limits = replace(
+            limits_from_pursuit_config(self.cfg),
+            decision_dt=float(getattr(self, "current_decision_dt", self.cfg.decision_dt)),
+        )
+        return velocity_action_for_thu(
+            policy_actions,
+            current_yaw_from_quadrotor_states(self.quadrotor_states),
+            limits=limits,
+        )
 
     def continuous_action_dim(self) -> int:
         return 4
@@ -433,18 +518,36 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         return super().state_dim() + self.cfg.n_uavs * 13
 
     def _capture_geometry(self) -> tuple[bool, int, float]:
-        """Any active pursuer within twice the target diameter, in world 3-D."""
+        """Shared capture API: k pursuers in radius (+ optional angular span)."""
+        from capture_geometry import angular_span_from_cfg, evaluate_capture
+
         target = np.array([*self.dynamic_targets[0], self.target_altitudes[0]])
-        distances = np.linalg.norm(self.quadrotor_states[:, :3] - target, axis=1)
-        count = int(np.count_nonzero((distances <= self.cfg.capture_radius) & ~self.disabled_uavs))
-        return count > 0, count, 0.0
+        result = evaluate_capture(
+            self.quadrotor_states[:, :3],
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=angular_span_from_cfg(self.cfg),
+            active_mask=~self.disabled_uavs,
+        )
+        return bool(result.success), int(result.close_count), float(result.angular_span_deg)
 
     def minimum_capture_gap(self) -> float:
-        """Distance remaining outside the nearest capture sphere (metres)."""
+        """Metres still needed for the k-th closest active pursuer to enter capture."""
+        from capture_geometry import angular_span_from_cfg, evaluate_capture
+
         target = np.array([*self.dynamic_targets[0], self.target_altitudes[0]])
-        distances = np.linalg.norm(self.quadrotor_states[:, :3] - target, axis=1)
-        active = ~self.disabled_uavs
-        return float(max(np.min(distances[active])-self.cfg.capture_radius, 0.0)) if np.any(active) else float(self.cfg.grid_size)
+        result = evaluate_capture(
+            self.quadrotor_states[:, :3],
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=angular_span_from_cfg(self.cfg),
+            active_mask=~self.disabled_uavs,
+        )
+        if not np.isfinite(result.kth_gap) or result.kth_gap >= 1e8:
+            return float(self.cfg.grid_size)
+        return float(result.kth_gap)
 
     def step_joint(self, actions: np.ndarray) -> dict:
         try:

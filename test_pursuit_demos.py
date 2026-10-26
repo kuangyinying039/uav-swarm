@@ -17,6 +17,7 @@ from train_pursuit_with_demos import (
     load_evaluation_environment_config,
 )
 from pursuit_training_output import write_pursuit_outputs
+from pursuit_vector_env import SyncVectorPursuitEnv
 from build_mpc_solvable_seed_bank import main as build_seed_bank
 
 
@@ -305,6 +306,40 @@ class PursuitDemoTests(unittest.TestCase):
         with patch.object(QuadrotorPursuitEnv, "step_joint", failed_step):
             with self.assertRaisesRegex(RuntimeError, "Only 0/1"):
                 collect_demos(self.env_cfg, 4, 1, 1, "mpc")
+
+    def test_train_vectorized_completes_parallel_episodes(self):
+        cfg = QuadrotorPursuitConfig(
+            seed=4,
+            building_count=0,
+            search_steps=3,
+            capture_required_uavs=2,
+            execution_reward_version=5,
+        )
+        vec = SyncVectorPursuitEnv.from_config(cfg, num_envs=2, seed=4)
+        try:
+            trainer = PursuitDemoTrainer(
+                lambda episode=0: QuadrotorPursuitEnv(cfg),
+                TrainConfig(
+                    episodes=2,
+                    max_steps=3,
+                    gamma=cfg.reward_gamma,
+                    hidden_dim=16,
+                    batch_size=4,
+                    update_epochs=1,
+                    use_gat=False,
+                    device="cpu",
+                    log_interval=1,
+                    checkpoint_interval=100,
+                ),
+            )
+            trainer.seed = 4
+            history = trainer.train_vectorized(vec, target_episodes=2)
+            self.assertEqual(len(history), 2)
+            self.assertEqual([row["episode"] for row in history], [1, 2])
+            self.assertTrue(all("reward" in row for row in history))
+            self.assertEqual(trainer._vector_num_envs, 2)
+        finally:
+            vec.close()
 
 
 if __name__ == "__main__":

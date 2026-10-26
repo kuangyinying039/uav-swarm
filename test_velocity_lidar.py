@@ -19,7 +19,7 @@ class VelocityLidarTests(unittest.TestCase):
         self.assertFalse(cfg.pursuit_target_observable)
         self.assertEqual(cfg.evader_policy, 'occlusion')
         self.assertEqual(cfg.scenario_version, 3)
-        self.assertEqual(cfg.execution_reward_version, 4)
+        self.assertEqual(cfg.execution_reward_version, 5)
 
     def test_response_lag_acceleration_limit_and_reset(self):
         cfg = self.config()

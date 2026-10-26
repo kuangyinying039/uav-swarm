@@ -725,7 +725,42 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
         else:
             self.occlusion_waypoint_dwell[target_index] += 1
             chosen_direction = current_evaluation[1]
-        return _unit(0.25 * repulsion + 0.75 * chosen_direction, repulsion)
+        direction = _unit(0.25 * repulsion + 0.75 * chosen_direction, repulsion)
+        # Parent ``_unit`` falls back to a planar [1, 0] when both vectors vanish.
+        if np.asarray(direction).reshape(-1).size == 2:
+            direction = np.r_[np.asarray(direction, dtype=float).reshape(-1), 0.0]
+        try:
+            from pursuit_scenarios import command_velocity, resolve_evader_motion
+        except ImportError:
+            from .pursuit_scenarios import command_velocity, resolve_evader_motion
+        nearest = float(np.min(distances))
+        dt = float(getattr(self, "current_decision_dt", c.decision_dt))
+        velocity = np.array(
+            [*self.target_velocity[target_index], self.target_vertical_velocity[target_index]],
+            dtype=float,
+        )
+        _, _, status = resolve_evader_motion(
+            self, target, velocity, command_velocity(direction, c), dt
+        )
+        # A blocked cover waypoint is not a place to wait. Close pursuers
+        # make the evader leave that waypoint and run away from them.
+        pursuers_close = nearest < float(getattr(c, "evader_repulsion_radius", 10.0))
+        speed_now = float(np.linalg.norm(velocity))
+        direction = np.asarray(direction, dtype=float).reshape(-1)
+        planar = float(np.linalg.norm(direction[:2])) if direction.size >= 2 else 0.0
+        leaving = float(np.dot(_unit(direction), repulsion))
+        # Occlusion may pick a near-zero "hover behind cover" command. Under
+        # pressure that becomes freeze-to-capture; force a flee heading.
+        frozen_under_pressure = pursuers_close and (
+            status == "stopped" or speed_now < 0.15 or planar < 0.25
+        )
+        if frozen_under_pressure or (pursuers_close and leaving < 0.35):
+            climb = np.array([repulsion[0], repulsion[1], 0.9], dtype=float)
+            escape = climb if nearest < 6.0 else repulsion
+            self.occlusion_waypoints[target_index] = target + escape * lookahead
+            self.occlusion_waypoint_dwell[target_index] = 0
+            direction = escape
+        return np.asarray(direction, dtype=float).reshape(-1)
 
     def _covering_building_height(self, xy: np.ndarray, margin: float = 0.0) -> float | None:
         heights = [
@@ -742,20 +777,26 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
 
     def _capture_geometry(self) -> tuple[bool, int, float]:
         target_xy = self.dynamic_targets[0]
+        try:
+            from capture_geometry import evaluate_capture
+        except ImportError:
+            from .capture_geometry import evaluate_capture
+
         horizontal_delta = self.positions.astype(float) - target_xy[None, :]
         dz = self.altitudes - self.target_altitudes[0]
-        distance_3d = np.sqrt(np.sum(horizontal_delta**2, axis=1) + dz**2)
-        close = np.flatnonzero(
-            (distance_3d <= self.cfg.capture_radius)
-            & (np.abs(dz) <= self.cfg.capture_vertical_tolerance)
-            & ~self.disabled_uavs
+        # Shared API is spherical; apply vertical tolerance by masking out-of-band UAVs.
+        active = ~self.disabled_uavs & (np.abs(dz) <= self.cfg.capture_vertical_tolerance)
+        pursuers = np.column_stack([self.positions.astype(float), self.altitudes.astype(float)])
+        target = np.array([*target_xy, float(self.target_altitudes[0])], dtype=float)
+        result = evaluate_capture(
+            pursuers,
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=float(self.cfg.capture_angular_span_deg),
+            active_mask=active,
         )
-        if len(close) < self.cfg.capture_required_uavs:
-            return False, len(close), 0.0
-        angles = np.sort(np.mod(np.arctan2(horizontal_delta[close, 1], horizontal_delta[close, 0]), 2 * np.pi))
-        wrapped = np.r_[angles, angles[0] + 2 * np.pi]
-        span = 2 * np.pi - float(np.max(np.diff(wrapped)))
-        return span >= np.deg2rad(self.cfg.capture_angular_span_deg), len(close), float(np.rad2deg(span))
+        return bool(result.success), int(result.close_count), float(result.angular_span_deg)
 
     def step_joint(self, search_actions: np.ndarray) -> dict:
         actions = np.asarray(search_actions, dtype=int)
