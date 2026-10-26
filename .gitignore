@@ -51,7 +51,7 @@ isaac_pursuit_backend.py.bak*
 .fonts/
 _ppt_assets/
 _replay_view/
-paper_figures/__pycache__/
+paper_figures/
 scripts/__pycache__/
 
 # Ad-hoc analysis dumps (regenerate from eval JSON)

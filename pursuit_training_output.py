@@ -177,9 +177,7 @@ def write_evaluation_chart(path, result):
 
 
 def write_pursuit_outputs(folder, history, traces):
-    from train_cooperative_marl import write_episode_scene_3d_svg
-    from pursuit_visualization import write_pursuit_animation_html
-
+    """Write training history, CSV, and learning charts (no paper animation assets)."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     history = [clean_history_row(row) for row in history]
@@ -190,27 +188,17 @@ def write_pursuit_outputs(folder, history, traces):
         writer.writerows(history)
     tail = history[-50:]
     success_times = [r["capture_time"] for r in tail if r.get("capture_time") is not None]
-    summary = {"episodes_averaged": len(tail), "capture_rate": float(np.mean([r["capture_success"] for r in tail])) if tail else None,
-               "mean_success_capture_steps": float(np.mean(success_times)) if success_times else None,
-               "mean_censored_steps": float(np.mean([r["steps"] for r in tail])) if tail else None,
-               "note": "Training samples, not held-out policy evaluation"}
+    summary = {
+        "episodes_averaged": len(tail),
+        "capture_rate": float(np.mean([r["capture_success"] for r in tail])) if tail else None,
+        "mean_success_capture_steps": float(np.mean(success_times)) if success_times else None,
+        "mean_censored_steps": float(np.mean([r["steps"] for r in tail])) if tail else None,
+        "n_episode_traces": len(traces or []),
+        "note": "Training samples, not held-out policy evaluation",
+    }
     (folder / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     write_learning_chart(folder / "capture_learning.svg", history)
     write_reward_capture_chart(folder / "reward_capture.svg", history)
-    links = ['<h1>协同围捕训练</h1><p>训练统计与独立评估分开；失败回合不计入成功捕获耗时。</p>',
-             '<img src="reward_capture.svg" style="width:100%;max-width:1000px" alt="奖励和捕获率双轴曲线">',
-             '<img src="capture_learning.svg" style="width:100%;max-width:1100px" alt="围捕学习曲线">']
-    for trace in traces:
-        trace = dict(trace, mode="3d")
-        trace["frames"] = [{k: v for k, v in frame.items() if k not in
-                            ("coverage", "new_cells", "revisit_gain", "stagnant_agents",
-                             "found_targets", "tracked_targets", "completed_targets")}
-                           for frame in trace["frames"]]
-        stem = f"capture_episode_{trace['episode']}"
-        write_episode_scene_3d_svg(folder / f"{stem}.svg", "MAPPO", trace)
-        write_pursuit_animation_html(folder / f"{stem}.html", trace, f"Cooperative capture | episode {trace['episode']}")
-        links.append(f'<p><a href="{stem}.html">第 {trace["episode"]} 回合三维围捕回放</a></p><img src="{stem}.svg" style="max-width:940px;width:100%">')
-    (folder / "index.html").write_text('<!doctype html><meta charset="utf-8"><title>协同围捕</title><body style="font-family:Arial;background:#f4f7fb;margin:24px">'+"\n".join(links)+'</body>', encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
 
 

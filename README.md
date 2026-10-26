@@ -13,13 +13,17 @@ real flight.
 | **Sensing (sim)** | Geometric MID-360 + LOS by default (`--no-native-lidar`); native LiDAR optional |
 | **Deploy** | 5 Hz world velocity + yaw-rate → MAVROS `setpoint_raw/local` (ENU↔NED) |
 
-Hybrid `isaac_dual_postlc` results are **baselines only** — do not mix with
+This repository keeps **simulation, training, evaluation, and real-flight
+deployment code only**. Paper figures, ablation/sensitivity suites, trajectory
+renderers, and handoff write-ups are intentionally out of tree.
+
+Hybrid `isaac_dual_postlc` numbers are **baselines only** — do not mix with
 `physx_closed` or real-flight tables. See [`SIM2REAL.md`](SIM2REAL.md).
 
 ## Repository layout
 
 ```
-configs/pursuit_v2/     # difficulty ladder + physx_closed JSON
+configs/pursuit_v2/     # dual difficulty ladder (+ *_physx_closed)
 pursuit/                # algorithms, trainers, datasets
 isaac_pursuit_backend.py
 train_isaac_pursuit.py / evaluate_isaac_pursuit.py
@@ -27,6 +31,7 @@ collect_isaac_pursuit_data.py / pretrain_isaac_pursuit_actor.py
 queue_physx_closed_*.sh / run_physx_closed_{train,eval}.sh
 px4_offboard_bridge.py / residual_policy.py / capture_geometry.py
 real_flight_{obs,safety,node}.py
+scripts/                # closed-loop probes only
 ```
 
 Training artifacts (`.pt`, logs) live under `$UAV_PROJECT_RUNS` (default
