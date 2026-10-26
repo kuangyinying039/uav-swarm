@@ -30,7 +30,8 @@ class MissingLidarInterface:
 
 
 class IsaacLidarMissingSensorTests(unittest.TestCase):
-    def test_missing_sensor_is_quarantined_after_first_empty_scan(self):
+    def test_missing_sensor_soft_fails_without_permanent_blacklist(self):
+        """Transient 'does not exist' during warmup must not quarantine forever."""
         adapter = IsaacLidarAdapter(1, n_targets=1, decision_dt=0.2)
         interface = MissingLidarInterface()
         scan = adapter.read_native_scan(
@@ -55,7 +56,8 @@ class IsaacLidarMissingSensorTests(unittest.TestCase):
             target_prim_tokens=("radar5_target",),
         )
         self.assertFalse(next_scan["sensor_available"])
-        self.assertEqual(interface.calls, 1)
+        # Soft-fail retries so sensors can come online after physics warmup.
+        self.assertEqual(interface.calls, 2)
 
 
     def test_reset_allows_sensor_time_to_restart_for_next_episode(self):

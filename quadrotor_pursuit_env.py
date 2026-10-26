@@ -518,22 +518,36 @@ class QuadrotorPursuitEnv(PursuitEvasion3DEnv):
         return super().state_dim() + self.cfg.n_uavs * 13
 
     def _capture_geometry(self) -> tuple[bool, int, float]:
-        """Count active pursuers inside the capture sphere; need ``capture_required_uavs``."""
+        """Shared capture API: k pursuers in radius (+ optional angular span)."""
+        from capture_geometry import angular_span_from_cfg, evaluate_capture
+
         target = np.array([*self.dynamic_targets[0], self.target_altitudes[0]])
-        distances = np.linalg.norm(self.quadrotor_states[:, :3] - target, axis=1)
-        count = int(np.count_nonzero((distances <= self.cfg.capture_radius) & ~self.disabled_uavs))
-        return count >= int(self.cfg.capture_required_uavs), count, 0.0
+        result = evaluate_capture(
+            self.quadrotor_states[:, :3],
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=angular_span_from_cfg(self.cfg),
+            active_mask=~self.disabled_uavs,
+        )
+        return bool(result.success), int(result.close_count), float(result.angular_span_deg)
 
     def minimum_capture_gap(self) -> float:
         """Metres still needed for the k-th closest active pursuer to enter capture."""
+        from capture_geometry import angular_span_from_cfg, evaluate_capture
+
         target = np.array([*self.dynamic_targets[0], self.target_altitudes[0]])
-        distances = np.linalg.norm(self.quadrotor_states[:, :3] - target, axis=1)
-        active = distances[~self.disabled_uavs]
-        if not len(active):
+        result = evaluate_capture(
+            self.quadrotor_states[:, :3],
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=angular_span_from_cfg(self.cfg),
+            active_mask=~self.disabled_uavs,
+        )
+        if not np.isfinite(result.kth_gap) or result.kth_gap >= 1e8:
             return float(self.cfg.grid_size)
-        ordered = np.sort(active)
-        needed = min(int(self.cfg.capture_required_uavs), len(ordered))
-        return float(max(ordered[needed - 1] - self.cfg.capture_radius, 0.0))
+        return float(result.kth_gap)
 
     def step_joint(self, actions: np.ndarray) -> dict:
         try:

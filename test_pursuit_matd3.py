@@ -88,7 +88,7 @@ class PursuitMatd3Tests(unittest.TestCase):
             )
             self.assertLessEqual(offset, cfg.capture_radius + 1e-6)
 
-    def test_transition_keeps_proposed_action_and_failures(self):
+    def test_transition_keeps_proposed_action_and_optional_failures(self):
         env = QuadrotorPursuitEnv(self.env_cfg)
         teacher = CooperativeGuidanceMPC3D()
         teacher.reset(env)
@@ -100,11 +100,13 @@ class PursuitMatd3Tests(unittest.TestCase):
         self.assertIn("reward", row)
         self.assertIn("next_state", row)
         self.assertEqual(row["executed_velocity"].shape, (env.cfg.n_uavs, 3))
-        dataset = collect_teacher_transitions(self.env_cfg, 4, 1, "mpc")
+        dataset = collect_teacher_transitions(self.env_cfg, 4, 1, "mpc", keep_failures=True)
         self.assertEqual(dataset["format"], TRANSITION_DATASET_V2)
         self.assertEqual(len(dataset["episodes"]), 1)
         validate_transition_dataset(dataset, self.env_cfg)
         self.assertTrue(dataset["report"][0]["kept"])
+        self.assertTrue(dataset["complete"])
+        self.assertTrue(dataset["keeps_failures"])
 
     def test_replay_and_prior_mix(self):
         env = QuadrotorPursuitEnv(self.env_cfg)

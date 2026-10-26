@@ -78,24 +78,43 @@ class IsaacPursuitEnv:
         *,
         seed=0,
         headless=True,
-        native_lidar=False,
+        native_lidar: bool | None = None,
         num_envs: int = 1,
         env_spacing: float | None = None,
         visual_model_scale: float | None = None,
+        physx_closed_loop: bool = False,
     ):
         self.num_envs = int(num_envs)
         if self.num_envs < 1:
             raise ValueError("num_envs must be >= 1")
         self.cfg = replace(cfg, seed=int(seed))
         self._headless = headless
+        # Pure PhysX 3 pursuers + 1 same-model evader (see SIM2REAL.md).
+        self._physx_closed_loop = bool(physx_closed_loop)
+        self._n_physics_drones = 4 if self._physx_closed_loop else int(cfg.n_uavs)
+        self._evader_drone_index = 3 if self._physx_closed_loop else None
+        # Pure closed-loop still uses a PhysX Hummingbird body for the evader
+        # (collision / capture / state tensor). Lee velocity tracking on that
+        # 4th body is too unstable for dual-capture (FRPN ~0–8%); exact pose
+        # integration on the articulation recovers ~30%+ and is the supported
+        # path. Set False only to experiment with Lee-on-evader again.
+        self._kinematic_evader = bool(self._physx_closed_loop)
+        # Lee altitude setpoint for the PhysX evader (updated on each reset).
+        self._evader_alt_hold = float(self.cfg.initial_altitude)
         # GUI-only mesh enlargement; PhysX / capture radii stay on the real model.
         # ~4×: readable from chase cam without drowning the scene / occluding cover.
         if visual_model_scale is None:
             self._visual_model_scale = 4.0 if not headless else 1.0
         else:
             self._visual_model_scale = max(float(visual_model_scale), 1e-3)
-        # Native LiDAR path is single-env for now; multi-env uses geometric fallback.
-        self._native_lidar_enabled = bool(native_lidar) and self.num_envs == 1
+        # PhysX RangeSensor does not register under OmniDrones' GPU pipeline
+        # (USD Lidar prim exists, is_lidar_sensor=False, clouds stay empty).
+        # Default both hybrid and closed to geometric LiDAR; pass
+        # native_lidar=True only for experiments that can use a CPU physics scene.
+        if native_lidar is None:
+            self._native_lidar_enabled = False
+        else:
+            self._native_lidar_enabled = bool(native_lidar)
         self._env_spacing = (
             float(env_spacing)
             if env_spacing is not None
@@ -146,7 +165,11 @@ class IsaacPursuitEnv:
                     f"task.env.num_envs={self.num_envs}",
                     f"task.env.env_spacing={self._env_spacing}",
                     f"task.env.max_episode_length={self._max_physics_steps}",
-                    "task.formation=radar5_three",
+                    (
+                        "task.formation=radar5_three_plus_evader"
+                        if self._physx_closed_loop
+                        else "task.formation=radar5_three"
+                    ),
                     f"headless={'true' if headless else 'false'}",
                     "++sim.device=cuda:0",
                 ],
@@ -157,6 +180,9 @@ class IsaacPursuitEnv:
         isaac_cfg.sim.substeps = 1
         isaac_cfg.sim.gravity = [0.0, 0.0, -self.cfg.quadrotor_gravity]
         isaac_cfg.sim.device = "cuda:0"
+        # OmniDrones Formation requires the GPU pipeline; PhysX RangeSensor then
+        # often fails to register when parented under GPU articulations. Lidars
+        # are created as world-fixed Xforms and pose-synced each step instead.
         isaac_cfg.sim.use_gpu_pipeline = True
         isaac_cfg.sim.use_gpu = True
         # Keep False so per-env Radar5 buildings/targets added after GridCloner
@@ -187,6 +213,18 @@ class IsaacPursuitEnv:
             [self.cfg.formation_spacing, 0.0, self.cfg.initial_altitude],
             [0.0, self.cfg.formation_spacing, self.cfg.initial_altitude],
         ]
+        # Index 3 = same-model PhysX evader (pure closed loop).
+        # Stay clear of the pursuer triangle (avoids Lee collision blow-ups) but
+        # keep spawn range inside lidar_target_detection_range so native scans
+        # can hit at t=0. spacing*4≈8.8 → ~12.5 m diagonal vs range 13 m left
+        # almost no margin; spacing*2.5≈5.5 → ~7.8 m is safe.
+        evader_xy = max(float(self.cfg.formation_spacing) * 2.5, 5.5)
+        formation_task.FORMATIONS["radar5_three_plus_evader"] = [
+            [0.0, 0.0, self.cfg.initial_altitude],
+            [self.cfg.formation_spacing, 0.0, self.cfg.initial_altitude],
+            [0.0, self.cfg.formation_spacing, self.cfg.initial_altitude],
+            [evader_xy, evader_xy, self.cfg.initial_altitude],
+        ]
         self.isaac_cfg = isaac_cfg
         try:
             self.sim_env = Formation(isaac_cfg, headless=headless)
@@ -194,6 +232,10 @@ class IsaacPursuitEnv:
             self.simulation_app.close()
             raise
         self.sim_env.controller = self.sim_env.controller.to(self.sim_env.device)
+        if int(self.sim_env.drone.n) != int(self._n_physics_drones):
+            raise RuntimeError(
+                f"Expected {self._n_physics_drones} PhysX drones, got {self.sim_env.drone.n}"
+            )
 
         from experiments.radar5_frozen_transfer_v1.isaac_sensor_bridge import IsaacLidarAdapter
         from experiments.radar5_frozen_transfer_v1.isaac_pursuit_observation import IsaacPursuitObservationBridge
@@ -208,6 +250,7 @@ class IsaacPursuitEnv:
             IsaacPursuitObservationBridge(
                 replace(self.cfg, seed=int(seed) + index),
                 sensor_adapter=self.lidars[index],
+                external_target_physics=self._physx_closed_loop,
             )
             for index in range(self.num_envs)
         ]
@@ -215,24 +258,68 @@ class IsaacPursuitEnv:
         self.lidar = self.lidars[0]
         self.envs = [bridge.env for bridge in self.bridges]
         self._create_scene_prims()
-        self.sensor_paths = []
+        # sensor_paths layout: env-major, pursuers only → length num_envs * n_uavs.
+        # With physx_closed (4 articulations/env), skip the evader slot (index 3).
+        self.sensor_paths = [None] * (self.cfg.n_uavs * self.num_envs)
         self._sensor_creation_errors = []
         self.lidar_interface = None
         if self._native_lidar_enabled:
             from omni.isaac.range_sensor import _range_sensor
 
             self.lidar_interface = _range_sensor.acquire_lidar_sensor_interface()
-            for drone_path in self.sim_env.drone.prim_paths:
-                drone_path = str(drone_path).rstrip("/")
-                parent = drone_path if drone_path.endswith("/base_link") else f"{drone_path}/base_link"
-                sensor_path = f"{parent}/radar5_lidar"
-                try:
-                    self.sensor_paths.append(self._create_lidar(sensor_path, parent))
-                except Exception as exc:  # pragma: no cover - simulator-dependent fallback
-                    self._sensor_creation_errors.append((sensor_path, exc))
-                    self.sensor_paths.append(None)
-        else:
-            self.sensor_paths = [None] * (self.cfg.n_uavs * self.num_envs)
+            prim_paths = [str(p).rstrip("/") for p in self.sim_env.drone.prim_paths]
+            n_phys = int(self._n_physics_drones)
+            expected = self.num_envs * n_phys
+            if len(prim_paths) != expected:
+                print(
+                    f"[isaac] warning: prim_paths={len(prim_paths)} expected={expected}; "
+                    "native lidar indexing may be partial",
+                    flush=True,
+                )
+            # Parent lidars under the env Xform (not the GPU articulation).
+            # Parenting under Hummingbird/base_link left type=Lidar USD prims that
+            # the range_sensor plugin never registered (alive=False, empty clouds).
+            for env_index in range(self.num_envs):
+                for drone_index in range(self.cfg.n_uavs):
+                    slot = env_index * self.cfg.n_uavs + drone_index
+                    parent = f"/World/envs/env_{env_index}"
+                    leaf = f"radar5_lidar_uav{drone_index}"
+                    try:
+                        self.sensor_paths[slot] = self._create_lidar(leaf, parent)
+                    except Exception as exc:  # pragma: no cover - simulator-dependent fallback
+                        self._sensor_creation_errors.append((f"{parent}/{leaf}", exc))
+                        self.sensor_paths[slot] = None
+            created = sum(1 for p in self.sensor_paths if p is not None)
+            print(
+                f"[isaac] native_lidar sensors={created}/{len(self.sensor_paths)} "
+                f"(world-fixed under env; physx_closed={self._physx_closed_loop})",
+                flush=True,
+            )
+            self._lidar_pose_ops = []
+            try:
+                from pxr import UsdGeom
+                import omni.usd
+
+                stage = omni.usd.get_context().get_stage()
+                for path in self.sensor_paths:
+                    if path is None:
+                        self._lidar_pose_ops.append(None)
+                        continue
+                    prim = stage.GetPrimAtPath(path)
+                    xform = UsdGeom.Xformable(prim)
+                    ops = {op.GetOpName(): op for op in xform.GetOrderedXformOps()}
+                    if "xformOp:translate" in ops:
+                        translate = ops["xformOp:translate"]
+                    else:
+                        translate = xform.AddTranslateOp()
+                    if "xformOp:orient" in ops:
+                        orient = ops["xformOp:orient"]
+                    else:
+                        orient = xform.AddOrientOp()
+                    self._lidar_pose_ops.append((translate, orient))
+            except Exception as exc:
+                print(f"[isaac] lidar pose ops unavailable: {exc}", flush=True)
+                self._lidar_pose_ops = [None] * len(self.sensor_paths)
         self._initialize_scene_transforms()
         self._apply_gui_visual_enlargement()
         if not headless:
@@ -240,16 +327,24 @@ class IsaacPursuitEnv:
             self._apply_viewport_presentation()
         self._last_native_scan = None
         self._physics_initialized = False
+        self._lidar_warmed = False
         self._patch_multirotor_throttle_reset()
         self._patch_formation_episode_end()
+        # Formation reset first so articulations exist, then warm LiDAR, then task reset.
         print(
             f"[isaac] num_envs={self.num_envs} env_spacing={self._env_spacing} "
             f"replicate_physics={bool(isaac_cfg.sim.replicate_physics)} "
             f"gpu_pipeline={bool(isaac_cfg.sim.use_gpu_pipeline)} "
+            f"native_lidar={self._native_lidar_enabled} "
+            f"physx_closed={self._physx_closed_loop} "
+            f"kinematic_evader={self._kinematic_evader} "
+            f"physics_drones={self._n_physics_drones} "
             f"compact_pad={not headless} "
             f"visual_model_scale={self._visual_model_scale}",
             flush=True,
         )
+        self.td = self.sim_env.reset()
+        self._warmup_native_lidars()
         self.reset(seed=seed)
 
     def _patch_multirotor_throttle_reset(self):
@@ -351,15 +446,22 @@ class IsaacPursuitEnv:
         return self.sim_env.envs_positions  # (N, 3) world origins of GridCloner cells
 
     def minimum_capture_gap(self, env_index: int = 0):
+        from capture_geometry import angular_span_from_cfg, evaluate_capture
+
         state = self._physical_state(env_index)
         target = self._target_position(env_index)
         active = ~np.asarray(self.bridges[env_index].env.disabled_uavs, dtype=bool)
-        distances = np.linalg.norm(state[:, :3] - target[None, :], axis=1)
-        required = int(self.cfg.capture_required_uavs)
-        if np.count_nonzero(active) < required:
+        result = evaluate_capture(
+            state[:, :3],
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=angular_span_from_cfg(self.cfg),
+            active_mask=active,
+        )
+        if not np.isfinite(result.kth_gap) or result.kth_gap >= 1e8:
             return float(self.cfg.grid_size)
-        required_distance = np.partition(distances[active], required - 1)[required - 1]
-        return float(max(required_distance - self.cfg.capture_radius, 0.0))
+        return float(result.kth_gap)
 
     def configure_domain(self, cfg: QuadrotorPursuitConfig):
         """Switch among transfer profiles with an identical policy/scene shape."""
@@ -380,11 +482,18 @@ class IsaacPursuitEnv:
             bridge.env.cfg = replace(self.cfg, seed=bridge.env.cfg.seed)
 
     def _has_physical_capture(self, state, target, env_index: int = 0):
+        from capture_geometry import angular_span_from_cfg, evaluate_capture
+
         active = ~np.asarray(self.bridges[env_index].env.disabled_uavs, dtype=bool)
-        distances = np.linalg.norm(state[:, :3] - target[None, :], axis=1)
-        return int(np.count_nonzero(active & (distances <= self.cfg.capture_radius))) >= int(
-            self.cfg.capture_required_uavs
+        result = evaluate_capture(
+            np.asarray(state, dtype=float).reshape(-1, 13)[:, :3],
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=angular_span_from_cfg(self.cfg),
+            active_mask=active,
         )
+        return bool(result.success)
 
     @staticmethod
     def _episode_end_flags(captured, task_timeout, upstream_terminated, upstream_truncated):
@@ -412,18 +521,94 @@ class IsaacPursuitEnv:
         return float(np.count_nonzero(feasible) / max(int(np.count_nonzero(active)), 1))
 
     def _create_lidar(self, path, parent):
+        """Create lidar under ``parent``; ``path`` may be absolute or leaf name."""
         from experiments.radar5_frozen_transfer_v1.isaac_sensor_bridge import IsaacLidarAdapter
 
-        return IsaacLidarAdapter.create_physx_lidar(
-            path,
+        parent = str(parent).rstrip("/")
+        # Isaac RangeSensorCreateLidar expects a leaf name (or absolute). Prefer leaf.
+        leaf = str(path).rstrip("/").rsplit("/", 1)[-1]
+        # Non-zero rotation_rate is required for PhysX lidar to emit clouds;
+        # rotation_rate=0 previously left sensors registered but unreadably empty.
+        scan_hz = float(getattr(self.cfg, "lidar_scan_hz", 10.0) or 10.0)
+        IsaacLidarAdapter.create_physx_lidar(
+            leaf,
             parent,
             min_range=self.cfg.lidar_min_range,
             max_range=self.cfg.lidar_target_detection_range,
             horizontal_fov=self.cfg.lidar_horizontal_fov_deg,
             vertical_fov=self.cfg.lidar_vertical_max_deg - self.cfg.lidar_vertical_min_deg,
-            horizontal_resolution=5.0,
-            vertical_resolution=5.0,
+            horizontal_resolution=2.0,
+            vertical_resolution=2.0,
+            rotation_rate=max(scan_hz, 1.0),
         )
+        return f"{parent}/{leaf}"
+
+    def _warmup_native_lidars(self, physics_steps: int = 48):
+        """Play timeline and step PhysX so range sensors register before reads."""
+        if not self._native_lidar_enabled:
+            return
+        try:
+            import omni.timeline
+
+            timeline = omni.timeline.get_timeline_interface()
+            if timeline.is_stopped() or not timeline.is_playing():
+                timeline.play()
+        except Exception:
+            pass
+        # Prefer raw physics steps; fall back to zero-action env steps.
+        stepped = 0
+        try:
+            sim = getattr(self.sim_env, "sim", None)
+            if sim is not None and hasattr(sim, "step"):
+                for _ in range(max(int(physics_steps), 1)):
+                    sim.step(render=False)
+                    stepped += 1
+        except Exception as exc:
+            print(f"[isaac] lidar warmup sim.step soft-fail: {exc}", flush=True)
+        if stepped == 0:
+            try:
+                import torch
+
+                n_phys = int(self._n_physics_drones)
+                zeros = torch.zeros(
+                    self.num_envs, n_phys, 4, device=self.sim_env.device, dtype=torch.float32
+                )
+                for _ in range(max(int(physics_steps), 1)):
+                    if getattr(self, "td", None) is None:
+                        self.td = self.sim_env.reset()
+                    self.td = self.sim_env.step(self.td.set(("agents", "action"), zeros))
+                    stepped += 1
+            except Exception as exc:
+                print(f"[isaac] lidar warmup env.step soft-fail: {exc}", flush=True)
+        # Probe whether the interface recognizes created paths.
+        alive = 0
+        pts_total = 0
+        try:
+            iface = self.lidar_interface
+            for path in self.sensor_paths:
+                if path is None:
+                    continue
+                try:
+                    registered = bool(
+                        hasattr(iface, "is_lidar_sensor") and iface.is_lidar_sensor(path)
+                    )
+                    data = iface.get_point_cloud_data(path)
+                    n_pts = int(np.asarray(data, dtype=float).size // 3)
+                    pts_total += n_pts
+                    # Empty buffers without registration are not "alive".
+                    if registered or n_pts > 0:
+                        alive += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        print(
+            f"[isaac] lidar warmup steps={stepped} sensors_alive={alive}/"
+            f"{sum(1 for p in self.sensor_paths if p)} pts={pts_total} "
+            f"gpu_pipeline={bool(self.isaac_cfg.sim.use_gpu_pipeline)}",
+            flush=True,
+        )
+        self._lidar_warmed = True
 
     @staticmethod
     def _translate_scale_ops(prim):
@@ -523,6 +708,9 @@ class IsaacPursuitEnv:
             # Slightly above Isaac ground so the pale pad is what you see in-map.
             ground_translate.Set(Gf.Vec3d(ground_center, ground_center, 0.02))
             ground_scale.Set(Gf.Vec3f(ground_half, ground_half, 0.02))
+            # PhysX LiDAR needs collision geometry. Without this the pad is
+            # visual-only and native scans return empty clouds in headless.
+            UsdPhysics.CollisionAPI.Apply(ground.GetPrim())
             if not self._headless:
                 self._bind_building_material(
                     stage, f"{root}/radar5_ground", (0.86, 0.89, 0.94), 1.0
@@ -530,13 +718,21 @@ class IsaacPursuitEnv:
 
             target_path = f"{root}/radar5_target"
             target = UsdGeom.Sphere.Define(stage, target_path)
-            # Original target modeling (physical diameter); GUI slightly larger for readability.
-            visual_r = float(self.cfg.target_diameter) / 2.0
+            # Collision / semantic sphere for PhysX LiDAR. Capture geometry still
+            # uses articulation poses + cfg.target_diameter, not this radius.
+            # At ~8–13 m range a 0.25 m sphere is often missed by 2° beams.
+            visual_r = max(float(self.cfg.target_diameter) / 2.0, 0.55)
             if not self._headless:
-                visual_r = max(visual_r, 0.45)
+                visual_r = max(visual_r, 0.65)
             target.CreateRadiusAttr(float(visual_r))
             target.CreateDisplayColorAttr([(0.92, 0.12, 0.12)])
             add_update_semantics(target.GetPrim(), "radar5_target", "class")
+            # Also stamp type=radar5_target — some Isaac builds expose the type
+            # token in get_prim_data instead of the class label / prim path.
+            try:
+                add_update_semantics(target.GetPrim(), "radar5_target", "type")
+            except Exception:
+                pass
             UsdPhysics.CollisionAPI.Apply(target.GetPrim())
             rigid = UsdPhysics.RigidBodyAPI.Apply(target.GetPrim())
             rigid.CreateKinematicEnabledAttr(True)
@@ -858,8 +1054,8 @@ class IsaacPursuitEnv:
         required_distance = float(np.partition(distances[active], required - 1)[required - 1])
         return float(max(required_distance - self.cfg.capture_radius, 0.0))
 
-    def _physical_state_batch(self):
-        """Radar5 pursuer states in env-local frames, shape (N, 3, 13).
+    def _physical_state_batch(self, *, include_evader: bool = False):
+        """Radar5 pursuer states ``(N, n_uavs, 13)``; optional full PhysX fleet.
 
         Uses ``check_nan=False`` so one bad clone cannot abort the whole batch;
         callers recover via :meth:`_corrupt_env_mask`. Non-finite OmniDrones
@@ -867,31 +1063,38 @@ class IsaacPursuitEnv:
         """
         from experiments.radar5_frozen_transfer_v1.state_adapter import omnidrones_state_to_radar5
 
+        n_phys = int(self._n_physics_drones)
         state = self.sim_env.drone.get_state(check_nan=False)
         if isinstance(state, torch.Tensor):
             raw = state.detach()
-            if not torch.isfinite(raw).all():
-                # Convert finite envs normally; leave corrupt envs as NaN markers.
-                raw_np = raw.detach().cpu().numpy()
-            else:
-                raw_np = None
-                converted = omnidrones_state_to_radar5(state)
-                return np.asarray(converted, dtype=np.float64).reshape(
-                    self.num_envs, self.cfg.n_uavs, 13
+            if torch.isfinite(raw).all():
+                converted = omnidrones_state_to_radar5(raw)
+                full = np.asarray(converted, dtype=np.float64).reshape(
+                    self.num_envs, n_phys, 13
                 )
+                self._last_full_physics = full
+                return full if include_evader else full[:, : int(self.cfg.n_uavs)]
+            raw_np = raw.detach().cpu().numpy()
         else:
             raw_np = np.asarray(state)
-        raw_np = raw_np.reshape(self.num_envs, self.cfg.n_uavs, -1)
-        out = np.full((self.num_envs, self.cfg.n_uavs, 13), np.nan, dtype=np.float64)
+        raw_np = raw_np.reshape(self.num_envs, n_phys, -1)
+        full = np.full((self.num_envs, n_phys, 13), np.nan, dtype=np.float64)
         for env_index in range(self.num_envs):
             row = raw_np[env_index]
             if not np.isfinite(row).all():
                 continue
             try:
-                out[env_index] = omnidrones_state_to_radar5(row)
+                full[env_index] = omnidrones_state_to_radar5(row)
             except ValueError:
                 continue
-        return out
+        self._last_full_physics = full
+        return full if include_evader else full[:, : int(self.cfg.n_uavs)]
+
+    def _evader_state_batch(self):
+        if not self._physx_closed_loop:
+            return np.full((self.num_envs, 13), np.nan, dtype=np.float64)
+        full = self._physical_state_batch(include_evader=True)
+        return full[:, int(self._evader_drone_index)]
 
     def _physical_state(self, env_index: int = 0):
         return self._physical_state_batch()[env_index]
@@ -923,39 +1126,128 @@ class IsaacPursuitEnv:
         return batch
 
     def _target_position(self, env_index: int = 0):
+        if self._physx_closed_loop:
+            evader = self._evader_state_batch()[env_index]
+            if np.isfinite(evader).all():
+                return np.asarray(evader[:3], dtype=np.float64)
         env = self.bridges[env_index].env
         return np.asarray([*env.dynamic_targets[0], env.target_altitudes[0]], dtype=np.float64)
 
     def _write_target_pose(self, env_index: int | None = None):
+        """HUD sphere only. In physx_closed_loop this mirrors PhysX — never drives it."""
         from pxr import Gf
 
+        if not getattr(self, "_target_translates", None):
+            return
         indices = range(self.num_envs) if env_index is None else (env_index,)
         for index in indices:
             self._target_translates[index].Set(Gf.Vec3d(*self._target_position(index).tolist()))
 
-    def _read_native_lidar(self):
+    def _sync_targets_from_physics(self, full_batch=None):
+        if not self._physx_closed_loop:
+            return
+        if full_batch is None:
+            full_batch = self._physical_state_batch(include_evader=True)
+        idx = int(self._evader_drone_index)
+        for env_index, bridge in enumerate(self.bridges):
+            row = full_batch[env_index, idx]
+            if not np.isfinite(row).all():
+                continue
+            bridge.sync_target_from_physics(row[:3], row[3:6])
+
+    def _sync_world_lidar_poses(self, batch=None) -> None:
+        """Move world-fixed LiDAR Xforms onto current pursuer poses (env frame)."""
+        ops = getattr(self, "_lidar_pose_ops", None)
+        if not ops:
+            return
+        from pxr import Gf
+
+        if batch is None:
+            batch = self._physical_state_batch()
+        for env_index in range(self.num_envs):
+            physical = batch[env_index]
+            if not np.isfinite(physical).all():
+                continue
+            for drone_index in range(self.cfg.n_uavs):
+                slot = env_index * self.cfg.n_uavs + drone_index
+                if slot >= len(ops) or ops[slot] is None:
+                    continue
+                translate, orient = ops[slot]
+                pos = physical[drone_index, :3]
+                quat = physical[drone_index, 6:10]  # wxyz
+                try:
+                    translate.Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+                    orient.Set(
+                        Gf.Quatf(
+                            float(quat[0]),
+                            float(quat[1]),
+                            float(quat[2]),
+                            float(quat[3]),
+                        )
+                    )
+                except Exception:
+                    pass
+
+    def _read_native_lidar(self, env_index: int | None = None):
+        """Read PhysX LiDAR into Radar5 bridges.
+
+        Call **before** ``bridge.advance()`` / ``observe`` so the decision sees
+        the current scan. ``env_index=None`` updates every parallel env.
+        """
         if not self._native_lidar_enabled:
             self._last_native_scan = None
-            self.bridges[0].clear_native_sensor_scan()
+            for bridge in self.bridges:
+                bridge.clear_native_sensor_scan()
+            return
+        if not getattr(self, "_lidar_warmed", False):
+            for bridge in self.bridges:
+                bridge.clear_native_sensor_scan()
             return
         from experiments.radar5_frozen_transfer_v1.pursuit_kinematics import quaternion_to_rotation
 
-        physical = self._physical_state(0)
-        positions = physical[:, :3]
-        rotations = np.stack([quaternion_to_rotation(row[6:10]) for row in physical])
-        scan = self.lidars[0].read_native_scan(
-            sim_time=float(self._steps[0]) * self.cfg.decision_dt,
-            lidar_interface=self.lidar_interface,
-            sensor_paths=self.sensor_paths[: self.cfg.n_uavs],
-            sensor_origins=positions,
-            sensor_rotations=rotations,
-            target_prim_tokens=("radar5_target",),
-        )
-        self._last_native_scan = scan
-        if scan.get("sensor_available", False):
-            self.bridges[0].set_native_sensor_scan(scan)
-        else:
-            self.bridges[0].clear_native_sensor_scan()
+        indices = range(self.num_envs) if env_index is None else (int(env_index),)
+        batch = self._physical_state_batch()
+        self._sync_world_lidar_poses(batch)
+        last = None
+        for index in indices:
+            physical = batch[index]
+            if not np.isfinite(physical).all():
+                self.bridges[index].clear_native_sensor_scan()
+                continue
+            positions = physical[:, :3]
+            rotations = np.stack([quaternion_to_rotation(row[6:10]) for row in physical])
+            start = index * self.cfg.n_uavs
+            paths = self.sensor_paths[start : start + self.cfg.n_uavs]
+            # Prefer semantic sphere (HUD mirrors PhysX target); also accept
+            # hummi/evader prim names if the sphere is absent.
+            tokens = ("radar5_target", "Hummingbird", "hummingbird", "evader")
+            try:
+                scan = self.lidars[index].read_native_scan(
+                    sim_time=float(self._steps[index]) * self.cfg.decision_dt,
+                    lidar_interface=self.lidar_interface,
+                    sensor_paths=paths,
+                    sensor_origins=positions,
+                    sensor_rotations=rotations,
+                    target_prim_tokens=tokens,
+                )
+            except (RuntimeError, ValueError) as exc:
+                self.bridges[index].clear_native_sensor_scan()
+                if index == 0:
+                    print(f"[isaac] native lidar env={index}: {exc}", flush=True)
+                continue
+            last = scan
+            # Prefer geometric fallback when reads fail, or when the PhysX
+            # lidar returns no semantic target hits. Empty-but-"available"
+            # native masks previously blinded FRPN/RL (0 detections forever).
+            usable = bool(scan.get("sensor_available", False))
+            any_hit = bool(np.any(scan.get("visible"))) if scan.get("visible") is not None else False
+            if usable and not any_hit:
+                usable = False
+            if usable:
+                self.bridges[index].set_native_sensor_scan(scan)
+            else:
+                self.bridges[index].clear_native_sensor_scan()
+        self._last_native_scan = last
 
     def _clear_drone_dynamics(self, env_ids=None):
         """Zero drone buffers without MultirotorBase._reset_idx (throttle shape bug)."""
@@ -1010,12 +1302,24 @@ class IsaacPursuitEnv:
             env_indices = list(range(self.num_envs))
         env_ids = torch.as_tensor(env_indices, device=self.sim_env.device, dtype=torch.long)
         offsets = self._env_offsets()[env_ids].unsqueeze(1)  # (K, 1, 3)
+        n_phys = int(self._n_physics_drones)
         locals_pos = []
         locals_quat = []
         for index in env_indices:
             physical = np.asarray(self.bridges[index].env.quadrotor_states, dtype=np.float64)
-            locals_pos.append(physical[:, :3])
-            locals_quat.append(physical[:, 6:10])
+            pos = physical[:, :3].copy()
+            quat = physical[:, 6:10].copy()
+            if n_phys > self.cfg.n_uavs:
+                # Pad evader from Radar5 target truth (recovery / replay only).
+                env = self.bridges[index].env
+                evader_pos = np.array(
+                    [*env.dynamic_targets[0], env.target_altitudes[0]], dtype=np.float64
+                )
+                evader_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                pos = np.vstack([pos, evader_pos[None, :]])
+                quat = np.vstack([quat, evader_quat[None, :]])
+            locals_pos.append(pos)
+            locals_quat.append(quat)
         positions = (
             torch.as_tensor(np.stack(locals_pos), dtype=torch.float32, device=self.sim_env.device)
             + offsets
@@ -1025,7 +1329,7 @@ class IsaacPursuitEnv:
         )
         self.sim_env.drone.set_world_poses(positions, orientations, env_ids)
         self.sim_env.drone.set_velocities(
-            torch.zeros((len(env_indices), self.cfg.n_uavs, 6), device=self.sim_env.device),
+            torch.zeros((len(env_indices), n_phys, 6), device=self.sim_env.device),
             env_ids,
         )
         self._clear_drone_dynamics(env_ids)
@@ -1104,6 +1408,23 @@ class IsaacPursuitEnv:
         except Exception:
             pass
         self._sync_bridge()
+        try:
+            self._read_native_lidar()
+        except (RuntimeError, ValueError):
+            self._last_native_scan = None
+            for bridge in self.bridges:
+                bridge.clear_native_sensor_scan()
+        # Warm KF tracks from the post-reset geometric/native scan. Without this,
+        # FRPN/MPC station-keep on step 0 (track.initialized=False → act_norm=0).
+        # Use belief update only — bridge.advance() would kinematically nudge
+        # Radar5 pursuer state and desync it from PhysX.
+        for env_index in env_indices:
+            try:
+                if not self._native_lidar_enabled or self.bridges[env_index].env._external_sensor_scan is None:
+                    self.bridges[env_index].clear_native_sensor_scan()
+                self.bridges[env_index].env._update_target_beliefs(force=True)
+            except Exception as exc:
+                print(f"[isaac] track warmup env={env_index} soft-fail: {exc}", flush=True)
         if hasattr(self, "_physical_potential"):
             for env_index in env_indices:
                 try:
@@ -1112,12 +1433,6 @@ class IsaacPursuitEnv:
                     )
                 except Exception:
                     self._physical_potential[env_index] = 0.0
-        if 0 in env_indices:
-            try:
-                self._read_native_lidar()
-            except (RuntimeError, ValueError):
-                self._last_native_scan = None
-                self.bridges[0].clear_native_sensor_scan()
 
     def reset(self, seed=None, seeds=None):
         """Reset all scenes.
@@ -1139,6 +1454,7 @@ class IsaacPursuitEnv:
         elif hasattr(self.sim_env, "progress_buf"):
             self.sim_env.progress_buf.zero_()
         self._reset_env_indices(list(range(self.num_envs)), seeds=seeds)
+        self._evader_alt_hold = float(self.cfg.initial_altitude)
         self._needs_reset = False
         observations = [bridge.observe() for bridge in self.bridges]
         return observations if vector_api else observations[0]
@@ -1169,8 +1485,213 @@ class IsaacPursuitEnv:
             raise ValueError("Isaac pursuit action must be finite")
         return action, False
 
+    def _clamp_fleet_speeds(self, velocity_cmds=None) -> None:
+        """Clamp PhysX lin/ang velocities to configured flight envelopes.
+
+        For pure closed-loop the 4th Lee body previously ran away at
+        ``target_speed * 2.5`` with unbounded climb. When ``velocity_cmds`` is
+        provided we also inject the commanded evader linvel (governor) so the
+        articulation stays a PhysX body without relying on Lee vertical track.
+        """
+        try:
+            vel = self.sim_env.drone.get_velocities(True)
+        except Exception:
+            return
+        if not torch.is_tensor(vel):
+            return
+        n_phys = int(self._n_physics_drones)
+        if vel.ndim == 2:
+            vel = vel.reshape(self.num_envs, n_phys, -1)
+        if vel.shape[-1] < 3:
+            return
+        max_p = float(self.cfg.max_horizontal_velocity) * 2.5
+        # Evader command is derated to 0.75 * target_speed in step_joint; allow
+        # only a small overshoot for Lee/injection noise.
+        max_e = float(self.cfg.target_speed) * 0.75 * 1.15
+        max_ang = 8.0
+        max_ev_z = float(getattr(self.cfg, "target_vertical_speed", 0.8) or 0.8)
+        lin = vel[..., :3]
+        speed = torch.linalg.norm(lin, dim=-1, keepdim=True).clamp_min(1e-6)
+        limits = torch.full(
+            (self.num_envs, n_phys, 1),
+            max_p,
+            device=vel.device,
+            dtype=vel.dtype,
+        )
+        eidx = int(self._evader_drone_index) if self._evader_drone_index is not None else None
+        if self._physx_closed_loop and eidx is not None:
+            limits[:, eidx, :] = max_e
+        scale = torch.clamp(limits / speed, max=1.0)
+        vel = vel.clone()
+        vel[..., :3] = lin * scale
+        if self._physx_closed_loop and eidx is not None:
+            # Hard-limit vertical channel independently of horizontal speed budget.
+            vel[:, eidx, 2] = torch.clamp(vel[:, eidx, 2], -max_ev_z, max_ev_z)
+            if velocity_cmds is not None:
+                cmd = torch.as_tensor(
+                    velocity_cmds, dtype=vel.dtype, device=vel.device
+                )
+                if cmd.ndim == 2:
+                    cmd = cmd.reshape(self.num_envs, n_phys, 3)
+                # Inject commanded linvel on the evader — Lee motors still run,
+                # but tracked speed matches the Radar5 occlusion policy.
+                vel[:, eidx, :3] = cmd[:, eidx, :3]
+                vel[:, eidx, 2] = torch.clamp(vel[:, eidx, 2], -max_ev_z, max_ev_z)
+                h = torch.linalg.norm(vel[:, eidx, :2], dim=-1, keepdim=True).clamp_min(1e-6)
+                vel[:, eidx, :2] = vel[:, eidx, :2] * torch.clamp(
+                    (max_e * 0.999) / h, max=1.0
+                )
+        if vel.shape[-1] >= 6:
+            ang = vel[..., 3:6]
+            ang_spd = torch.linalg.norm(ang, dim=-1, keepdim=True).clamp_min(1e-6)
+            vel[..., 3:6] = ang * torch.clamp(max_ang / ang_spd, max=1.0)
+            if self._physx_closed_loop and eidx is not None:
+                vel[:, eidx, 3:6] = 0.0
+        env_ids = torch.arange(self.num_envs, device=self.sim_env.device, dtype=torch.long)
+        try:
+            self.sim_env.drone.set_velocities(vel, env_ids)
+        except Exception:
+            try:
+                self.sim_env.drone.set_velocities(vel.reshape(self.num_envs * n_phys, -1))
+            except Exception:
+                pass
+        # Contain altitude: Lee vertical channel still drifts the evader to z≫max.
+        if not self._physx_closed_loop:
+            return
+        try:
+            pos_w, ori_w = self.sim_env.drone.get_world_poses(True)
+        except Exception:
+            return
+        if pos_w.ndim == 2:
+            pos_w = pos_w.reshape(self.num_envs, n_phys, 3)
+            ori_w = ori_w.reshape(self.num_envs, n_phys, 4)
+        offsets = self._env_offsets().reshape(self.num_envs, 1, 3)
+        local = pos_w - offsets
+        z_min = float(self.cfg.min_altitude)
+        z_max = float(self.cfg.max_altitude)
+        z = local[..., 2:3]
+        out = (z < z_min) | (z > z_max)
+        if eidx is not None:
+            # Always snap the closed-loop evader into the band (even if pursuers
+            # are fine) — soft any() over the whole fleet previously let a
+            # single in-band pursuer hide an out-of-band evader when shapes
+            # mismatched, and GPU pose writes are cheap for N=1.
+            e_z = local[:, eidx, 2]
+            e_out = (e_z < z_min) | (e_z > z_max)
+            if bool(e_out.any().item()) or bool(out.any().item()):
+                local = local.clone()
+                local[..., 2:3] = torch.clamp(z, z_min, z_max)
+                # Kill residual climb/descent into the wall.
+                try:
+                    vel2 = self.sim_env.drone.get_velocities(True)
+                    if vel2.ndim == 2:
+                        vel2 = vel2.reshape(self.num_envs, n_phys, -1)
+                    vel2 = vel2.clone()
+                    hit_low = local[:, eidx, 2] <= z_min + 1e-3
+                    hit_high = local[:, eidx, 2] >= z_max - 1e-3
+                    if bool(hit_low.any().item()):
+                        vel2[hit_low, eidx, 2] = torch.clamp(vel2[hit_low, eidx, 2], min=0.0)
+                    if bool(hit_high.any().item()):
+                        vel2[hit_high, eidx, 2] = torch.clamp(vel2[hit_high, eidx, 2], max=0.0)
+                    self.sim_env.drone.set_velocities(vel2, env_ids)
+                except Exception:
+                    pass
+                try:
+                    self.sim_env.drone.set_world_poses(local + offsets, ori_w, env_ids)
+                except Exception:
+                    pass
+        elif bool(out.any().item()):
+            local = local.clone()
+            local[..., 2:3] = torch.clamp(z, z_min, z_max)
+            try:
+                self.sim_env.drone.set_world_poses(local + offsets, ori_w, env_ids)
+            except Exception:
+                pass
+
+    def _integrate_kinematic_evader(self, velocity_cmds: np.ndarray) -> None:
+        """Advance only the PhysX evader prim by exact velocity integration.
+
+        Pursuer articulations are left untouched (Lee/PhysX authority). Rewriting
+        the whole fleet each step previously corrupted pursuer tracking.
+        """
+        if not self._physx_closed_loop or not self._kinematic_evader:
+            return
+        cmds = np.asarray(velocity_cmds, dtype=np.float64).reshape(self.num_envs, 3)
+        dt = float(self.cfg.decision_dt)
+        idx = int(self._evader_drone_index)
+        n_phys = int(self._n_physics_drones)
+        env_ids = torch.arange(self.num_envs, device=self.sim_env.device, dtype=torch.long)
+        offsets = self._env_offsets()[env_ids]  # (N, 3)
+        # Read the live fleet pose, then overwrite only the evader slot.
+        # OmniDrones get_world_poses(clone: bool) — never pass env_ids here
+        # (that was interpreted as clone=Tensor and crashed when num_envs>1).
+        pos_w, ori_w = self.sim_env.drone.get_world_poses(True)
+        if pos_w.ndim == 2:
+            pos_w = pos_w.reshape(self.num_envs, n_phys, 3)
+            ori_w = ori_w.reshape(self.num_envs, n_phys, 4)
+        try:
+            vel_w = self.sim_env.drone.get_velocities(True)
+            if vel_w.ndim == 2:
+                vel_w = vel_w.reshape(self.num_envs, n_phys, -1)
+        except Exception:
+            vel_w = torch.zeros(
+                (self.num_envs, n_phys, 6), device=self.sim_env.device, dtype=torch.float32
+            )
+
+        full = self._physical_state_batch(include_evader=True)
+        for env_index in range(self.num_envs):
+            cur = full[env_index, idx, :3]
+            if not np.isfinite(cur).all():
+                bridge = self.bridges[env_index].env
+                cur = np.array(
+                    [*bridge.dynamic_targets[0], bridge.target_altitudes[0]],
+                    dtype=np.float64,
+                )
+            nxt = cur + cmds[env_index] * dt
+            nxt[0] = float(np.clip(nxt[0], 0.5, float(self.cfg.grid_size) - 0.5))
+            nxt[1] = float(np.clip(nxt[1], 0.5, float(self.cfg.grid_size) - 0.5))
+            nxt[2] = float(
+                np.clip(nxt[2], float(self.cfg.min_altitude), float(self.cfg.max_altitude))
+            )
+            pos_w[env_index, idx] = (
+                torch.as_tensor(nxt, dtype=torch.float32, device=self.sim_env.device)
+                + offsets[env_index]
+            )
+            ori_w[env_index, idx] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=self.sim_env.device
+            )
+            if vel_w.shape[-1] >= 3:
+                vel_w[env_index, idx, :3] = torch.as_tensor(
+                    cmds[env_index], dtype=torch.float32, device=self.sim_env.device
+                )
+                if vel_w.shape[-1] >= 6:
+                    vel_w[env_index, idx, 3:6] = 0.0
+
+        self.sim_env.drone.set_world_poses(pos_w, ori_w, env_ids)
+        self.sim_env.drone.set_velocities(vel_w, env_ids)
+        try:
+            if hasattr(self.sim_env, "sim") and hasattr(self.sim_env.sim, "forward"):
+                self.sim_env.sim.forward()
+        except Exception:
+            pass
+
     def _step_physics_batch(self, velocity_batch, yaw_batch):
-        """Advance all envs one decision step with batched Lee velocity tracking."""
+        """Advance all envs one decision step with batched Lee velocity tracking.
+
+        ``velocity_batch`` / ``yaw_batch`` are sized to ``_n_physics_drones``
+        (3 hybrid, 4 closed-loop with last slot = evader).
+        """
+        n_phys = int(self._n_physics_drones)
+        velocity_batch = np.asarray(velocity_batch, dtype=np.float32)
+        yaw_batch = np.asarray(yaw_batch, dtype=np.float32)
+        if velocity_batch.shape != (self.num_envs, n_phys, 3):
+            raise ValueError(
+                f"velocity_batch must be {(self.num_envs, n_phys, 3)}; got {velocity_batch.shape}"
+            )
+        if yaw_batch.shape != (self.num_envs, n_phys):
+            raise ValueError(
+                f"yaw_batch must be {(self.num_envs, n_phys)}; got {yaw_batch.shape}"
+            )
         velocity_tensor = torch.as_tensor(
             np.nan_to_num(velocity_batch, nan=0.0, posinf=0.0, neginf=0.0),
             dtype=torch.float32,
@@ -1182,6 +1703,17 @@ class IsaacPursuitEnv:
             device=self.sim_env.device,
         )
         physics_steps = max(1, round(self.cfg.decision_dt / self.physics_dt))
+        # Altitude hold: current-z position setpoints give Lee zero vertical
+        # position error, so a bad vz channel drifts the fleet to the floor
+        # (pursuers) or ceiling (evader). Pin every body to the hold altitude.
+        hold_z = float(
+            getattr(self, "_evader_alt_hold", None) or self.cfg.initial_altitude
+        )
+        eidx = (
+            int(self._evader_drone_index)
+            if self._physx_closed_loop and self._evader_drone_index is not None
+            else None
+        )
         for _ in range(physics_steps):
             state = self.sim_env.drone.get_state(check_nan=False)
             # Hold current xyz as position setpoints so Lee tracks velocity only.
@@ -1189,11 +1721,24 @@ class IsaacPursuitEnv:
             if not torch.isfinite(state).all():
                 state = torch.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
             target_pos = state[..., :3].clone()
+            target_pos[..., 2] = hold_z
+            # Soft-dampen commanded vertical rates so FRPN/MPC los terms cannot
+            # dive the fleet into the ground plane.
+            vel_cmd = velocity_tensor
+            if self._physx_closed_loop:
+                max_vz_p = float(getattr(self.cfg, "max_vertical_velocity", None) or 0.8)
+                max_vz_e = float(getattr(self.cfg, "target_vertical_speed", 0.8) or 0.8)
+                vel_cmd = velocity_tensor.clone()
+                vel_cmd[..., 2] = torch.clamp(vel_cmd[..., 2], -max_vz_p, max_vz_p)
+                if eidx is not None:
+                    vel_cmd[:, eidx, 2] = torch.clamp(
+                        vel_cmd[:, eidx, 2], -max_vz_e, max_vz_e
+                    )
             with torch.no_grad():
                 motor_action = self.sim_env.controller.compute(
                     state[..., :13],
                     target_pos=target_pos,
-                    target_vel=velocity_tensor,
+                    target_vel=vel_cmd,
                     target_yaw=yaw_tensor,
                 ).clamp(-1.0, 1.0)
                 if not torch.isfinite(motor_action).all():
@@ -1201,6 +1746,9 @@ class IsaacPursuitEnv:
                         motor_action, nan=0.0, posinf=0.0, neginf=0.0
                     ).clamp(-1.0, 1.0)
             self.td = self.sim_env.step(self.td.set(("agents", "action"), motor_action))
+            # Hard speed governor: Lee/PhysX occasionally runaway on the 4th
+            # body; clamp + inject commanded evader linvel every physics substep.
+            self._clamp_fleet_speeds(velocity_cmds=vel_cmd if self._physx_closed_loop else velocity_tensor)
 
     def _gap_potential(self, gap):
         scale = max(float(self.cfg.approach_distance_scale), 1e-6)
@@ -1344,8 +1892,12 @@ class IsaacPursuitEnv:
         from experiments.radar5_frozen_transfer_v1.sim2real_contract import policy_action_to_setpoint
 
         self._sync_bridge()
-        velocity_batch = np.zeros((self.num_envs, self.cfg.n_uavs, 3), dtype=np.float32)
-        yaw_batch = np.zeros((self.num_envs, self.cfg.n_uavs), dtype=np.float32)
+        if self._physx_closed_loop:
+            self._sync_targets_from_physics()
+        n_phys = int(self._n_physics_drones)
+        velocity_batch = np.zeros((self.num_envs, n_phys, 3), dtype=np.float32)
+        yaw_batch = np.zeros((self.num_envs, n_phys), dtype=np.float32)
+        evader_cmd = np.zeros((self.num_envs, 3), dtype=np.float32)
         safety_all = []
         for env_index, bridge in enumerate(self.bridges):
             measured_yaw = np.asarray(
@@ -1361,13 +1913,52 @@ class IsaacPursuitEnv:
                 max_yaw_rate=self.cfg.max_reference_yaw_rate,
             )
             requested_velocity, safety_reasons = bridge.filter_references(requested_velocity)
-            velocity_batch[env_index] = requested_velocity.astype(np.float32)
-            yaw_batch[env_index] = np.asarray(target_yaw, dtype=np.float32)
+            velocity_batch[env_index, : self.cfg.n_uavs] = requested_velocity.astype(np.float32)
+            yaw_batch[env_index, : self.cfg.n_uavs] = np.asarray(target_yaw, dtype=np.float32)
+            if self._physx_closed_loop:
+                evader_vel = bridge.env.desired_evader_world_velocity(0).astype(np.float32)
+                # Clamp to configured target speeds, then derate horizontal speed so
+                # pursuer Lee lag can still close for dual-capture. Without this,
+                # FRPN/MPC on PhysX closed stayed ~0–8% while hybrid (kinematic
+                # target) reached ~75% at the same cfg.target_speed.
+                horiz = float(np.linalg.norm(evader_vel[:2]))
+                max_h = float(self.cfg.target_speed)
+                if horiz > max_h > 0:
+                    evader_vel[:2] *= max_h / horiz
+                # 0.75 leaves pursuers (~1.48 m/s) a clear closing margin after
+                # Lee tracking loss on the 4-body Formation controller.
+                evader_vel[:2] *= 0.75
+                max_vz = float(getattr(self.cfg, "target_vertical_speed", 0.8))
+                evader_vel[2] = float(np.clip(evader_vel[2], -max_vz, max_vz))
+                if self._kinematic_evader:
+                    # Hover under Lee; pose is advanced after the physics step.
+                    velocity_batch[env_index, self._evader_drone_index] = 0.0
+                    evader_cmd[env_index] = evader_vel
+                else:
+                    velocity_batch[env_index, self._evader_drone_index] = evader_vel
+                # Hold current yaw for the evader (policy does not command yaw).
+                evader_state = self._evader_state_batch()[env_index]
+                if np.isfinite(evader_state).all():
+                    yaw_batch[env_index, self._evader_drone_index] = float(
+                        yaw_from_quaternion(evader_state[6:10])
+                    )
             safety_all.append(safety_reasons)
 
         self._step_physics_batch(velocity_batch, yaw_batch)
-        batch_states = self._physical_state_batch()
+        if self._physx_closed_loop and self._kinematic_evader:
+            self._integrate_kinematic_evader(evader_cmd)
+        full_batch = self._physical_state_batch(include_evader=self._physx_closed_loop)
+        batch_states = full_batch[:, : self.cfg.n_uavs] if self._physx_closed_loop else full_batch
         corrupt = self._corrupt_env_mask(batch_states)
+        if self._physx_closed_loop:
+            # Evader blow-ups also count as corrupt for formal headless runs.
+            evader = full_batch[:, self._evader_drone_index]
+            corrupt = corrupt | ~np.isfinite(evader).reshape(self.num_envs, -1).all(axis=1)
+            # Governor keeps |v| ≤ 1.15 * target_speed; anything above 1.5× is
+            # a real articulation blow-up worth recovering.
+            max_e = float(self.cfg.target_speed) * 1.5
+            evader_spd = np.linalg.norm(evader[:, 3:6], axis=-1)
+            corrupt = corrupt | (evader_spd > max_e)
         if np.any(corrupt):
             self._physics_fail_count += int(np.count_nonzero(corrupt))
             print(
@@ -1375,49 +1966,70 @@ class IsaacPursuitEnv:
                 f"total_fails={self._physics_fail_count}",
                 flush=True,
             )
-            # Viewport demos: recover articulations from Radar5 bridge state and
-            # continue the episode instead of truncating (avoids step-11 flash-quit).
-            if not self._headless:
-                recovered = [i for i in range(self.num_envs) if corrupt[i]]
-                self._recover_corrupt_envs(recovered)
-                batch_states = self._physical_state_batch()
-                corrupt = self._corrupt_env_mask(batch_states)
+            # Recover articulations from Radar5 bridge state and continue when
+            # possible. Truncating every Lee glitch made closed-loop FRPN/MPC
+            # collect collapse to ~0% even after kinematic-evader stabilization.
+            recovered = [i for i in range(self.num_envs) if corrupt[i]]
+            self._recover_corrupt_envs(recovered)
+            if self._physx_closed_loop and self._kinematic_evader:
+                # Re-seat the evader after pursuer recovery using the last command.
+                self._integrate_kinematic_evader(evader_cmd)
+            full_batch = self._physical_state_batch(include_evader=self._physx_closed_loop)
+            batch_states = (
+                full_batch[:, : self.cfg.n_uavs] if self._physx_closed_loop else full_batch
+            )
+            corrupt = self._corrupt_env_mask(batch_states)
+            if self._physx_closed_loop:
+                evader = full_batch[:, self._evader_drone_index]
+                corrupt = corrupt | ~np.isfinite(evader).reshape(self.num_envs, -1).all(axis=1)
         # Do not re-push world poses every step: under Direct-GPU PhysX that
         # path can re-corrupt articulations and spam recovery. Recover-only.
         self._sync_bridge(batch=batch_states)
+        if self._physx_closed_loop:
+            self._sync_targets_from_physics(full_batch)
+        # HUD sphere tracks PhysX target so semantic LiDAR can hit radar5_target.
+        self._write_target_pose()
+        # Native LiDAR must be installed before advance/observe.
+        try:
+            self._read_native_lidar()
+        except Exception as exc:
+            print(f"[isaac] native lidar batch failed: {exc}", flush=True)
+            for bridge in self.bridges:
+                bridge.clear_native_sensor_scan()
 
         results = []
         done_indices = []
         for env_index, bridge in enumerate(self.bridges):
             physics_failed = bool(corrupt[env_index])
-            # Headless: skip Radar5 on corrupt PhysX (truncate). GUI: keep advancing
-            # the chase from bridge kinematics so the target does not "freeze" and
-            # gap does not stick at the grid_size=25 sentinel.
-            if physics_failed and self._headless:
+            # Headless: truncate on corrupt PhysX. Hybrid GUI may recover;
+            # physx_closed never treats kinematic fallback as formal success.
+            if physics_failed and (self._headless or self._physx_closed_loop):
                 result = {
                     "reward": 0.0,
                     "reward_components": {},
                     "capture_success": False,
                     "terminated": False,
                     "truncated": True,
+                    "physics_recovered": False,
                     "obs": bridge.observe(),
                 }
             else:
                 if physics_failed and not self._headless:
                     # Reseat again from last finite bridge poses before advancing.
                     self._recover_corrupt_envs([env_index])
+                    result_flag_recovered = True
+                else:
+                    result_flag_recovered = False
                 result = bridge.advance()
-                self._write_target_pose(env_index)
+                result["physics_recovered"] = bool(result_flag_recovered)
                 # Pursuer states were synced before advance; do not rebuild the
                 # expensive hetero-graph observation a second time.
                 if result.get("obs") is None:
                     if not physics_failed:
                         bridge.sync_pursuers(batch_states[env_index])
                     result["obs"] = bridge.observe()
-                if env_index == 0:
-                    self._read_native_lidar()
             self._steps[env_index] += 1
-            fatal_physics = physics_failed and self._headless
+            fatal_physics = physics_failed and (self._headless or self._physx_closed_loop)
             result = self._finalize_env_result(
                 env_index, result, safety_all[env_index], physics_failed=fatal_physics
             )

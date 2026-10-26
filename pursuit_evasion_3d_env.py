@@ -777,20 +777,26 @@ class PursuitEvasion3DEnv(PursuitEvasionEnv):
 
     def _capture_geometry(self) -> tuple[bool, int, float]:
         target_xy = self.dynamic_targets[0]
+        try:
+            from capture_geometry import evaluate_capture
+        except ImportError:
+            from .capture_geometry import evaluate_capture
+
         horizontal_delta = self.positions.astype(float) - target_xy[None, :]
         dz = self.altitudes - self.target_altitudes[0]
-        distance_3d = np.sqrt(np.sum(horizontal_delta**2, axis=1) + dz**2)
-        close = np.flatnonzero(
-            (distance_3d <= self.cfg.capture_radius)
-            & (np.abs(dz) <= self.cfg.capture_vertical_tolerance)
-            & ~self.disabled_uavs
+        # Shared API is spherical; apply vertical tolerance by masking out-of-band UAVs.
+        active = ~self.disabled_uavs & (np.abs(dz) <= self.cfg.capture_vertical_tolerance)
+        pursuers = np.column_stack([self.positions.astype(float), self.altitudes.astype(float)])
+        target = np.array([*target_xy, float(self.target_altitudes[0])], dtype=float)
+        result = evaluate_capture(
+            pursuers,
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=float(self.cfg.capture_angular_span_deg),
+            active_mask=active,
         )
-        if len(close) < self.cfg.capture_required_uavs:
-            return False, len(close), 0.0
-        angles = np.sort(np.mod(np.arctan2(horizontal_delta[close, 1], horizontal_delta[close, 0]), 2 * np.pi))
-        wrapped = np.r_[angles, angles[0] + 2 * np.pi]
-        span = 2 * np.pi - float(np.max(np.diff(wrapped)))
-        return span >= np.deg2rad(self.cfg.capture_angular_span_deg), len(close), float(np.rad2deg(span))
+        return bool(result.success), int(result.close_count), float(result.angular_span_deg)
 
     def step_joint(self, search_actions: np.ndarray) -> dict:
         actions = np.asarray(search_actions, dtype=int)

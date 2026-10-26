@@ -55,10 +55,10 @@ PY
 
 prior_ready() {
   [[ -f "${DATA_ROOT}/hard_mpc_prior.pt" && -f "${DATA_ROOT}/hard_mpc_prior.json" ]] || return 1
-  python3 - "${DATA_ROOT}/hard_mpc_prior.json" <<'PY' || return 1
-import json, sys
-payload = json.load(open(sys.argv[1], encoding="utf-8"))
-raise SystemExit(0 if int(payload.get("n_episodes", 0)) >= 200 else 1)
+  python3 - "${DATA_ROOT}/hard_mpc_prior.pt" <<'PY' || return 1
+import sys
+from pursuit.data.transition_dataset import prior_is_complete
+raise SystemExit(0 if prior_is_complete(sys.argv[1], min_episodes=200, min_successes=200, allow_failures=False) else 1)
 PY
 }
 
@@ -99,6 +99,7 @@ while true; do
     if run_isaac python collect_isaac_pursuit_data.py \
       --env-config "$HARD_CFG" \
       --teacher mpc --demo-seed 2000000 --rollouts 200 \
+      --max-attempts 800 --no-keep-failures --min-successes 200 \
       --dataset "${DATA_ROOT}/hard_mpc_prior.pt"; then
       failures=0
     else

@@ -1,6 +1,64 @@
-
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-__pycache__/
-*.py[cod]
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local caches & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+
+# Isaac / OmniDrones runtime
+.cache/
+.nvidia-omniverse/
+outputs/
+*.log
+
+# Checkpoints & datasets (keep out of git; live under runs/)
+*.pt
+*.pth
+*.ckpt
+!configs/**/*.json
+
+# Backups & local scratch
+*.bak
+*.bak_*
+*.py.bak*
+isaac_pursuit_backend.py.bak*
+
+# Generated / local-only assets
+.fonts/
+_ppt_assets/
+_replay_view/
+paper_figures/__pycache__/
+scripts/__pycache__/
+
+# Ad-hoc analysis dumps (regenerate from eval JSON)
+postlc_hybrid_*.png
+postlc-hybrid-eval-analysis.canvas.tsx
+
+# OS / temp
+*.tmp
+*.temp
+/tmp/

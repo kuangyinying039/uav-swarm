@@ -188,9 +188,24 @@ def main():
         env_cfg.building_state_capacity = max(env_cfg.building_state_capacity, env_cfg.building_count)
 
     if args.mode == "collect-transitions":
+        from pursuit.data.transition_dataset import progress_path_for
+
         args.dataset.parent.mkdir(parents=True, exist_ok=True)
-        dataset = collect_teacher_transitions(env_cfg, args.demo_seed, args.rollouts, args.teacher, args.dataset)
-        torch.save(dataset, args.dataset)
+        # Never checkpoint into the final artifact path (interrupted collects used
+        # to leave a partial prior that training treated as finished).
+        progress = progress_path_for(args.dataset)
+        dataset = collect_teacher_transitions(
+            env_cfg,
+            args.demo_seed,
+            args.rollouts,
+            args.teacher,
+            progress,
+            keep_failures=False,
+            max_attempts=max(int(args.rollouts) * 4, int(args.rollouts)),
+        )
+        temporary = args.dataset.with_name(args.dataset.name + ".tmp")
+        torch.save(dataset, temporary)
+        temporary.replace(args.dataset)
         args.dataset.with_suffix(".json").write_text(json_sidecar(dataset), encoding="utf-8")
         print(json_sidecar(dataset))
         return

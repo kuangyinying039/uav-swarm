@@ -712,17 +712,20 @@ class PursuitDemoTrainer(MAPPOTrainer):
                 run_count = max(completed - int(getattr(self, "_vector_start_episode", 0)), 1)
                 eta = elapsed / run_count * max(target - completed, 0)
                 rmse = row.get("track_position_rmse", float("nan"))
+                reward = float(row.get("reward") if row.get("reward") is not None else 0.0)
+                capture = float(row.get("capture_success") or 0.0)
+                visibility = float(row.get("continuous_visibility_ratio") or 0.0)
                 print(
-                    f"[MAPPO] episode={completed}/{target} reward={row['reward']:.2f} "
-                    f"env={row.get('environment_seconds', 0.0):.2f}s "
-                    f"ppo={row.get('ppo_update_seconds', 0.0):.2f}s "
-                    f"capture={row['capture_success']:.0f} "
-                    f"first_obs_step={row['first_onboard_contact_time']} "
-                    f"visibility={row['continuous_visibility_ratio']:.3f} "
-                    f"target_losses={row['target_loss_count']} "
-                    f"capture_rate_50={np.mean([r['capture_success'] for r in history[-50:]]):.3f} "
-                    f"track_rmse={rmse:.3f} "
-                    f"entropy={row.get('entropy', float('nan')):.3f} "
+                    f"[MAPPO] episode={completed}/{target} reward={reward:.2f} "
+                    f"env={float(row.get('environment_seconds') or 0.0):.2f}s "
+                    f"ppo={float(row.get('ppo_update_seconds') or 0.0):.2f}s "
+                    f"capture={capture:.0f} "
+                    f"first_obs_step={row.get('first_onboard_contact_time')} "
+                    f"visibility={visibility:.3f} "
+                    f"target_losses={row.get('target_loss_count')} "
+                    f"capture_rate_50={np.mean([float(r.get('capture_success') or 0.0) for r in history[-50:]]):.3f} "
+                    f"track_rmse={float(rmse) if np.isfinite(rmse) else float('nan'):.3f} "
+                    f"entropy={float(row.get('entropy') if row.get('entropy') is not None else float('nan')):.3f} "
                     f"num_envs={num_envs} "
                     f"time={episode_seconds:.2f}s eta={eta / 3600:.2f}h",
                     flush=True,

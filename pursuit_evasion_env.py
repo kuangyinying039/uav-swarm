@@ -662,20 +662,45 @@ class PursuitEvasionEnv(WeakCommBeliefGraphEnv):
         )
 
     def _move_dynamic_entities(self) -> None:
+        # PhysX-closed Isaac path: compute desired velocity for the Lee command,
+        # but never integrate target pose here — PhysX is the sole authority.
+        external = bool(getattr(self, "external_target_physics", False))
         if self.cfg.dynamic_targets_enabled and not self.captured:
             for target_idx in range(self.cfg.n_targets):
                 direction = self.evader_policy.action(
                     self, target_idx, self.evader_observation(target_idx)
                 )
                 self.target_velocity[target_idx] = _unit(direction) * self.cfg.target_speed
-            self.dynamic_targets, self.target_velocity = self._move_points_avoiding_buildings(
-                self.dynamic_targets, self.target_velocity
-            )
-        if self.cfg.dynamic_obstacles_enabled:
+            if not external:
+                self.dynamic_targets, self.target_velocity = self._move_points_avoiding_buildings(
+                    self.dynamic_targets, self.target_velocity
+                )
+        if self.cfg.dynamic_obstacles_enabled and not external:
             self.obstacles, self.obstacle_velocity = self._move_points(
                 self.obstacles, self.obstacle_velocity
             )
         self.target_grid = self._target_occupancy()
+
+    def desired_evader_world_velocity(self, target_index: int = 0) -> np.ndarray:
+        """World-frame velocity command for PhysX Lee tracking (xy + optional vz)."""
+        direction = self.evader_policy.action(
+            self, target_index, self.evader_observation(target_index)
+        )
+        horizontal = _unit(direction) * float(self.cfg.target_speed)
+        vz = 0.0
+        if hasattr(self, "target_altitudes") and hasattr(self.cfg, "target_vertical_speed"):
+            # Hold near initial altitude (not mid-band): mid≈6.5 pulled the
+            # PhysX Lee body into a sustained climb when the vertical channel
+            # tracked poorly. Keep horizontal primary; soft PD on z only.
+            hold = float(getattr(self.cfg, "initial_altitude", 5.0))
+            hold = float(
+                np.clip(hold, float(self.cfg.min_altitude), float(self.cfg.max_altitude))
+            )
+            err = hold - float(self.target_altitudes[target_index])
+            vz = float(
+                np.clip(err * 0.8, -self.cfg.target_vertical_speed, self.cfg.target_vertical_speed)
+            )
+        return np.asarray([horizontal[0], horizontal[1], vz], dtype=np.float64)
 
     def _move_points_avoiding_buildings(self, points, velocity):
         dt = float(getattr(self, "current_decision_dt", self.cfg.decision_dt))
@@ -687,18 +712,28 @@ class PursuitEvasionEnv(WeakCommBeliefGraphEnv):
         return self._move_points(points, velocity)
 
     def _capture_geometry(self) -> tuple[bool, int, float]:
-        target = self.dynamic_targets[0]
-        delta = self.positions.astype(float) - target[None, :]
-        distance = np.linalg.norm(delta, axis=1)
-        close = np.flatnonzero((distance <= self.cfg.capture_radius) & ~self.disabled_uavs)
-        if len(close) < self.cfg.capture_required_uavs:
-            return False, len(close), 0.0
-        angles = np.sort(np.mod(np.arctan2(delta[close, 1], delta[close, 0]), 2 * np.pi))
-        wrapped = np.r_[angles, angles[0] + 2 * np.pi]
-        largest_gap = float(np.max(np.diff(wrapped)))
-        span = 2 * np.pi - largest_gap
-        required_span = np.deg2rad(self.cfg.capture_angular_span_deg)
-        return span >= required_span, len(close), float(np.rad2deg(span))
+        """Journal pursuit uses planar positions + angular enclose (shared API)."""
+        try:
+            from capture_geometry import evaluate_capture
+        except ImportError:
+            from .capture_geometry import evaluate_capture
+
+        target_xy = np.asarray(self.dynamic_targets[0], dtype=float)
+        # Planar journal env: lift to xyz with z=0 for the shared 3-D helper.
+        pursuers = np.column_stack(
+            [self.positions.astype(float), np.zeros(len(self.positions), dtype=float)]
+        )
+        target = np.array([target_xy[0], target_xy[1], 0.0], dtype=float)
+        # Always apply angular gate for this env (historical journal_v1 contract).
+        result = evaluate_capture(
+            pursuers,
+            target,
+            radius=float(self.cfg.capture_radius),
+            required_uavs=int(self.cfg.capture_required_uavs),
+            angular_span_deg=float(self.cfg.capture_angular_span_deg),
+            active_mask=~self.disabled_uavs,
+        )
+        return bool(result.success), int(result.close_count), float(result.angular_span_deg)
 
     def step_joint(self, search_actions: np.ndarray) -> dict:
         was_visible = bool(np.any(self.direct_visibility_mask()))

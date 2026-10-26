@@ -135,13 +135,14 @@ prior_complete() {
   local json_path="$1"
   local expected="$2"
   python - "$json_path" "$expected" <<'PY'
-import json, sys
+import sys
 from pathlib import Path
+from pursuit.data.transition_dataset import prior_is_complete
 path, expected = Path(sys.argv[1]), int(sys.argv[2])
-if not path.is_file():
-    raise SystemExit(1)
-payload = json.loads(path.read_text())
-raise SystemExit(0 if int(payload.get("n_episodes", 0)) >= expected else 1)
+# Prefer the .pt sibling when given a .json sidecar.
+pt = path.with_suffix(".pt") if path.suffix == ".json" else path
+ok = prior_is_complete(pt if pt.is_file() else path, min_episodes=expected, min_successes=expected, allow_failures=False)
+raise SystemExit(0 if ok else 1)
 PY
 }
 
@@ -154,6 +155,7 @@ phase_data() {
     run_isaac_python python collect_isaac_pursuit_data.py \
       --env-config "$HARD_CFG" \
       --teacher mpc --demo-seed 2000000 --rollouts 200 \
+      --max-attempts 800 --no-keep-failures --min-successes 200 \
       --dataset "$DATA_ROOT/hard_mpc_prior.pt"
   fi
 }

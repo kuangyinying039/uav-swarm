@@ -20,6 +20,16 @@ from quadrotor_pursuit_env import QuadrotorPursuitConfig
 LEVELS = ("nominal", "medium", "hard", "severe", "extreme")
 
 
+def _level_config_path(level: str, *, physx_closed: bool = False) -> Path:
+    """Load dual ladder JSON; prefer ``*_physx_closed`` when closed-loop eval is on."""
+    root = Path(__file__).resolve().parent / "configs/pursuit_v2"
+    if physx_closed:
+        closed = root / f"radar5_dual_{level}_physx_closed.json"
+        if closed.is_file():
+            return closed
+    return root / f"radar5_dual_{level}.json"
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--method", choices=("apf", "frpn", "mpc", "mappo", "matd3"), required=True)
@@ -66,7 +76,30 @@ def build_parser():
 
     add_isaac_display_flags(parser, default_headless=True)
     parser.add_argument("--native-lidar", action="store_true")
+    parser.add_argument(
+        "--no-native-lidar",
+        action="store_true",
+        help="Force geometric LiDAR fallback (overrides closed-loop native default)",
+    )
+    parser.add_argument(
+        "--physx-closed-loop",
+        action="store_true",
+        help="Evaluate with pure PhysX 3+1 closed loop (do not mix with hybrid postlc tables)",
+    )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Parallel Isaac scenes for evaluation (default 1). Use 4–8 when GPU allows.",
+    )
     return parser
+
+
+def _policy_action(method, action_fn, policy, env, observation, env_index: int = 0):
+    """Compute one (n_uavs, 4) action for a single parallel slot."""
+    if method in ("apf", "frpn", "mpc"):
+        return np.asarray(policy.actions(env.bridges[env_index].env), dtype=np.float32)
+    return np.asarray(action_fn(observation), dtype=np.float32)
 
 
 def _read_partial_rows(path: Path, seeds) -> dict:
@@ -152,7 +185,8 @@ def load_policy(method, checkpoint, env, device):
             raise ValueError("Checkpoint is not from the dual-capture reward-v5 experiment")
         if saved_env.task_mode != "pursuit_quadrotor_3d":
             raise ValueError("Checkpoint is not compatible with the Isaac quadrotor pursuit task")
-        if payload.get("demo_metadata", {}).get("execution_backend") != "isaac_physx":
+        backend = payload.get("demo_metadata", {}).get("execution_backend")
+        if backend not in ("isaac_physx", "isaac_physx_closed"):
             raise ValueError(
                 "Checkpoint is not marked as Isaac PhysX-trained; retrain it in this simulator "
                 "instead of reusing a kinematic checkpoint"
@@ -198,7 +232,8 @@ def evaluate_level(
     residual_mode="blend",
     residual_weight=0.35,
 ):
-    config_path = Path(__file__).parent / "configs/pursuit_v2" / f"radar5_dual_{level}.json"
+    physx_closed = bool(getattr(env, "_physx_closed_loop", False))
+    config_path = _level_config_path(level, physx_closed=physx_closed)
     env_config = QuadrotorPursuitConfig(**json.loads(config_path.read_text(encoding="utf-8")))
     if env_config.capture_required_uavs != 2 or env_config.execution_reward_version != 5:
         raise ValueError(f"{config_path} is not a dual-capture reward-v5 profile")
@@ -230,65 +265,191 @@ def evaluate_level(
     try:
         if hasattr(policy, "reset"):
             policy.reset(env)
-        for seed in pending:
-            episode_index = len(rows) + 1
-            observation = env.reset(seed=seed)
-            if hasattr(policy, "reset"):
-                policy.reset(env)
-            episode_return = 0.0
-            collisions = 0
-            intervention_sum = 0.0
-            closest_gap = env.minimum_capture_gap()
-            started = time.perf_counter()
-            result = None
-            limit = min(env.cfg.search_steps, max_steps) if max_steps else env.cfg.search_steps
-            for step in range(limit):
-                action = np.asarray(action_fn(observation), dtype=np.float32)
-                result = env.step_joint(action)
-                observation = result["obs"]
-                episode_return += float(result["reward"])
-                collisions += int(result.get("collisions", 0))
-                intervention_sum += float(result.get("safety_correction_rate", 0.0))
-                closest_gap = min(closest_gap, float(result["minimum_capture_gap"]))
-                if result["terminated"] or result["truncated"]:
-                    break
-            if result is None:
-                raise RuntimeError("evaluation produced no environment steps")
-            rows.append({
-                "method": method_tag,
-                "level": level,
-                "seed": int(seed),
-                "captured": bool(result["capture_success"]),
-                "steps": step + 1,
-                "return": episode_return,
-                "collisions": collisions,
-                "mean_safety_correction_rate": intervention_sum / (step + 1),
-                "closest_capture_gap": closest_gap,
-                "final_capture_gap": env.minimum_capture_gap(),
-                "smoke_step_cap_hit": bool(
-                    max_steps and step + 1 >= limit
-                    and not result["terminated"] and not result["truncated"]
-                ),
-                "elapsed_seconds": time.perf_counter() - started,
-            })
-            _append_partial_row(partial_path, rows[-1])
-            if (
-                log_every <= 0
-                or episode_index == 1
-                or episode_index == len(seeds)
-                or episode_index % int(log_every) == 0
-            ):
-                running = sum(1 for row in rows if row["captured"]) / len(rows)
-                print(
-                    f"[isaac-eval] method={method_tag} level={level} "
-                    f"{episode_index}/{len(seeds)} seed={seed} "
-                    f"capture={rows[-1]['captured']} steps={step + 1} "
-                    f"rate_so_far={running:.3f}",
-                    flush=True,
-                )
+        limit = min(env.cfg.search_steps, max_steps) if max_steps else env.cfg.search_steps
+        num_envs = int(getattr(env, "num_envs", 1) or 1)
+        # Formal eval must assign held-out seeds itself; disable train-style auto-reset.
+        env._auto_reset = False
+
+        if num_envs <= 1 or not pending:
+            for seed in pending:
+                episode_index = len(rows) + 1
+                observation = env.reset(seed=seed)
+                if hasattr(policy, "reset"):
+                    policy.reset(env)
+                episode_return = 0.0
+                collisions = 0
+                intervention_sum = 0.0
+                closest_gap = float(env.minimum_capture_gap())
+                started = time.perf_counter()
+                result = None
+                for step in range(limit):
+                    action = _policy_action(method, action_fn, policy, env, observation, 0)
+                    result = env.step_joint(action)
+                    observation = result["obs"]
+                    episode_return += float(result["reward"])
+                    collisions += int(result.get("collisions", 0))
+                    intervention_sum += float(result.get("safety_correction_rate", 0.0))
+                    closest_gap = min(closest_gap, float(result["minimum_capture_gap"]))
+                    if result["terminated"] or result["truncated"]:
+                        break
+                if result is None:
+                    raise RuntimeError("evaluation produced no environment steps")
+                rows.append({
+                    "method": method_tag,
+                    "level": level,
+                    "seed": int(seed),
+                    "captured": bool(result["capture_success"]),
+                    "steps": step + 1,
+                    "return": episode_return,
+                    "collisions": collisions,
+                    "mean_safety_correction_rate": intervention_sum / (step + 1),
+                    "closest_capture_gap": closest_gap,
+                    "final_capture_gap": float(env.minimum_capture_gap()),
+                    "smoke_step_cap_hit": bool(
+                        max_steps and step + 1 >= limit
+                        and not result["terminated"] and not result["truncated"]
+                    ),
+                    "elapsed_seconds": time.perf_counter() - started,
+                })
+                _append_partial_row(partial_path, rows[-1])
+                if (
+                    log_every <= 0
+                    or episode_index == 1
+                    or episode_index == len(seeds)
+                    or episode_index % int(log_every) == 0
+                ):
+                    running = sum(1 for row in rows if row["captured"]) / len(rows)
+                    print(
+                        f"[isaac-eval] method={method_tag} level={level} "
+                        f"{episode_index}/{len(seeds)} seed={seed} "
+                        f"capture={rows[-1]['captured']} steps={step + 1} "
+                        f"rate_so_far={running:.3f}",
+                        flush=True,
+                    )
+        else:
+            print(
+                f"[isaac-eval] parallel num_envs={num_envs} method={method_tag} "
+                f"level={level} pending={len(pending)}",
+                flush=True,
+            )
+            pending_q = list(pending)
+            slot_seed = [None] * num_envs
+            slot_steps = np.zeros(num_envs, dtype=np.int32)
+            slot_return = np.zeros(num_envs, dtype=np.float64)
+            slot_collisions = np.zeros(num_envs, dtype=np.int32)
+            slot_intervention = np.zeros(num_envs, dtype=np.float64)
+            slot_closest = np.full(num_envs, np.inf, dtype=np.float64)
+            slot_started = np.zeros(num_envs, dtype=np.float64)
+            observations = [None] * num_envs
+
+            def _arm_slot(env_index: int, seed: int, observation) -> None:
+                slot_seed[env_index] = int(seed)
+                slot_steps[env_index] = 0
+                slot_return[env_index] = 0.0
+                slot_collisions[env_index] = 0
+                slot_intervention[env_index] = 0.0
+                slot_started[env_index] = time.perf_counter()
+                observations[env_index] = observation
+                if hasattr(policy, "reset"):
+                    try:
+                        policy.reset(env.bridges[env_index].env)
+                    except TypeError:
+                        policy.reset(env)
+                slot_closest[env_index] = float(env.minimum_capture_gap(env_index))
+
+            def _fill_slot(env_index: int) -> bool:
+                if not pending_q:
+                    slot_seed[env_index] = None
+                    return False
+                seed = int(pending_q.pop(0))
+                env._reset_env_indices([env_index], seeds=[seed])
+                _arm_slot(env_index, seed, env.bridges[env_index].observe())
+                return True
+
+            # One vector reset to arm physics; unused slots get a placeholder seed.
+            n_boot = min(num_envs, len(pending_q))
+            boot_seeds = [int(pending_q.pop(0)) for _ in range(n_boot)]
+            while len(boot_seeds) < num_envs:
+                boot_seeds.append(int(seeds[0]))
+            obs_list = env.reset(seeds=boot_seeds)
+            env._auto_reset = False
+            for env_index in range(num_envs):
+                if env_index < n_boot:
+                    _arm_slot(env_index, boot_seeds[env_index], obs_list[env_index])
+                else:
+                    slot_seed[env_index] = None
+
+            while any(s is not None for s in slot_seed):
+                actions = np.zeros((num_envs, env.cfg.n_uavs, 4), dtype=np.float32)
+                for env_index in range(num_envs):
+                    if slot_seed[env_index] is None:
+                        continue
+                    actions[env_index] = _policy_action(
+                        method, action_fn, policy, env, observations[env_index], env_index
+                    )
+                results = env.step_joint(actions)
+                for env_index, result in enumerate(results):
+                    if slot_seed[env_index] is None:
+                        continue
+                    slot_steps[env_index] += 1
+                    slot_return[env_index] += float(result["reward"])
+                    slot_collisions[env_index] += int(result.get("collisions", 0))
+                    slot_intervention[env_index] += float(
+                        result.get("safety_correction_rate", 0.0)
+                    )
+                    slot_closest[env_index] = min(
+                        float(slot_closest[env_index]),
+                        float(result["minimum_capture_gap"]),
+                    )
+                    observations[env_index] = result["obs"]
+                    done = bool(result["terminated"] or result["truncated"])
+                    hit_cap = bool(max_steps and slot_steps[env_index] >= limit and not done)
+                    if done or slot_steps[env_index] >= limit:
+                        steps = int(slot_steps[env_index])
+                        rows.append({
+                            "method": method_tag,
+                            "level": level,
+                            "seed": int(slot_seed[env_index]),
+                            "captured": bool(result.get("capture_success", False)),
+                            "steps": steps,
+                            "return": float(slot_return[env_index]),
+                            "collisions": int(slot_collisions[env_index]),
+                            "mean_safety_correction_rate": float(
+                                slot_intervention[env_index] / max(steps, 1)
+                            ),
+                            "closest_capture_gap": float(slot_closest[env_index]),
+                            "final_capture_gap": float(env.minimum_capture_gap(env_index)),
+                            "smoke_step_cap_hit": hit_cap,
+                            "elapsed_seconds": time.perf_counter() - float(slot_started[env_index]),
+                        })
+                        _append_partial_row(partial_path, rows[-1])
+                        episode_index = len(rows)
+                        if (
+                            log_every <= 0
+                            or episode_index == 1
+                            or episode_index == len(seeds)
+                            or episode_index % int(log_every) == 0
+                        ):
+                            running = sum(1 for row in rows if row["captured"]) / len(rows)
+                            print(
+                                f"[isaac-eval] method={method_tag} level={level} "
+                                f"{episode_index}/{len(seeds)} seed={rows[-1]['seed']} "
+                                f"capture={rows[-1]['captured']} steps={steps} "
+                                f"rate_so_far={running:.3f} num_envs={num_envs}",
+                                flush=True,
+                            )
+                        if not _fill_slot(env_index):
+                            slot_seed[env_index] = None
     finally:
         if hasattr(policy, "close"):
             policy.close()
+
+    # Stable seed order for summaries / resume checks.
+    by_seed = {int(row["seed"]): row for row in rows}
+    missing = [int(seed) for seed in seeds if int(seed) not in by_seed]
+    if missing:
+        raise RuntimeError(f"evaluation missing seeds: {missing[:8]}{'...' if len(missing) > 8 else ''}")
+    rows = [by_seed[int(seed)] for seed in seeds]
 
     successes = int(sum(bool(row["captured"]) for row in rows))
     count = len(rows)
@@ -353,6 +514,8 @@ def main():
         parser.error("--residual-base requires --method mappo or matd3")
     if args.residual_weight < 0.0 or args.residual_weight > 1.5:
         parser.error("--residual-weight should be in [0, 1.5]")
+    if int(args.num_envs) < 1:
+        parser.error("--num-envs must be >= 1")
 
     args.out.mkdir(parents=True, exist_ok=True)
     seeds = list(range(args.seed_start, args.seed_start + args.seed_count))
@@ -377,14 +540,23 @@ def main():
             pending_levels.append(level)
 
     if pending_levels:
-        first_path = Path(__file__).parent / "configs/pursuit_v2" / f"radar5_dual_{pending_levels[0]}.json"
+        closed = bool(getattr(args, "physx_closed_loop", False))
+        first_path = _level_config_path(pending_levels[0], physx_closed=closed)
         first_cfg = QuadrotorPursuitConfig(**json.loads(first_path.read_text(encoding="utf-8")))
         headless = resolve_headless(args)
+        if getattr(args, "no_native_lidar", False):
+            native_lidar = False
+        elif getattr(args, "native_lidar", False):
+            native_lidar = True
+        else:
+            native_lidar = None  # closed-loop defaults ON inside IsaacPursuitEnv
         env = IsaacPursuitEnv(
             first_cfg,
             seed=seeds[0],
             headless=headless,
-            native_lidar=args.native_lidar,
+            native_lidar=native_lidar,
+            physx_closed_loop=closed,
+            num_envs=int(args.num_envs),
         )
         try:
             for level in pending_levels:

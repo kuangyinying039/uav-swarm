@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import traceback
 
@@ -13,6 +14,13 @@ import torch
 from artifact_paths import artifact_path
 from pursuit.algorithms.matd3 import Matd3Config
 from quadrotor_pursuit_env import QuadrotorPursuitConfig
+
+_ISAAC_BACKENDS = frozenset({"isaac_physx", "isaac_physx_closed"})
+
+
+def _require_isaac_backend(value, what: str) -> None:
+    if value not in _ISAAC_BACKENDS:
+        raise ValueError(f"{what} must come from Isaac PhysX (got {value!r})")
 
 
 def build_parser():
@@ -92,7 +100,14 @@ def build_parser():
 
     add_isaac_display_flags(parser, default_headless=True)
     parser.add_argument("--native-lidar", action="store_true",
-                        help="Enable Isaac PhysX LiDAR; default uses the noisy geometric LiDAR model")
+                        help="Force Isaac PhysX LiDAR on (default ON for --physx-closed-loop)")
+    parser.add_argument("--no-native-lidar", action="store_true",
+                        help="Force geometric LiDAR fallback even with --physx-closed-loop")
+    parser.add_argument(
+        "--physx-closed-loop",
+        action="store_true",
+        help="Pure PhysX 3+1 closed loop (same-model evader drone); see SIM2REAL.md",
+    )
     return parser
 
 
@@ -198,13 +213,20 @@ TRAIN_DOMAINS = ("hard",)
 EVAL_DOMAINS = ("nominal", "medium", "hard", "severe", "extreme")
 
 
-def _training_mix():
+def _training_mix(*, physx_closed: bool = False):
     root = Path(__file__).resolve().parent / "configs" / "pursuit_v2"
-    return [_load_env_config(root / f"radar5_dual_{level}.json") for level in TRAIN_DOMAINS]
+    suffix = "_physx_closed" if physx_closed else ""
+    return [
+        _load_env_config(root / f"radar5_dual_{level}{suffix}.json")
+        for level in TRAIN_DOMAINS
+    ]
 
 
 def _bind_training_domains(env):
-    mix = _training_mix()
+    # Closed-loop envs must mix *_physx_closed ladder JSONs so capture_radius /
+    # building_count stay on the same contract as IsaacPursuitEnv.cfg.
+    closed = bool(getattr(env, "_physx_closed_loop", False))
+    mix = _training_mix(physx_closed=closed)
 
     def apply(episode):
         cfg = mix[int(episode) % len(mix)]
@@ -299,9 +321,12 @@ def _resolve_residual(args, variant):
         return None
     weight = float(getattr(args, "residual_weight", 0.40))
     weight_final = getattr(args, "residual_weight_final", None)
+    # MAPPO on-policy: store δ / apply base+w·δ (see PursuitDemoTrainer.set_residual).
+    # Blend is reserved for eval-time hybrids on full-action checkpoints.
+    mode = "residual" if str(variant).startswith("mappo") else "blend"
     return ResidualComposeConfig(
         base=requested,
-        mode="blend",
+        mode=mode,
         weight=weight,
         weight_final=None if weight_final is None else float(weight_final),
         weight_warmup_steps=10_000,
@@ -393,7 +418,9 @@ def _run_mappo(args, env):
         trainer.validation_seeds,
     )
     trainer.demo_metadata["train_domains"] = list(TRAIN_DOMAINS)
-    trainer.demo_metadata["execution_backend"] = "isaac_physx"
+    trainer.demo_metadata["execution_backend"] = (
+        "isaac_physx_closed" if bool(getattr(args, "physx_closed_loop", False)) else "isaac_physx"
+    )
     trainer.demo_metadata["physics_dt"] = float(env.physics_dt)
     trainer.demo_metadata["experiment_variant"] = args.variant
     trainer.demo_metadata["validation_seeds"] = list(trainer.validation_seeds)
@@ -403,8 +430,10 @@ def _run_mappo(args, env):
     resuming = False
     if args.checkpoint:
         payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        if payload.get("demo_metadata", {}).get("execution_backend") != "isaac_physx":
-            raise ValueError("Cannot resume MAPPO from a non-Isaac checkpoint")
+        _require_isaac_backend(
+            payload.get("demo_metadata", {}).get("execution_backend"),
+            "MAPPO resume checkpoint",
+        )
         if payload.get("demo_metadata", {}).get("experiment_variant") != args.variant:
             raise ValueError("Cannot resume MAPPO from a different experiment variant")
         trainer.load_checkpoint(args.checkpoint)
@@ -415,8 +444,10 @@ def _run_mappo(args, env):
         print(f"[mappo] resume episode={trainer.start_episode}/{args.episodes} from {args.checkpoint}", flush=True)
     if args.actor_init and not resuming:
         payload = torch.load(args.actor_init, map_location="cpu", weights_only=False)
-        if payload.get("demo_metadata", {}).get("execution_backend") != "isaac_physx":
-            raise ValueError("MAPPO actor initialization must come from Isaac PhysX")
+        _require_isaac_backend(
+            payload.get("demo_metadata", {}).get("execution_backend"),
+            "MAPPO actor initialization",
+        )
         source_env = QuadrotorPursuitConfig(**payload["env_config"])
         if source_env.capture_required_uavs != 2 or source_env.execution_reward_version != 5:
             raise ValueError("MAPPO actor initialization must use the dual-capture reward-v5 task")
@@ -424,7 +455,11 @@ def _run_mappo(args, env):
 
         trainer.actor.mean_actor.load_state_dict(mean_actor_state_from_checkpoint(payload))
         trainer.demo_metadata.update(payload.get("demo_metadata", {}))
-        trainer.demo_metadata["execution_backend"] = "isaac_physx"
+        trainer.demo_metadata["execution_backend"] = (
+            "isaac_physx_closed"
+            if bool(getattr(args, "physx_closed_loop", False))
+            else "isaac_physx"
+        )
         trainer.demo_metadata["actor_init"] = str(args.actor_init)
         if plus or float(getattr(trainer, "reference_kl_weight", 0.0) or 0.0) > 0.0:
             trainer.capture_reference_policy()
@@ -432,8 +467,10 @@ def _run_mappo(args, env):
         if path is None:
             continue
         dataset = torch.load(path, map_location="cpu", weights_only=False)
-        if dataset.get("execution_backend") != "isaac_physx":
-            raise ValueError(f"{path} is not an Isaac PhysX demonstration dataset")
+        _require_isaac_backend(
+            dataset.get("execution_backend"),
+            f"{path} demonstration dataset",
+        )
         recorded_config = QuadrotorPursuitConfig(**dataset["env_config"])
         if recorded_config.capture_required_uavs != 2 or recorded_config.execution_reward_version != 5:
             raise ValueError(f"{path} does not use the dual-capture reward-v5 contract")
@@ -494,14 +531,25 @@ def _run_matd3(args, env):
         return env
 
     trainer = Matd3Trainer(env_factory, config, seed=args.seed)
+
+    def _validation_action(obs, env_index=0):
+        # Match MAPPO: vectorized Isaac validation passes env_index so residual /
+        # teacher composition (if any) reads the correct clone's logic env.
+        logic = env
+        if num_envs > 1 and hasattr(env, "bridges"):
+            logic = env.bridges[int(env_index)].env
+        return trainer.deterministic_action(obs, env=logic)
+
     trainer.physical_metrics_fn = lambda: _physical_validation_metrics(
         env,
         apply_medium,
-        lambda obs: trainer.deterministic_action(obs, env=env),
+        _validation_action,
         trainer.validation_seeds,
     )
     trainer.demo_metadata["train_domains"] = list(TRAIN_DOMAINS)
-    trainer.demo_metadata["execution_backend"] = "isaac_physx"
+    trainer.demo_metadata["execution_backend"] = (
+        "isaac_physx_closed" if bool(getattr(args, "physx_closed_loop", False)) else "isaac_physx"
+    )
     trainer.demo_metadata["physics_dt"] = float(env.physics_dt)
     trainer.demo_metadata["training_seeds"] = [
         args.seed * 100_000 + episode for episode in range(args.episodes)
@@ -514,8 +562,10 @@ def _run_matd3(args, env):
     resuming = False
     if args.checkpoint:
         payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        if payload.get("demo_metadata", {}).get("execution_backend") != "isaac_physx":
-            raise ValueError("Cannot resume MATD3 from a non-Isaac checkpoint")
+        _require_isaac_backend(
+            payload.get("demo_metadata", {}).get("execution_backend"),
+            "MATD3 resume checkpoint",
+        )
         if payload.get("demo_metadata", {}).get("experiment_variant") != args.variant:
             raise ValueError("Cannot resume MATD3 from a different experiment variant")
         trainer.load_checkpoint(args.checkpoint)
@@ -523,8 +573,10 @@ def _run_matd3(args, env):
         resuming = True
     if args.actor_init:
         payload = torch.load(args.actor_init, map_location="cpu", weights_only=False)
-        if payload.get("demo_metadata", {}).get("execution_backend") != "isaac_physx":
-            raise ValueError("MATD3 actor initialization must be collected/trained in Isaac PhysX")
+        _require_isaac_backend(
+            payload.get("demo_metadata", {}).get("execution_backend"),
+            "MATD3 actor initialization",
+        )
         source_env = QuadrotorPursuitConfig(**payload["env_config"])
         if source_env.capture_required_uavs != 2 or source_env.execution_reward_version != 5:
             raise ValueError("MATD3 actor initialization must use the dual-capture reward-v5 task")
@@ -615,6 +667,7 @@ def main():
     args.budget_checkpoints = ",".join(str(x) for x in budgets) if budgets else ""
     env_cfg = _load_env_config(args.env_config)
     allowed_profiles = {f"radar5_dual_{level}.json" for level in EVAL_DOMAINS}
+    allowed_profiles |= {f"radar5_dual_{level}_physx_closed.json" for level in EVAL_DOMAINS}
     if args.env_config.name not in allowed_profiles:
         parser.error(
             "Isaac training uses the dual Radar5 profiles "
@@ -632,19 +685,30 @@ def main():
 
     headless = resolve_headless(args)
     num_envs = int(getattr(args, "num_envs", 1) or 1)
+    physx_closed = bool(getattr(args, "physx_closed_loop", False))
+    if getattr(args, "no_native_lidar", False):
+        native_lidar = False
+    elif getattr(args, "native_lidar", False):
+        native_lidar = True
+    else:
+        native_lidar = None  # closed-loop defaults ON inside IsaacPursuitEnv
     env = IsaacPursuitEnv(
         env_cfg,
         seed=args.seed,
         headless=headless,
-        native_lidar=args.native_lidar,
+        native_lidar=native_lidar,
         num_envs=num_envs,
+        physx_closed_loop=physx_closed,
     )
     backend_metadata = {
         "backend": "omnidrones_isaac_sim",
         "training_algorithm": args.algorithm,
         "scene_count": num_envs,
         "uavs_per_scene": 3,
-        "native_physx_lidar": args.native_lidar and num_envs == 1,
+        "physx_closed_loop": physx_closed,
+        "physics_drones_per_scene": int(getattr(env, "_n_physics_drones", 3)),
+        "execution_backend": "isaac_physx_closed" if physx_closed else "isaac_physx",
+        "native_physx_lidar": bool(getattr(env, "_native_lidar_enabled", False)),
         "headless": headless,
         "visualize": bool(getattr(args, "visualize", False)),
         "physics_dt": env.physics_dt,
@@ -658,15 +722,23 @@ def main():
         "num_envs": num_envs,
     }
     (args.out / "backend.json").write_text(json.dumps(backend_metadata, indent=2), encoding="utf-8")
+    # Isaac SimulationApp.close() may call os._exit(0) and mask a raised error,
+    # so track failure explicitly and force a non-zero process status afterward.
+    exit_code = 0
     try:
         print(f"[isaac-training] starting algorithm={args.algorithm} episodes={args.episodes}", flush=True)
         result = _run_mappo(args, env) if args.algorithm == "mappo" else _run_matd3(args, env)
         print(json.dumps(result, indent=2))
     except BaseException:
         traceback.print_exc()
-        raise
+        exit_code = 1
     finally:
-        env.close()
+        try:
+            env.close()
+        except Exception:
+            pass
+    if exit_code:
+        os._exit(exit_code)
 
 
 if __name__ == "__main__":
