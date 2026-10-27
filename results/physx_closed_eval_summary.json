@@ -1,0 +1,530 @@
+{
+  "tag": "isaac_dual_physx_closed",
+  "label": "Pure PhysX 3 pursuers + 1 PhysX evader (FORMAL sim table)",
+  "as_of": "2026-10-27",
+  "do_not_mix_with": [
+    "isaac_dual_postlc"
+  ],
+  "protocol": {
+    "physics": "physx_closed: 4 articulations, Lee velocity tracking, no kinematic teleport",
+    "train_domain": "hard only",
+    "train_config": "configs/pursuit_v2/radar5_dual_hard_physx_closed.json",
+    "target_diameter": 0.75,
+    "capture_radius": 1.5,
+    "capture_mode": "single_distance",
+    "capture_required_uavs": 2,
+    "pursuer_max_horizontal_velocity_hard": 1.48,
+    "sensing": "geometric MID-360 + LOS (--no-native-lidar)",
+    "eval_seed_start": 7000000,
+    "eval_seed_count": 100,
+    "num_envs_eval": 10,
+    "checkpoint_policy": "best_capture.pt",
+    "teacher_for_rl_table": "mpc",
+    "pipeline": "collect success-only MPC prior \u2192 DAgger \u2192 MATD3-A6 + MAPPO+ \u2192 ladder eval",
+    "residual_at_eval": null
+  },
+  "levels": [
+    "nominal",
+    "medium",
+    "hard",
+    "severe",
+    "extreme"
+  ],
+  "methods": {
+    "APF": {
+      "nominal": {
+        "capture_rate": 0.46,
+        "capture_rate_wilson_95": [
+          0.36560808309024106,
+          0.5573513967663177
+        ],
+        "mean_censored_steps": 200.37,
+        "mean_return": 1.5390615576538607,
+        "mean_collisions": 0.18,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.4,
+        "target_speed": 1.45,
+        "lidar_target_detection_range": 15.0
+      },
+      "medium": {
+        "capture_rate": 0.38,
+        "capture_rate_wilson_95": [
+          0.29097599252478734,
+          0.47790244704488916
+        ],
+        "mean_censored_steps": 222.16,
+        "mean_return": -11.101005491416103,
+        "mean_collisions": 0.16,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.42,
+        "target_speed": 1.46,
+        "lidar_target_detection_range": 14.0
+      },
+      "hard": {
+        "capture_rate": 0.3,
+        "capture_rate_wilson_95": [
+          0.2189488529493276,
+          0.3958485463334666
+        ],
+        "mean_censored_steps": 241.58,
+        "mean_return": -23.192721729744207,
+        "mean_collisions": 0.12,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.52,
+        "lidar_target_detection_range": 16.0
+      },
+      "severe": {
+        "capture_rate": 0.19,
+        "capture_rate_wilson_95": [
+          0.12514751509768735,
+          0.27778845379064376
+        ],
+        "mean_censored_steps": 267.01,
+        "mean_return": -39.86885570474451,
+        "mean_collisions": 0.07,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.45,
+        "target_speed": 1.72,
+        "lidar_target_detection_range": 11.0
+      },
+      "extreme": {
+        "capture_rate": 0.17,
+        "capture_rate_wilson_95": [
+          0.10893566114059931,
+          0.25548004767601123
+        ],
+        "mean_censored_steps": 267.37,
+        "mean_return": -43.22317543264612,
+        "mean_collisions": 0.13,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.76,
+        "lidar_target_detection_range": 10.5
+      }
+    },
+    "FRPN": {
+      "nominal": {
+        "capture_rate": 0.87,
+        "capture_rate_wilson_95": [
+          0.7901964855992357,
+          0.9224283257275948
+        ],
+        "mean_censored_steps": 113.24,
+        "mean_return": 69.54095755541533,
+        "mean_collisions": 0.11,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.4,
+        "target_speed": 1.45,
+        "lidar_target_detection_range": 15.0
+      },
+      "medium": {
+        "capture_rate": 0.71,
+        "capture_rate_wilson_95": [
+          0.6146110882442888,
+          0.7898516425087772
+        ],
+        "mean_censored_steps": 148.33,
+        "mean_return": 43.526653811621394,
+        "mean_collisions": 0.21,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.42,
+        "target_speed": 1.46,
+        "lidar_target_detection_range": 14.0
+      },
+      "hard": {
+        "capture_rate": 0.66,
+        "capture_rate_wilson_95": [
+          0.5627772885472462,
+          0.7453847920265184
+        ],
+        "mean_censored_steps": 172.65,
+        "mean_return": 34.69896703036854,
+        "mean_collisions": 0.19,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.52,
+        "lidar_target_detection_range": 16.0
+      },
+      "severe": {
+        "capture_rate": 0.4,
+        "capture_rate_wilson_95": [
+          0.3094012864324589,
+          0.4979974132089382
+        ],
+        "mean_censored_steps": 230.74,
+        "mean_return": -8.15714024421452,
+        "mean_collisions": 0.31,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.45,
+        "target_speed": 1.72,
+        "lidar_target_detection_range": 11.0
+      },
+      "extreme": {
+        "capture_rate": 0.38,
+        "capture_rate_wilson_95": [
+          0.29097599252478734,
+          0.47790244704488916
+        ],
+        "mean_censored_steps": 231.7,
+        "mean_return": -10.62441654026495,
+        "mean_collisions": 0.26,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.76,
+        "lidar_target_detection_range": 10.5
+      }
+    },
+    "MPC": {
+      "nominal": {
+        "capture_rate": 0.85,
+        "capture_rate_wilson_95": [
+          0.7671644040916763,
+          0.9069401471634337
+        ],
+        "mean_censored_steps": 116.71,
+        "mean_return": 66.16228767066112,
+        "mean_collisions": 0.13,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.4,
+        "target_speed": 1.45,
+        "lidar_target_detection_range": 15.0
+      },
+      "medium": {
+        "capture_rate": 0.77,
+        "capture_rate_wilson_95": [
+          0.6784561697712622,
+          0.8415673411969654
+        ],
+        "mean_censored_steps": 134.01,
+        "mean_return": 53.837464612738515,
+        "mean_collisions": 0.11,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.42,
+        "target_speed": 1.46,
+        "lidar_target_detection_range": 14.0
+      },
+      "hard": {
+        "capture_rate": 0.73,
+        "capture_rate_wilson_95": [
+          0.6356788323205499,
+          0.8073041585042365
+        ],
+        "mean_censored_steps": 151.64,
+        "mean_return": 46.91418348115325,
+        "mean_collisions": 0.13,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.52,
+        "lidar_target_detection_range": 16.0
+      },
+      "severe": {
+        "capture_rate": 0.46,
+        "capture_rate_wilson_95": [
+          0.36560808309024106,
+          0.5573513967663177
+        ],
+        "mean_censored_steps": 207.13,
+        "mean_return": 3.9800208725625117,
+        "mean_collisions": 0.13,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.45,
+        "target_speed": 1.72,
+        "lidar_target_detection_range": 11.0
+      },
+      "extreme": {
+        "capture_rate": 0.54,
+        "capture_rate_wilson_95": [
+          0.44264860323368227,
+          0.6343919169097589
+        ],
+        "mean_censored_steps": 204.85,
+        "mean_return": 16.514378479863375,
+        "mean_collisions": 0.08,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.76,
+        "lidar_target_detection_range": 10.5
+      }
+    },
+    "MAPPO+MPC": {
+      "nominal": {
+        "capture_rate": 0.76,
+        "capture_rate_wilson_95": [
+          0.6676766365018553,
+          0.8330867444305122
+        ],
+        "mean_censored_steps": 140.74,
+        "mean_return": 50.53616544224467,
+        "mean_collisions": 0.21,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.4,
+        "target_speed": 1.45,
+        "lidar_target_detection_range": 15.0
+      },
+      "medium": {
+        "capture_rate": 0.66,
+        "capture_rate_wilson_95": [
+          0.5627772885472462,
+          0.7453847920265184
+        ],
+        "mean_censored_steps": 154.72,
+        "mean_return": 35.15301786336227,
+        "mean_collisions": 0.22,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.42,
+        "target_speed": 1.46,
+        "lidar_target_detection_range": 14.0
+      },
+      "hard": {
+        "capture_rate": 0.58,
+        "capture_rate_wilson_95": [
+          0.4820648670304296,
+          0.6720161732564526
+        ],
+        "mean_censored_steps": 183.96,
+        "mean_return": 21.939530558891764,
+        "mean_collisions": 0.21,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.52,
+        "lidar_target_detection_range": 16.0
+      },
+      "severe": {
+        "capture_rate": 0.43,
+        "capture_rate_wilson_95": [
+          0.33733298524110106,
+          0.5278461045078768
+        ],
+        "mean_censored_steps": 214.49,
+        "mean_return": -1.4766640177992914,
+        "mean_collisions": 0.2,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.45,
+        "target_speed": 1.72,
+        "lidar_target_detection_range": 11.0
+      },
+      "extreme": {
+        "capture_rate": 0.39,
+        "capture_rate_wilson_95": [
+          0.3001687400639441,
+          0.4879698295415926
+        ],
+        "mean_censored_steps": 227.38,
+        "mean_return": -8.609264151781883,
+        "mean_collisions": 0.24,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.76,
+        "lidar_target_detection_range": 10.5
+      }
+    },
+    "MATD3-A6+MPC": {
+      "nominal": {
+        "capture_rate": 0.7,
+        "capture_rate_wilson_95": [
+          0.6041514536665332,
+          0.7810511470506724
+        ],
+        "mean_censored_steps": 157.44,
+        "mean_return": 40.22377125688265,
+        "mean_collisions": 0.25,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.4,
+        "target_speed": 1.45,
+        "lidar_target_detection_range": 15.0
+      },
+      "medium": {
+        "capture_rate": 0.63,
+        "capture_rate_wilson_95": [
+          0.5322052958094291,
+          0.7181763946567546
+        ],
+        "mean_censored_steps": 160.35,
+        "mean_return": 30.16302496260042,
+        "mean_collisions": 0.24,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.42,
+        "target_speed": 1.46,
+        "lidar_target_detection_range": 14.0
+      },
+      "hard": {
+        "capture_rate": 0.62,
+        "capture_rate_wilson_95": [
+          0.5220975529551107,
+          0.7090240074752127
+        ],
+        "mean_censored_steps": 176.18,
+        "mean_return": 28.38632860579209,
+        "mean_collisions": 0.21,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.52,
+        "lidar_target_detection_range": 16.0
+      },
+      "severe": {
+        "capture_rate": 0.41,
+        "capture_rate_wilson_95": [
+          0.3186731302113651,
+          0.5079856994658921
+        ],
+        "mean_censored_steps": 220.01,
+        "mean_return": -4.931420849728224,
+        "mean_collisions": 0.21,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.45,
+        "target_speed": 1.72,
+        "lidar_target_detection_range": 11.0
+      },
+      "extreme": {
+        "capture_rate": 0.42,
+        "capture_rate_wilson_95": [
+          0.3279838267435473,
+          0.5179351329695703
+        ],
+        "mean_censored_steps": 220.01,
+        "mean_return": -3.374546433394848,
+        "mean_collisions": 0.2,
+        "episodes": 100,
+        "target_diameter": 0.75,
+        "capture_radius": 1.5,
+        "max_horizontal_velocity": 1.48,
+        "target_speed": 1.76,
+        "lidar_target_detection_range": 10.5
+      }
+    }
+  },
+  "capture_rate_matrix": {
+    "APF": [
+      0.46,
+      0.38,
+      0.3,
+      0.19,
+      0.17
+    ],
+    "FRPN": [
+      0.87,
+      0.71,
+      0.66,
+      0.4,
+      0.38
+    ],
+    "MPC": [
+      0.85,
+      0.77,
+      0.73,
+      0.46,
+      0.54
+    ],
+    "MAPPO+MPC": [
+      0.76,
+      0.66,
+      0.58,
+      0.43,
+      0.39
+    ],
+    "MATD3-A6+MPC": [
+      0.7,
+      0.63,
+      0.62,
+      0.41,
+      0.42
+    ]
+  },
+  "headline": {
+    "best_hard_classical": {
+      "method": "MPC",
+      "capture_rate": 0.73
+    },
+    "best_hard_learned": {
+      "method": "MATD3-A6+MPC",
+      "capture_rate": 0.62
+    },
+    "note": "Under physx_closed with diameter=0.75, classical MPC leads hard (73%); current MPC-teacher RL (A6 62%, MAPPO 58%) does not beat its teacher. FRPN-teacher RL was not re-run on physx_closed in this table."
+  },
+  "extreme_diameter_contrast_d05": {
+    "description": "Optional A/B on extreme only with target_diameter=0.5 (capture_radius=1.0). NOT the formal ladder.",
+    "config": "configs/pursuit_v2/radar5_dual_extreme_physx_closed_d05.json",
+    "methods": {
+      "APF": {
+        "extreme": {
+          "capture_rate": 0.03,
+          "capture_rate_wilson_95": [
+            0.010254524024038925,
+            0.0845193642905276
+          ],
+          "mean_censored_steps": 294.43,
+          "mean_return": -65.95150937398415,
+          "mean_collisions": 0.14,
+          "episodes": 100,
+          "target_diameter": 0.5,
+          "capture_radius": 1.0
+        }
+      },
+      "FRPN": {
+        "extreme": {
+          "capture_rate": 0.21,
+          "capture_rate_wilson_95": [
+            0.141656540619153,
+            0.29979968834089865
+          ],
+          "mean_censored_steps": 261.33,
+          "mean_return": -38.93013841930598,
+          "mean_collisions": 0.38,
+          "episodes": 100,
+          "target_diameter": 0.5,
+          "capture_radius": 1.0
+        }
+      }
+    },
+    "status": "partial"
+  }
+}

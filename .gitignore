@@ -63,3 +63,7 @@ suite_manifest_*.json
 *.tmp
 *.temp
 /tmp/
+
+# Temporary config swaps for contrast evals
+*.bak_d075
+*.bak_d*

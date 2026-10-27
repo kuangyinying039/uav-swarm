@@ -32,13 +32,17 @@ PRIOR="${DATA_ROOT}/hard_${TEACHER}_prior.pt"
 DEMOS="${DATA_ROOT}/dagger_${TEACHER}_hard_seed11/expert_episodes.pt"
 AUX_DEMOS="${DATA_ROOT}/dagger_${TEACHER}_hard_seed11/correction_episodes.pt"
 NUM_ENVS="${NUM_ENVS:-4}"
-# Held-out validation during RL (was 10 — too noisy for best_capture / rollback).
-VAL_EPISODES="${VAL_EPISODES:-40}"
+# Held-out validation during RL. Prefer training throughput; roll back only on
+# clear drops. Override with VAL_EPISODES / VAL_INTERVAL.
+VAL_EPISODES="${VAL_EPISODES:-20}"
+VAL_INTERVAL="${VAL_INTERVAL:-250}"
 # Optional MAPPO residual-on-MPC. Default off so primary tables compare pure RL
 # against classical baselines; set RESIDUAL_BASE=mpc to enable residual RL.
 RESIDUAL_BASE="${RESIDUAL_BASE:-none}"
 RESIDUAL_WEIGHT="${RESIDUAL_WEIGHT:-0.45}"
 RESIDUAL_WEIGHT_FINAL="${RESIDUAL_WEIGHT_FINAL:-0.70}"
+# If set, resume MATD3-A6 from this checkpoint (skips critic pretrain / ep0 val).
+RESUME_CKPT="${RESUME_CKPT:-}"
 
 require() {
   local path="$1"
@@ -71,8 +75,14 @@ run_matd3() {
   local out="${OUT_ROOT}/${name}"
   local log="${LOG_DIR}/${name}.log"
   mkdir -p "$out"
-  : >"$log"
-  echo "[physx_closed] $(date -Is) start ${name} num_envs=${NUM_ENVS} teacher=${TEACHER}" | tee -a "$log"
+  local resume_args=()
+  if [[ -n "${RESUME_CKPT}" ]]; then
+    resume_args+=(--checkpoint "${RESUME_CKPT}")
+    echo "[physx_closed] $(date -Is) resume ${name} from ${RESUME_CKPT} num_envs=${NUM_ENVS} val=${VAL_EPISODES}@${VAL_INTERVAL} teacher=${TEACHER}" | tee -a "$log"
+  else
+    : >"$log"
+    echo "[physx_closed] $(date -Is) start ${name} num_envs=${NUM_ENVS} val=${VAL_EPISODES}@${VAL_INTERVAL} teacher=${TEACHER}" | tee -a "$log"
+  fi
   if ! python -u "${ROOT}/train_isaac_pursuit.py" matd3 --variant A6 \
     --num-envs "${NUM_ENVS}" \
     --env-config "$ENV_CFG" \
@@ -81,12 +91,13 @@ run_matd3() {
     --episodes 1000 \
     --seed 11 \
     --validation-episodes "${VAL_EPISODES}" \
-    --validation-interval 100 \
+    --validation-interval "${VAL_INTERVAL}" \
     --budget-checkpoints 100,300,1000 \
     --batch-size 256 \
     --hidden-dim 128 \
     --actor-init "$ACTOR_INIT" \
     --prior "$PRIOR" \
+    "${resume_args[@]}" \
     --out "$out" \
     >>"$log" 2>&1
   then
@@ -124,7 +135,7 @@ run_mappo() {
     --episodes 1000 \
     --seed 11 \
     --validation-episodes "${VAL_EPISODES}" \
-    --validation-interval 100 \
+    --validation-interval "${VAL_INTERVAL}" \
     --budget-checkpoints 100,300,1000 \
     --batch-size 256 \
     --hidden-dim 128 \

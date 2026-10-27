@@ -570,7 +570,17 @@ def _run_matd3(args, env):
             raise ValueError("Cannot resume MATD3 from a different experiment variant")
         trainer.load_checkpoint(args.checkpoint)
         trainer.cfg.episodes = args.episodes
+        # CLI validation settings win over whatever was baked into the ckpt era.
+        trainer.cfg.validation_interval = int(args.validation_interval)
+        trainer.validation_seeds = _isaac_validation_seeds(args)
+        trainer.validation_seed_bank = list(trainer.validation_seeds)
         resuming = True
+        print(
+            f"[matd3] resume episode={trainer.start_episode}/{args.episodes} "
+            f"val={len(trainer.validation_seeds)}@{trainer.cfg.validation_interval} "
+            f"from {args.checkpoint}",
+            flush=True,
+        )
     if args.actor_init:
         payload = torch.load(args.actor_init, map_location="cpu", weights_only=False)
         _require_isaac_backend(
