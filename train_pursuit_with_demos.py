@@ -178,6 +178,9 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.safeguard_patience = 2
         self.safeguard_bad_validations = 0
         self.safeguard_rollbacks = 0
+        self.max_safeguard_rollbacks = 3
+        self.early_stop = False
+        self.early_stop_reason = None
         self.min_actor_lr = 1e-5
         self.output_directory = None
         self.train_seed_bank = []
@@ -701,6 +704,13 @@ class PursuitDemoTrainer(MAPPOTrainer):
             callback = getattr(self, "on_vector_episode_complete", None)
             if callable(callback):
                 callback(completed)
+            if getattr(self, "early_stop", False):
+                print(
+                    f"[MAPPO-VEC] stopped early at episode={completed}: "
+                    f"{getattr(self, 'early_stop_reason', 'capture_collapse')}",
+                    flush=True,
+                )
+                break
 
             episode_seconds = time.perf_counter() - episode_wall
             if (
@@ -1009,6 +1019,17 @@ class PursuitDemoTrainer(MAPPOTrainer):
                 self.save_checkpoint(
                     self.output_directory / "rollback_latest.pt", episode=episode, history=self.pursuit_history
                 )
+                max_rb = int(getattr(self, "max_safeguard_rollbacks", 0) or 0)
+                if max_rb > 0 and self.safeguard_rollbacks >= max_rb:
+                    self.early_stop = True
+                    self.early_stop_reason = f"capture_rate_degradation_rollbacks>={max_rb}"
+                    self.validation_records[-1]["early_stop"] = True
+                    self.validation_records[-1]["early_stop_reason"] = self.early_stop_reason
+                    print(
+                        f"[validation] early_stop after {self.safeguard_rollbacks} rollbacks; "
+                        f"keeping best_capture.pt (rate={self.best_capture_score[0]:.3f})",
+                        flush=True,
+                    )
         else:
             self.safeguard_bad_validations = 0
         (self.output_directory / "validation.json").write_text(json.dumps(self.validation_records, indent=2), encoding="utf-8")

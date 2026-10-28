@@ -1,0 +1,266 @@
+{
+  "tag": "isaac_dual_physx_closed",
+  "label": "PhysX-closed baselines under target_diameter=0.5 (current formal ladder)",
+  "as_of": "2026-10-28T15:00:28+08:00",
+  "do_not_mix_with": [
+    "physx_closed_eval_summary.json (target_diameter=0.75 formal archive)",
+    "hybrid_postlc_eval_summary.json"
+  ],
+  "protocol": {
+    "physics": "physx_closed: 4 articulations, Lee velocity tracking",
+    "target_diameter": 0.5,
+    "capture_radius_expected": 1.0,
+    "capture_mode": "single_distance",
+    "sensing": "geometric MID-360 + LOS (--no-native-lidar)",
+    "eval_seed_start": 7000000,
+    "eval_seed_count": 100,
+    "num_envs_eval": 10,
+    "levels": [
+      "nominal",
+      "medium",
+      "hard",
+      "severe",
+      "extreme"
+    ],
+    "artifact_root": "/srv/data/projects/kyy/runs/isaac_dual_physx_closed/train/isaac_dual_eval_baselines_d05",
+    "queue_script": "queue_physx_closed_baseline_eval_d05.sh"
+  },
+  "pipeline_status": {
+    "teacher_enhance": {
+      "stage1_collect": "done (kept=240, successes=155, near_miss\u224885; prior.pt not finalized)",
+      "stage2_dagger": "done; best=dagger_round_02 val_capture=0.575; pi0_frozen.pt saved",
+      "stage3_residual_parallel_A6_MAPPO": "blocked: missing hard_mpc_prior.pt",
+      "stage4_locked_eval": "superseded by this baseline ladder for now"
+    },
+    "baseline_eval_d05": {
+      "APF": {
+        "done_levels": [
+          "nominal",
+          "medium",
+          "hard",
+          "severe",
+          "extreme"
+        ],
+        "pending_levels": [],
+        "complete": true
+      },
+      "FRPN": {
+        "done_levels": [
+          "nominal",
+          "medium",
+          "hard",
+          "severe",
+          "extreme"
+        ],
+        "pending_levels": [],
+        "complete": true
+      },
+      "MPC": {
+        "done_levels": [
+          "nominal",
+          "medium",
+          "hard",
+          "severe",
+          "extreme"
+        ],
+        "pending_levels": [],
+        "complete": true
+      },
+      "pi0_DAgger": {
+        "done_levels": [
+          "nominal",
+          "medium",
+          "hard"
+        ],
+        "pending_levels": [
+          "severe",
+          "extreme"
+        ],
+        "complete": false
+      }
+    }
+  },
+  "methods": {
+    "APF": {
+      "nominal": {
+        "capture_rate": 0.18,
+        "mean_censored_steps": 266.7,
+        "mean_return": -45.02756456567321,
+        "mean_collisions": 0.22,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "medium": {
+        "capture_rate": 0.17,
+        "mean_censored_steps": 271.5,
+        "mean_return": -45.76596451385021,
+        "mean_collisions": 0.17,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "hard": {
+        "capture_rate": 0.04,
+        "mean_censored_steps": 293.33,
+        "mean_return": -66.26226991386788,
+        "mean_collisions": 0.21,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "severe": {
+        "capture_rate": 0.08,
+        "mean_censored_steps": 285.28,
+        "mean_return": -57.4696279236626,
+        "mean_collisions": 0.07,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "extreme": {
+        "capture_rate": 0.06,
+        "mean_censored_steps": 291.63,
+        "mean_return": -61.12065856004957,
+        "mean_collisions": 0.12,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      }
+    },
+    "FRPN": {
+      "nominal": {
+        "capture_rate": 0.55,
+        "mean_censored_steps": 194.05,
+        "mean_return": 14.2771571944975,
+        "mean_collisions": 0.39,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "medium": {
+        "capture_rate": 0.57,
+        "mean_censored_steps": 189.09,
+        "mean_return": 18.38894448871616,
+        "mean_collisions": 0.35,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "hard": {
+        "capture_rate": 0.46,
+        "mean_censored_steps": 219.76,
+        "mean_return": -0.5389561936458452,
+        "mean_collisions": 0.46,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "severe": {
+        "capture_rate": 0.34,
+        "mean_censored_steps": 240.48,
+        "mean_return": -16.683548466937236,
+        "mean_collisions": 0.26,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "extreme": {
+        "capture_rate": 0.18,
+        "mean_censored_steps": 266.63,
+        "mean_return": -43.73392094918826,
+        "mean_collisions": 0.39,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      }
+    },
+    "MPC": {
+      "nominal": {
+        "capture_rate": 0.67,
+        "mean_censored_steps": 162.34,
+        "mean_return": 34.9795847096818,
+        "mean_collisions": 0.3,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "medium": {
+        "capture_rate": 0.56,
+        "mean_censored_steps": 186.84,
+        "mean_return": 17.175487422315797,
+        "mean_collisions": 0.34,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "hard": {
+        "capture_rate": 0.53,
+        "mean_censored_steps": 198.12,
+        "mean_return": 12.883786381166779,
+        "mean_collisions": 0.28,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "severe": {
+        "capture_rate": 0.37,
+        "mean_censored_steps": 243.8,
+        "mean_return": -11.982900434360998,
+        "mean_collisions": 0.15,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "extreme": {
+        "capture_rate": 0.32,
+        "mean_censored_steps": 243.79,
+        "mean_return": -19.672963094847567,
+        "mean_collisions": 0.19,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      }
+    },
+    "pi0_DAgger": {
+      "nominal": {
+        "capture_rate": 0.61,
+        "mean_censored_steps": 181.93,
+        "mean_return": 24.097705512260877,
+        "mean_collisions": 0.38,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "medium": {
+        "capture_rate": 0.52,
+        "mean_censored_steps": 197.71,
+        "mean_return": 10.19917999815326,
+        "mean_collisions": 0.37,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      },
+      "hard": {
+        "capture_rate": 0.47,
+        "mean_censored_steps": 212.35,
+        "mean_return": 3.06057838372708,
+        "mean_collisions": 0.3,
+        "episodes": 100,
+        "target_diameter": null,
+        "capture_radius": null
+      }
+    }
+  },
+  "hard_snapshot": {
+    "APF": 0.04,
+    "FRPN": 0.46,
+    "MPC": 0.53,
+    "pi0_DAgger": 0.47
+  },
+  "reference_d075_hard_archive": {
+    "APF": 0.3,
+    "FRPN": 0.66,
+    "MPC": 0.73
+  }
+}

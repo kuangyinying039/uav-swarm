@@ -194,7 +194,12 @@ def write_pursuit_outputs(folder, history, traces):
         "mean_success_capture_steps": float(np.mean(success_times)) if success_times else None,
         "mean_censored_steps": float(np.mean([r["steps"] for r in tail])) if tail else None,
         "n_episode_traces": len(traces or []),
-        "note": "Training samples, not held-out policy evaluation",
+        "note": (
+            "Training-rollout samples only — NOT for checkpoint selection. "
+            "Use held-out validation.json / best_capture.pt."
+        ),
+        "selection_checkpoint": "best_capture.pt",
+        "do_not_use_for_selection": True,
     }
     (folder / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     write_learning_chart(folder / "capture_learning.svg", history)

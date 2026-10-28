@@ -136,6 +136,8 @@ def collect_teacher_transitions(
     env_factory=None,
     execution_backend="kinematic",
     keep_failures: bool = False,
+    keep_near_misses: bool = False,
+    near_miss_gap: float = 1.5,
     max_attempts: int | None = None,
 ):
     """Collect teacher transitions until ``rollouts`` episodes are **kept**.
@@ -147,6 +149,12 @@ def collect_teacher_transitions(
     keep_failures:
         If False (default), only successful captures are kept — timeouts never
         enter the prior. If True, every rollout is kept (legacy behaviour).
+    keep_near_misses:
+        If True (and keep_failures is False), also keep unsuccessful episodes
+        whose closest capture gap fell below ``near_miss_gap``. These teach
+        recovery near the capture boundary without dumping irreversible fails.
+    near_miss_gap:
+        Minimum capture-gap threshold (metres) for near-miss retention.
     max_attempts:
         Hard cap on teacher rollouts. Defaults to ``rollouts`` when keeping
         failures, otherwise ``4 * rollouts``.
@@ -160,6 +168,8 @@ def collect_teacher_transitions(
         max_attempts = int(rollouts if keep_failures else max(rollouts * 4, rollouts))
     if max_attempts < rollouts:
         raise ValueError("max_attempts must be >= rollouts")
+    if float(near_miss_gap) <= 0.0:
+        raise ValueError("near_miss_gap must be positive")
 
     episodes, report, attempt_report = (
         _resume_teacher_progress(
@@ -189,6 +199,8 @@ def collect_teacher_transitions(
             report,
             execution_backend,
             keep_failures=keep_failures,
+            keep_near_misses=keep_near_misses,
+            near_miss_gap=near_miss_gap,
             attempt_report=attempt_report,
             complete=False,
             target_episodes=rollouts,
@@ -222,12 +234,17 @@ def collect_teacher_transitions(
         teacher = BASELINES_3D[teacher_name]()
         teacher.reset(env)
         trajectory = []
+        closest_gap = float("inf")
         for step in range(env.cfg.search_steps):
             action, labels = teacher_step(teacher, env)
             active = ~env.disabled_uavs
             result = env.step_joint(action)
             trajectory.append(make_transition(obs, action, result, labels, active, ~env.disabled_uavs))
             obs = result["obs"]
+            try:
+                closest_gap = min(closest_gap, float(env.minimum_capture_gap()))
+            except Exception:
+                pass
             if (step + 1) % 50 == 0:
                 print(
                     f"[transitions] seed={seed} step={step+1} capture_gap={env.minimum_capture_gap():.3f}",
@@ -236,10 +253,18 @@ def collect_teacher_transitions(
             if result["terminated"] or result["truncated"]:
                 break
         success = bool(result.get("capture_success", False))
-        kept = bool(success or keep_failures)
+        near_miss = (
+            (not success)
+            and bool(keep_near_misses)
+            and np.isfinite(closest_gap)
+            and float(closest_gap) <= float(near_miss_gap)
+        )
+        kept = bool(success or keep_failures or near_miss)
         attempt_row = {
             "seed": seed,
             "success": success,
+            "near_miss": bool(near_miss),
+            "closest_capture_gap": None if not np.isfinite(closest_gap) else float(closest_gap),
             "steps": len(trajectory),
             "kept": kept,
         }
@@ -249,8 +274,10 @@ def collect_teacher_transitions(
             report.append(attempt_row)
         save_progress()
         print(
-            f"[transitions] seed={seed} success={success} kept_flag={kept} "
-            f"stored={len(episodes)}/{rollouts} attempts={attempts_used}/{max_attempts}",
+            f"[transitions] seed={seed} success={success} near_miss={near_miss} "
+            f"closest_gap={closest_gap if np.isfinite(closest_gap) else float('nan'):.3f} "
+            f"kept_flag={kept} stored={len(episodes)}/{rollouts} "
+            f"attempts={attempts_used}/{max_attempts}",
             flush=True,
         )
 
@@ -261,6 +288,8 @@ def collect_teacher_transitions(
         report,
         execution_backend,
         keep_failures=keep_failures,
+        keep_near_misses=keep_near_misses,
+        near_miss_gap=near_miss_gap,
         attempt_report=attempt_report,
         complete=True,
         target_episodes=rollouts,
@@ -275,6 +304,8 @@ def _dataset_payload(
     execution_backend="kinematic",
     *,
     keep_failures: bool = False,
+    keep_near_misses: bool = False,
+    near_miss_gap: float = 1.5,
     attempt_report=None,
     complete: bool = True,
     target_episodes: int | None = None,
@@ -289,6 +320,8 @@ def _dataset_payload(
         "attempt_report": list(attempt_report if attempt_report is not None else report),
         "pursuit_graph_version": PURSUIT_GRAPH_VERSION,
         "keeps_failures": bool(keep_failures),
+        "keeps_near_misses": bool(keep_near_misses),
+        "near_miss_gap": float(near_miss_gap),
         "action_kind": "proposed",
         "complete": bool(complete),
         "target_episodes": int(target_episodes if target_episodes is not None else len(episodes)),
@@ -327,8 +360,9 @@ def prior_is_complete(dataset_or_path, *, min_episodes: int, min_successes: int,
         return False
     if n_episodes < int(min_episodes) or n_successes < int(min_successes):
         return False
-    if not allow_failures and bool(payload.get("keeps_failures", True)):
-        # Legacy polluted priors (failures stored) are rejected for closed training.
+    allows_near = bool(payload.get("keeps_near_misses", False))
+    if not allow_failures and bool(payload.get("keeps_failures", True)) and not allows_near:
+        # Legacy polluted priors (all failures stored) are rejected for closed training.
         if n_successes < n_episodes:
             return False
     return True

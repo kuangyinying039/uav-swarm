@@ -1024,6 +1024,13 @@ class MAPPOTrainer:
             if self.continuous_actions and hasattr(self, "finalize_pursuit_row"):
                 history[-1] = self.finalize_pursuit_row(history[-1])
             completed = episode + 1
+            if getattr(self, "early_stop", False):
+                print(
+                    f"[{self.algorithm_name.upper()}] stopped early at episode={completed}: "
+                    f"{getattr(self, 'early_stop_reason', 'capture_collapse')}",
+                    flush=True,
+                )
+                break
             episode_seconds = time.perf_counter() - episode_started_at
             if completed == 1 or completed % max(1, self.cfg.log_interval) == 0 or completed == self.cfg.episodes:
                 elapsed = time.perf_counter() - started_at
@@ -1038,8 +1045,8 @@ class MAPPOTrainer:
                         f"first_obs_step={row['first_onboard_contact_time']} "
                         f"visibility={row['continuous_visibility_ratio']:.3f} "
                         f"target_losses={row['target_loss_count']} "
-                        f"capture_rate_50={np.mean([r['capture_success'] for r in history[-50:]]):.3f} "
-                        f"track_rmse={rmse:.3f}"
+                        f"train_roll_cap50={np.mean([r['capture_success'] for r in history[-50:]]):.3f} "
+                        f"(not_for_ckpt) track_rmse={rmse:.3f}"
                     )
                 elif discovery_only:
                     task_metrics = (

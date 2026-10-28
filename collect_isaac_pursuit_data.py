@@ -58,6 +58,18 @@ def build_parser():
         help="If set, store timeout/failure episodes (pollutes prior; off by default)",
     )
     parser.add_argument(
+        "--keep-near-misses",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also keep unsuccessful episodes whose closest capture gap ≤ --near-miss-gap",
+    )
+    parser.add_argument(
+        "--near-miss-gap",
+        type=float,
+        default=1.5,
+        help="Closest-gap threshold (m) for --keep-near-misses (default 1.5 ≈ radius+margin)",
+    )
+    parser.add_argument(
         "--min-successes",
         type=int,
         default=0,
@@ -110,12 +122,13 @@ def main():
             dataset_path,
             min_episodes=args.rollouts,
             min_successes=min_successes,
-            allow_failures=bool(args.keep_failures),
+            allow_failures=bool(args.keep_failures or args.keep_near_misses),
         )
     ):
         print(
             f"[isaac-collect] skip existing clean prior={dataset_path} "
-            f"(episodes>={args.rollouts}, successes>={min_successes}, keep_failures={args.keep_failures})",
+            f"(episodes>={args.rollouts}, successes>={min_successes}, "
+            f"keep_failures={args.keep_failures}, keep_near_misses={args.keep_near_misses})",
             flush=True,
         )
         return
@@ -127,7 +140,7 @@ def main():
         dataset_path,
         min_episodes=args.rollouts,
         min_successes=min_successes,
-        allow_failures=bool(args.keep_failures),
+        allow_failures=bool(args.keep_failures or args.keep_near_misses),
     ):
         polluted = dataset_path.with_name(
             f"{dataset_path.stem}.polluted_incomplete{dataset_path.suffix}"
@@ -155,6 +168,7 @@ def main():
         print(
             f"[isaac-collect] target_kept={args.rollouts} min_successes={min_successes} "
             f"max_attempts={max_attempts} keep_failures={args.keep_failures} "
+            f"keep_near_misses={args.keep_near_misses} near_miss_gap={args.near_miss_gap} "
             f"progress={progress_path}",
             flush=True,
         )
@@ -167,6 +181,8 @@ def main():
             env_factory=lambda _seed: env,
             execution_backend="isaac_physx_closed" if physx_closed else "isaac_physx",
             keep_failures=bool(args.keep_failures),
+            keep_near_misses=bool(args.keep_near_misses),
+            near_miss_gap=float(args.near_miss_gap),
             max_attempts=max_attempts,
         )
         n_success = sum(1 for row in dataset.get("report", []) if row.get("success"))
@@ -179,7 +195,7 @@ def main():
             dataset,
             min_episodes=args.rollouts,
             min_successes=min_successes,
-            allow_failures=bool(args.keep_failures),
+            allow_failures=bool(args.keep_failures or args.keep_near_misses),
         ):
             raise RuntimeError("collected dataset failed completeness / cleanliness checks")
         _atomic_finalize(dataset, dataset_path)

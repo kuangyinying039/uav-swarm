@@ -58,6 +58,9 @@ Formal success (must match sim eval, SITL, and real logs):
 `radar5_dual_*` hybrid configs keep `capture_mode=single_distance` (k-distance).
 `physx_closed` configs may enable `angular_enclose` — report which mode was used.
 
+Formal ladder uses **`target_diameter=0.5`** → `capture_radius = 2 × diameter = 1.0 m`
+(see `quadrotor_pursuit_env.py`). Do not mix 0.75-diameter tables with 0.5 tables.
+
 ## Physics authority (`physx_closed`)
 
 - All four vehicles are PhysX articulations with Lee velocity tracking.

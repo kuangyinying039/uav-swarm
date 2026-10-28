@@ -143,24 +143,29 @@ def _load_env_config(path):
 
 
 def _apply_o2o_stable(values, decay):
-    """Offline-to-online package that stops warm-start collapse (A5s / A6)."""
+    """Offline-to-online package that stops warm-start collapse (A5s / A6).
+
+    P1 defaults: keep BC + actor-anchor alive through training, and keep
+    exploration small so DAgger init is not washed out (see hard best≪final).
+    """
     slow = max(decay * 2, 200_000)
     values.update(
         warmup_steps=20_000,
-        exploration_std=0.05,
-        exploration_final_std=0.02,
+        exploration_std=0.04,
+        exploration_final_std=0.015,
         exploration_decay_steps=slow,
         demo_bc_weight=1.0,
-        demo_bc_final_weight=0.5,
+        demo_bc_final_weight=0.35,
         demo_bc_decay_steps=slow,
         td3_bc_alpha=2.5,
         bc_on_batch=True,
         actor_anchor_weight=1.0,
-        actor_anchor_final_weight=0.1,
+        actor_anchor_final_weight=0.35,
         actor_anchor_decay_steps=slow,
         prior_fraction=0.5,
         utd=2,
         success_replay_only=True,
+        max_safeguard_rollbacks=3,
     )
     return values
 
@@ -355,10 +360,10 @@ def _run_mappo(args, env):
         update_epochs=5 if plus else 3,
         target_kl=0.006 if plus else 0.01,
         clip_eps=0.08 if plus else 0.10,
-        continuous_initial_std=0.08 if plus else 0.20,
-        continuous_log_std_max=float(np.log(0.25 if plus else 0.40)),
-        entropy_coef=0.001 if plus else 0.003,
-        entropy_coef_end=0.0003 if plus else 0.001,
+        continuous_initial_std=0.06 if plus else 0.20,
+        continuous_log_std_max=float(np.log(0.20 if plus else 0.40)),
+        entropy_coef=0.0005 if plus else 0.003,
+        entropy_coef_end=0.00015 if plus else 0.001,
         adaptive_entropy=False,
         use_gat=True,
         use_hetero_entities=True,
@@ -388,21 +393,26 @@ def _run_mappo(args, env):
     trainer.validation_seeds = _isaac_validation_seeds(args)
     trainer.validation_seed_bank = list(trainer.validation_seeds)
     trainer.on_vector_episode_complete = apply_domain
-    # Stronger demo retention so DAgger warm-start is not washed out by on-policy noise.
+    # P1: stronger demo retention + KL anchor so DAgger warm-start survives PPO.
     if args.variant in ("mappo_dagger", "mappo_plus"):
-        trainer.demo_weight = 0.35 if plus else 0.15
-        trainer.demo_weight_floor = 0.12 if plus else 0.04
+        trainer.demo_weight = 0.45 if plus else 0.15
+        trainer.demo_weight_floor = 0.20 if plus else 0.04
     if plus:
         # Keep the frozen DAgger policy as a trust-region / KL anchor (O2O).
         # Residual/MPC blend is applied at Isaac *eval* time so on-policy PPO
         # log-probs stay consistent with DAgger full-action initialization.
-        trainer.reference_kl_weight = 0.08
+        trainer.reference_kl_weight = 0.15
         trainer.safeguard_drop = 0.05
         trainer.safeguard_patience = 2
+        trainer.max_safeguard_rollbacks = 3
         residual = _resolve_residual(args, "mappo_plus")
         if residual is not None:
             # Optional train-time residual (explicit --residual-base); default none.
             trainer.set_residual(residual)
+            # Residual runs: even tighter KL / demo floor (teacher already in the loop).
+            trainer.reference_kl_weight = max(float(trainer.reference_kl_weight), 0.20)
+            trainer.demo_weight = max(float(trainer.demo_weight), 0.50)
+            trainer.demo_weight_floor = max(float(trainer.demo_weight_floor), 0.25)
     from train_pursuit_with_demos import deterministic_action
 
     def _validation_action(obs, env_index=0):
@@ -559,6 +569,18 @@ def _run_matd3(args, env):
     residual = _resolve_residual(args, variant)
     if residual is not None:
         trainer.set_residual(residual)
+        # Residual / blend runs: keep a tighter offline-to-online package so RL
+        # corrects the teacher instead of unlearning the DAgger prior (B3C/OVMSE-ish).
+        # Zero-init soft residual uses blend α:0→small; keep exploration tiny and
+        # allow near-miss / mixed transitions (success_replay_only=False).
+        trainer.cfg.exploration_std = min(float(trainer.cfg.exploration_std), 0.03)
+        trainer.cfg.exploration_final_std = min(float(trainer.cfg.exploration_final_std), 0.01)
+        trainer.cfg.actor_anchor_final_weight = max(
+            float(trainer.cfg.actor_anchor_final_weight), 0.35
+        )
+        trainer.cfg.success_replay_only = False
+        trainer.demo_metadata["o2o_residual_tight"] = True
+        trainer.demo_metadata["residual_zero_init_blend"] = True
     resuming = False
     if args.checkpoint:
         payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)

@@ -3,7 +3,7 @@
   "execution_reward_version": 5,
   "policy_observation_version": 2,
   "capture_mode": "single_distance",
-  "target_diameter": 0.75,
+  "target_diameter": 0.5,
   "capture_required_uavs": 2,
   "capture_hold_steps": 1,
   "n_uavs": 3,

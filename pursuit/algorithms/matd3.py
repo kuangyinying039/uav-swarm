@@ -47,6 +47,8 @@ class Matd3Config:
     actor_anchor_final_weight: float = 0.0
     actor_anchor_decay_steps: int = 100_000
     critic_pretrain_updates: int = 0
+    # After this many capture-rate rollbacks, stop and keep best_capture.pt (P0 early stop).
+    max_safeguard_rollbacks: int = 3
     device: str = "auto"
     episodes: int = 3000
     max_steps: int = 0

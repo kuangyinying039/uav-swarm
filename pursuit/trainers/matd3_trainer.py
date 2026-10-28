@@ -125,6 +125,8 @@ class Matd3Trainer:
         self.safeguard_patience = 2
         self.safeguard_bad_validations = 0
         self.safeguard_rollbacks = 0
+        self.early_stop = False
+        self.early_stop_reason = None
         self.min_actor_lr = 1e-5
         self.output_directory = None
         self.validation_seeds = []
@@ -431,6 +433,7 @@ class Matd3Trainer:
             f"residual_rl_weight={self.current_residual_weight()}",
             flush=True,
         )
+        episode = int(self.start_episode) - 1
         for episode in range(self.start_episode, self.cfg.episodes):
             env = self.env_factory(episode)
             obs = env.observe_search()
@@ -539,8 +542,16 @@ class Matd3Trainer:
                 print(f"[matd3] budget checkpoint → {budget_path}", flush=True)
             if self.output_directory and self.validation_seeds and (episode + 1) % self.cfg.validation_interval == 0:
                 self.validate(episode + 1, evaluate_policy)
+                if self.early_stop:
+                    break
         if self.output_directory:
-            self.save_checkpoint(self.output_directory / "final.pt", episode=self.cfg.episodes)
+            final_ep = episode + 1 if self.early_stop else self.cfg.episodes
+            self.save_checkpoint(self.output_directory / "final.pt", episode=final_ep)
+            if self.early_stop:
+                print(
+                    f"[matd3] stopped early at episode={final_ep}: {self.early_stop_reason}",
+                    flush=True,
+                )
         return self.history
 
     def train_vectorized(self, rng, vec_env, *, target_episodes=None):
@@ -664,9 +675,15 @@ class Matd3Trainer:
                         and completed % self.cfg.validation_interval == 0
                     ):
                         self.validate(completed, evaluate_policy)
+                        if self.early_stop:
+                            break
                     if completed >= target:
                         break
+                if self.early_stop:
+                    break
                 observations[index] = result["obs"]
+            if self.early_stop:
+                break
             if (
                 self.output_directory
                 and self.cfg.step_checkpoint_interval > 0
@@ -677,7 +694,12 @@ class Matd3Trainer:
                     episode=completed,
                 )
         if self.output_directory:
-            self.save_checkpoint(self.output_directory / "final.pt", episode=target)
+            self.save_checkpoint(self.output_directory / "final.pt", episode=completed if self.early_stop else target)
+            if self.early_stop:
+                print(
+                    f"[matd3-vec] stopped early at episode={completed}: {self.early_stop_reason}",
+                    flush=True,
+                )
         return self.history
 
     def validate(self, episode, evaluate_policy, *, consider_for_best=None):
@@ -728,6 +750,19 @@ class Matd3Trainer:
                 record["actor_lr_before_rollback"] = old_lr
                 record["actor_lr_after_rollback"] = new_lr
                 self.save_checkpoint(self.output_directory / "rollback_latest.pt", episode=episode)
+                max_rb = int(getattr(self.cfg, "max_safeguard_rollbacks", 0) or 0)
+                if max_rb > 0 and self.safeguard_rollbacks >= max_rb:
+                    self.early_stop = True
+                    self.early_stop_reason = (
+                        f"capture_rate_degradation_rollbacks>={max_rb}"
+                    )
+                    record["early_stop"] = True
+                    record["early_stop_reason"] = self.early_stop_reason
+                    print(
+                        f"[validation] early_stop after {self.safeguard_rollbacks} rollbacks; "
+                        f"keeping best_capture.pt (rate={self.best_capture_score[0]:.3f})",
+                        flush=True,
+                    )
         elif consider_for_best:
             self.safeguard_bad_validations = 0
         (self.output_directory / "validation.json").write_text(

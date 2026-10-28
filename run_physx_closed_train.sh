@@ -32,17 +32,26 @@ PRIOR="${DATA_ROOT}/hard_${TEACHER}_prior.pt"
 DEMOS="${DATA_ROOT}/dagger_${TEACHER}_hard_seed11/expert_episodes.pt"
 AUX_DEMOS="${DATA_ROOT}/dagger_${TEACHER}_hard_seed11/correction_episodes.pt"
 NUM_ENVS="${NUM_ENVS:-4}"
-# Held-out validation during RL. Prefer training throughput; roll back only on
-# clear drops. Override with VAL_EPISODES / VAL_INTERVAL.
-VAL_EPISODES="${VAL_EPISODES:-20}"
-VAL_INTERVAL="${VAL_INTERVAL:-250}"
-# Optional MAPPO residual-on-MPC. Default off so primary tables compare pure RL
-# against classical baselines; set RESIDUAL_BASE=mpc to enable residual RL.
+# P0 validation: larger held-out + denser checks; early-stop kicks in after
+# repeated capture-rate rollbacks (see Matd3Config.max_safeguard_rollbacks).
+# Formal tables MUST use best_capture.pt — never training-roll summary.json.
+VAL_EPISODES="${VAL_EPISODES:-40}"
+VAL_INTERVAL="${VAL_INTERVAL:-100}"
+# Optional residual/blend on a classical teacher. Default off so primary tables
+# compare pure RL against classical baselines; set RESIDUAL_BASE=mpc|frpn to enable.
 RESIDUAL_BASE="${RESIDUAL_BASE:-none}"
 RESIDUAL_WEIGHT="${RESIDUAL_WEIGHT:-0.45}"
 RESIDUAL_WEIGHT_FINAL="${RESIDUAL_WEIGHT_FINAL:-0.70}"
 # If set, resume MATD3-A6 from this checkpoint (skips critic pretrain / ep0 val).
 RESUME_CKPT="${RESUME_CKPT:-}"
+# P0 budget: still allow 1000 ep, but keep mid checkpoints; collapse usually
+# appears by ~300–500 so early-stop / best_capture are the real selectors.
+EPISODES="${EPISODES:-1000}"
+BUDGET_CHECKPOINTS="${BUDGET_CHECKPOINTS:-100,300,500,1000}"
+# Optional name suffix so residual runs never overwrite pure-RL dirs.
+# Example: NAME_SUFFIX=_residual_mpc_ep200
+NAME_SUFFIX="${NAME_SUFFIX:-}"
+SKIP_MAPPO="${SKIP_MAPPO:-0}"
 
 require() {
   local path="$1"
@@ -63,6 +72,7 @@ fi
 if ! python - <<PY
 from pursuit.data.transition_dataset import prior_is_complete
 import sys
+# Near-miss priors (keeps_near_misses) are allowed; all-failure pollution is not.
 sys.exit(0 if prior_is_complete("${PRIOR}", min_episodes=200, min_successes=200, allow_failures=False) else 1)
 PY
 then
@@ -83,20 +93,28 @@ run_matd3() {
     : >"$log"
     echo "[physx_closed] $(date -Is) start ${name} num_envs=${NUM_ENVS} val=${VAL_EPISODES}@${VAL_INTERVAL} teacher=${TEACHER}" | tee -a "$log"
   fi
+  residual_args=()
+  if [[ "${RESIDUAL_BASE}" != "none" ]]; then
+    residual_args+=(--residual-base "${RESIDUAL_BASE}" --residual-weight "${RESIDUAL_WEIGHT}")
+    if [[ -n "${RESIDUAL_WEIGHT_FINAL}" && "${RESIDUAL_WEIGHT_FINAL}" != "none" ]]; then
+      residual_args+=(--residual-weight-final "${RESIDUAL_WEIGHT_FINAL}")
+    fi
+  fi
   if ! python -u "${ROOT}/train_isaac_pursuit.py" matd3 --variant A6 \
     --num-envs "${NUM_ENVS}" \
     --env-config "$ENV_CFG" \
     --physx-closed-loop \
     --no-native-lidar \
-    --episodes 1000 \
+    --episodes "${EPISODES}" \
     --seed 11 \
     --validation-episodes "${VAL_EPISODES}" \
     --validation-interval "${VAL_INTERVAL}" \
-    --budget-checkpoints 100,300,1000 \
+    --budget-checkpoints "${BUDGET_CHECKPOINTS}" \
     --batch-size 256 \
     --hidden-dim 128 \
     --actor-init "$ACTOR_INIT" \
     --prior "$PRIOR" \
+    "${residual_args[@]}" \
     "${resume_args[@]}" \
     --out "$out" \
     >>"$log" 2>&1
@@ -119,7 +137,7 @@ run_mappo() {
   local log="${LOG_DIR}/${name}.log"
   mkdir -p "$out"
   : >"$log"
-  echo "[physx_closed] $(date -Is) start ${name} num_envs=${NUM_ENVS} teacher=${TEACHER}" | tee -a "$log"
+  echo "[physx_closed] $(date -Is) start ${name} num_envs=${NUM_ENVS} episodes=${EPISODES} residual=${RESIDUAL_BASE} teacher=${TEACHER}" | tee -a "$log"
   mappo_extra=()
   if [[ "${RESIDUAL_BASE}" != "none" ]]; then
     mappo_extra+=(--residual-base "${RESIDUAL_BASE}" --residual-weight "${RESIDUAL_WEIGHT}")
@@ -132,11 +150,11 @@ run_mappo() {
     --env-config "$ENV_CFG" \
     --physx-closed-loop \
     --no-native-lidar \
-    --episodes 1000 \
+    --episodes "${EPISODES}" \
     --seed 11 \
     --validation-episodes "${VAL_EPISODES}" \
     --validation-interval "${VAL_INTERVAL}" \
-    --budget-checkpoints 100,300,1000 \
+    --budget-checkpoints "${BUDGET_CHECKPOINTS}" \
     --batch-size 256 \
     --hidden-dim 128 \
     --actor-init "$ACTOR_INIT" \
@@ -159,11 +177,50 @@ run_mappo() {
 }
 
 SKIP_MATD3="${SKIP_MATD3:-0}"
-if [[ "$SKIP_MATD3" != "1" ]]; then
-  run_matd3 "isaac_dual_A6_${TEACHER}_hard_${TAG}_seed11"
-else
-  echo "[physx_closed] $(date -Is) skip MATD3-A6 (SKIP_MATD3=1)"
+# PARALLEL_TRAIN=1: launch A6 and MAPPO together (each uses PARALLEL_NUM_ENVS).
+# Default PARALLEL_NUM_ENVS = max(4, NUM_ENVS/2) to avoid dual-Isaac OOM on one GPU.
+PARALLEL_TRAIN="${PARALLEL_TRAIN:-0}"
+PARALLEL_NUM_ENVS="${PARALLEL_NUM_ENVS:-}"
+if [[ -z "${PARALLEL_NUM_ENVS}" ]]; then
+  PARALLEL_NUM_ENVS=$(( NUM_ENVS / 2 ))
+  if [[ "${PARALLEL_NUM_ENVS}" -lt 4 ]]; then
+    PARALLEL_NUM_ENVS=4
+  fi
 fi
-run_mappo "isaac_dual_mappo_plus_${TEACHER}_hard_${TAG}_seed11"
 
-echo "[physx_closed] all train jobs finished $(date -Is) teacher=${TEACHER}"
+if [[ "${PARALLEL_TRAIN}" == "1" && "${SKIP_MATD3}" != "1" && "${SKIP_MAPPO}" != "1" ]]; then
+  echo "[physx_closed] $(date -Is) parallel train A6+MAPPO each num_envs=${PARALLEL_NUM_ENVS} (from NUM_ENVS=${NUM_ENVS})"
+  (
+    NUM_ENVS="${PARALLEL_NUM_ENVS}" run_matd3 "isaac_dual_A6_${TEACHER}_hard_${TAG}_seed11${NAME_SUFFIX}"
+  ) &
+  pid_a6=$!
+  (
+    NUM_ENVS="${PARALLEL_NUM_ENVS}" run_mappo "isaac_dual_mappo_plus_${TEACHER}_hard_${TAG}_seed11${NAME_SUFFIX}"
+  ) &
+  pid_mappo=$!
+  status=0
+  if ! wait "${pid_a6}"; then
+    echo "[physx_closed] $(date -Is) FAILED parallel A6 (pid=${pid_a6})"
+    status=1
+  fi
+  if ! wait "${pid_mappo}"; then
+    echo "[physx_closed] $(date -Is) FAILED parallel MAPPO (pid=${pid_mappo})"
+    status=1
+  fi
+  if [[ "${status}" -ne 0 ]]; then
+    exit 1
+  fi
+else
+  if [[ "$SKIP_MATD3" != "1" ]]; then
+    run_matd3 "isaac_dual_A6_${TEACHER}_hard_${TAG}_seed11${NAME_SUFFIX}"
+  else
+    echo "[physx_closed] $(date -Is) skip MATD3-A6 (SKIP_MATD3=1)"
+  fi
+  if [[ "$SKIP_MAPPO" != "1" ]]; then
+    run_mappo "isaac_dual_mappo_plus_${TEACHER}_hard_${TAG}_seed11${NAME_SUFFIX}"
+  else
+    echo "[physx_closed] $(date -Is) skip MAPPO+ (SKIP_MAPPO=1)"
+  fi
+fi
+
+echo "[physx_closed] all train jobs finished $(date -Is) teacher=${TEACHER} suffix=${NAME_SUFFIX:-none}"
