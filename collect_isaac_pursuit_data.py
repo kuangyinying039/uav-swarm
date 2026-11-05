@@ -184,25 +184,48 @@ def main():
             keep_near_misses=bool(args.keep_near_misses),
             near_miss_gap=float(args.near_miss_gap),
             max_attempts=max_attempts,
+            min_successes=min_successes,
         )
         n_success = sum(1 for row in dataset.get("report", []) if row.get("success"))
+        n_episodes = len(dataset.get("episodes") or [])
         if n_success < min_successes:
-            raise RuntimeError(
-                f"teacher collect produced n_successes={n_success} "
-                f"< min_successes={min_successes}; refusing to finalize prior"
+            # Finalize check before env.close(): Isaac shutdown can os._exit(0)
+            # and hide a non-zero status from the pipeline.
+            print(
+                f"[isaac-collect] ERROR n_successes={n_success} "
+                f"< min_successes={min_successes} (kept={n_episodes}); "
+                "refusing to finalize prior",
+                flush=True,
             )
+            try:
+                env.close()
+            except Exception:
+                pass
+            os._exit(2)
         if not prior_is_complete(
             dataset,
             min_episodes=args.rollouts,
             min_successes=min_successes,
             allow_failures=bool(args.keep_failures or args.keep_near_misses),
         ):
-            raise RuntimeError("collected dataset failed completeness / cleanliness checks")
+            print(
+                "[isaac-collect] ERROR collected dataset failed completeness / "
+                "cleanliness checks; refusing to finalize prior",
+                flush=True,
+            )
+            try:
+                env.close()
+            except Exception:
+                pass
+            os._exit(2)
         _atomic_finalize(dataset, dataset_path)
         print(json_sidecar(dataset), flush=True)
         print(f"[isaac-collect] finalized clean prior={dataset_path}", flush=True)
     finally:
-        env.close()
+        try:
+            env.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -214,16 +214,28 @@ class PursuitDemoTrainer(MAPPOTrainer):
             "mode": cfg.mode,
             "weight": float(cfg.weight),
             "weight_final": None if cfg.weight_final is None else float(cfg.weight_final),
+            "weight_warmup_steps": int(cfg.weight_warmup_steps),
+            "weight_decay_steps": int(cfg.weight_decay_steps),
         }
 
-    def execution_actions(self, policy_actions, env):
-        if self.residual_cfg is None or self._residual_teacher is None:
+    def current_residual_weight(self):
+        if self.residual_cfg is None:
+            return None
+        return float(self.residual_cfg.weight_at(self._residual_env_steps))
+
+    def execution_actions(self, policy_actions, env, *, compose_residual=True):
+        if (
+            not compose_residual
+            or self.residual_cfg is None
+            or self._residual_teacher is None
+        ):
             return policy_actions
         from pursuit_residual import compose_actions
 
-        logic = getattr(env, "env", env)
-        if hasattr(env, "bridges") and len(getattr(env, "bridges", [])) == 1:
-            logic = env.bridges[0].env
+        from pursuit_residual import _logic_env
+
+        # Prefer an already-unwrapped logic env (vector trainers pass bridges[i].env).
+        logic = _logic_env(env, 0) if hasattr(env, "bridges") or hasattr(env, "envs") else env
         base = np.asarray(self._residual_teacher.actions(logic), dtype=np.float32)
         weight = self.residual_cfg.weight_at(self._residual_env_steps)
         self._residual_env_steps += 1
@@ -670,12 +682,33 @@ class PursuitDemoTrainer(MAPPOTrainer):
     def _flush_vector_batch(
         self, batch, history, *, completed, target, num_envs, started_at, episode_wall
     ):
-        """Run on-policy PPO for trajectories collected under one frozen policy."""
+        """Run on-policy PPO for trajectories collected under one frozen policy.
+
+        A wave may contain several finished episodes. They are concatenated into
+        one PPO update (GAE respects per-episode terminals) so likelihood parity
+        stays valid, then each episode is logged into ``history`` so
+        ``capture_rate_50`` counts every started seed—not only the fastest slot.
+        """
+        usable = []
         for item in batch:
+            if completed + len(usable) >= target:
+                break
+            if item is None or not item.get("rollout"):
+                continue
+            usable.append(item)
+        if not usable:
+            return completed
+
+        combined = []
+        for item in usable:
+            combined.extend(item["rollout"])
+        shared_stats = self._update(combined, completed)
+
+        for item in usable:
             if completed >= target:
                 break
             completed += 1
-            update_stats = self._update(item["rollout"], completed - 1)
+            update_stats = dict(shared_stats)
             self.episode_traces.append(
                 {"episode": completed, "frames": item["diag"]["trace"], "mode": "3d"}
             )
@@ -700,6 +733,7 @@ class PursuitDemoTrainer(MAPPOTrainer):
                 row["minimum_capture_gap"] = item["terminal_gap"]
             self._finalize_use_closest_gap = False
             self._finalize_disabled_count = None
+            row["residual_α"] = self.current_residual_weight()
             history.append(row)
             callback = getattr(self, "on_vector_episode_complete", None)
             if callable(callback):
@@ -725,6 +759,12 @@ class PursuitDemoTrainer(MAPPOTrainer):
                 reward = float(row.get("reward") if row.get("reward") is not None else 0.0)
                 capture = float(row.get("capture_success") or 0.0)
                 visibility = float(row.get("continuous_visibility_ratio") or 0.0)
+                residual_w = self.current_residual_weight()
+                residual_tag = (
+                    f" residual_α={residual_w:.3f}"
+                    if residual_w is not None
+                    else ""
+                )
                 print(
                     f"[MAPPO] episode={completed}/{target} reward={reward:.2f} "
                     f"env={float(row.get('environment_seconds') or 0.0):.2f}s "
@@ -737,7 +777,8 @@ class PursuitDemoTrainer(MAPPOTrainer):
                     f"track_rmse={float(rmse) if np.isfinite(rmse) else float('nan'):.3f} "
                     f"entropy={float(row.get('entropy') if row.get('entropy') is not None else float('nan')):.3f} "
                     f"num_envs={num_envs} "
-                    f"time={episode_seconds:.2f}s eta={eta / 3600:.2f}h",
+                    f"time={episode_seconds:.2f}s eta={eta / 3600:.2f}h"
+                    f"{residual_tag}",
                     flush=True,
                 )
 
@@ -761,12 +802,14 @@ class PursuitDemoTrainer(MAPPOTrainer):
     def train_vectorized(self, vec_env, *, target_episodes=None):
         """Collect from Isaac/kinematic vector envs with on-policy PPO.
 
-        All ``num_envs`` scenes step in lockstep under a frozen policy (using
-        ``info['final_obs']`` on auto-reset). When the first scene finishes an
-        episode, that trajectory is PPO-updated once; every other in-flight or
-        simultaneously-finished trajectory is discarded and soft-reset so
-        likelihood parity stays valid. PhysX still runs N-way in parallel for
-        most of each episode wall-clock.
+        All ``num_envs`` scenes step in lockstep under a frozen policy. A wave
+        waits until every slot finishes one episode (success or timeout), then
+        PPO-updates on all finished trajectories and soft-resets the wave.
+
+        This avoids the old first-finisher bias where only the fastest slot was
+        logged/updated and siblings were dropped — that inflated
+        ``capture_rate_50`` toward ``1-(1-p)^N``. Auto-reset continuations after
+        a slot finishes are ignored until the wave ends.
         """
         if not self.continuous_actions:
             raise ValueError("train_vectorized currently supports continuous pursuit MAPPO only")
@@ -777,12 +820,14 @@ class PursuitDemoTrainer(MAPPOTrainer):
         base_seed = int(getattr(self, "seed", None) or self.environment_config.get("seed", 0))
         num_envs = int(vec_env.num_envs)
         self._vector_num_envs = num_envs
+        next_episode_seed = completed
         observations = vec_env.reset(
-            seeds=[base_seed * 100_000 + completed + i for i in range(num_envs)]
+            seeds=[base_seed * 100_000 + next_episode_seed + i for i in range(num_envs)]
         )
+        next_episode_seed += num_envs
         print(
             f"[MAPPO-VEC] device={self.device} num_envs={num_envs} "
-            f"episodes={completed + 1}..{target}",
+            f"episodes={completed + 1}..{target} wave_sync=1",
             flush=True,
         )
         started_at = time.perf_counter()
@@ -793,8 +838,8 @@ class PursuitDemoTrainer(MAPPOTrainer):
         rollouts = [[] for _ in range(num_envs)]
         diagnostics = [self._empty_slot_diagnostics() for _ in range(num_envs)]
         pending_fields = [None] * num_envs
-        finished_batch = []
-        next_episode_seed = completed
+        slot_done = [False] * num_envs
+        wave_batch = [None] * num_envs
 
         while completed < target:
             episode_wall = time.perf_counter()
@@ -811,6 +856,11 @@ class PursuitDemoTrainer(MAPPOTrainer):
             per_env_seconds = vector_seconds / max(num_envs, 1)
 
             for index, result in enumerate(results):
+                observations[index] = result["obs"]
+                # Slot already delivered this wave's episode; ignore auto-reset tail.
+                if slot_done[index]:
+                    continue
+
                 logic_env = self._logic_env_at(vec_env, index)
                 fields = pending_fields[index]
                 transition_result = dict(result)
@@ -847,66 +897,63 @@ class PursuitDemoTrainer(MAPPOTrainer):
                     capture_env_frame(logic_env, transition_result, fields["actions"])
                 )
 
-                if result.get("_episode_done") or force_done or terminated or truncated:
-                    capture_result = dict(transition_result)
-                    capture_result["capture_success"] = bool(
-                        info.get(
-                            "capture_success",
-                            transition_result.get(
-                                "capture_success", result.get("capture_success", False)
-                            ),
-                        )
-                    )
-                    episode_steps = int(local_steps[index])
-                    env_already_reset = bool(
-                        result.get("_episode_done") and info.get("final_obs") is not None
-                    )
-                    terminal_gap = float(
-                        transition_result.get(
-                            "minimum_capture_gap",
-                            diagnostics[index]["closest_capture_gap"],
-                        )
-                    )
-                    finished_batch.append(
-                        {
-                            "rollout": rollouts[index],
-                            "diag": diagnostics[index],
-                            "logic_env": logic_env,
-                            "capture_result": capture_result,
-                            "episode_steps": episode_steps,
-                            "rollout_limit": step_limit or episode_steps,
-                            "env_already_reset": env_already_reset,
-                            "terminal_gap": terminal_gap,
-                            "disabled_count": (
-                                int(np.count_nonzero(getattr(logic_env, "disabled_uavs", [])))
-                                if not env_already_reset
-                                else int(result.get("disabled_count", 0) or 0)
-                            ),
-                        }
-                    )
-                    rollouts[index] = []
-                    diagnostics[index] = self._empty_slot_diagnostics()
-                    local_steps[index] = 0
-                    next_episode_seed += 1
-                    if force_done and not result.get("_episode_done"):
-                        self._soft_reset_vector_slot(
-                            vec_env,
-                            observations,
-                            index,
-                            seed=base_seed * 100_000 + next_episode_seed + index,
-                        )
-                    else:
-                        observations[index] = result["obs"]
-                else:
-                    observations[index] = result["obs"]
+                if not (result.get("_episode_done") or force_done or terminated or truncated):
+                    continue
 
-            if not finished_batch or completed >= target:
+                capture_result = dict(transition_result)
+                capture_result["capture_success"] = bool(
+                    info.get(
+                        "capture_success",
+                        transition_result.get(
+                            "capture_success", result.get("capture_success", False)
+                        ),
+                    )
+                )
+                episode_steps = int(local_steps[index])
+                env_already_reset = bool(
+                    result.get("_episode_done") and info.get("final_obs") is not None
+                )
+                terminal_gap = float(
+                    transition_result.get(
+                        "minimum_capture_gap",
+                        diagnostics[index]["closest_capture_gap"],
+                    )
+                )
+                wave_batch[index] = {
+                    "rollout": rollouts[index],
+                    "diag": diagnostics[index],
+                    "logic_env": logic_env,
+                    "capture_result": capture_result,
+                    "episode_steps": episode_steps,
+                    "rollout_limit": step_limit or episode_steps,
+                    "env_already_reset": env_already_reset,
+                    "terminal_gap": terminal_gap,
+                    "disabled_count": (
+                        int(np.count_nonzero(getattr(logic_env, "disabled_uavs", [])))
+                        if not env_already_reset
+                        else int(result.get("disabled_count", 0) or 0)
+                    ),
+                }
+                slot_done[index] = True
+                rollouts[index] = []
+                diagnostics[index] = self._empty_slot_diagnostics()
+                local_steps[index] = 0
+                if force_done and not result.get("_episode_done"):
+                    # Keep PhysX clone alive until the wave flushes together.
+                    self._soft_reset_vector_slot(
+                        vec_env,
+                        observations,
+                        index,
+                        seed=base_seed * 100_000 + next_episode_seed + index,
+                    )
+                    next_episode_seed += 1
+
+            if not all(slot_done):
                 continue
 
-            # One on-policy update per flush. Remaining finished/partial rollouts
-            # were collected under the pre-update policy and must be dropped.
-            to_flush = finished_batch[:1]
-            finished_batch = []
+            to_flush = [wave_batch[i] for i in range(num_envs) if wave_batch[i] is not None]
+            slot_done = [False] * num_envs
+            wave_batch = [None] * num_envs
             completed = self._flush_vector_batch(
                 to_flush,
                 history,
@@ -920,15 +967,17 @@ class PursuitDemoTrainer(MAPPOTrainer):
                 rollouts[index] = []
                 diagnostics[index] = self._empty_slot_diagnostics()
                 local_steps[index] = 0
-                next_episode_seed += 1
                 self._soft_reset_vector_slot(
                     vec_env,
                     observations,
                     index,
                     seed=base_seed * 100_000 + next_episode_seed + index,
                 )
+            next_episode_seed += num_envs
+            if getattr(self, "early_stop", False):
+                break
 
-        self.start_episode = target
+        self.start_episode = target if not getattr(self, "early_stop", False) else completed
         self.restored_history = history
         self.pursuit_history = list(history)
         return history
@@ -1113,12 +1162,14 @@ class PursuitDemoTrainer(MAPPOTrainer):
 
 
 @torch.no_grad()
-def deterministic_action(trainer, obs, env=None):
+def deterministic_action(trainer, obs, env=None, *, compose_residual=True):
     vectors, adjacency, graph = observation_tensors(obs, trainer.device, trainer.cfg)
     means, _ = trainer.actor(vectors, adjacency, graph).chunk(2, dim=-1)
     action = means.tanh().cpu().numpy()
     if env is not None and hasattr(trainer, "execution_actions"):
-        return trainer.execution_actions(action, env)
+        return trainer.execution_actions(
+            action, env, compose_residual=compose_residual
+        )
     return action
 
 

@@ -47,6 +47,11 @@ def build_parser():
     parser.add_argument("--prior", type=artifact_path, help="Isaac-collected transition dataset for MATD3 prior replay")
     parser.add_argument("--prior-fraction", type=float)
     parser.add_argument(
+        "--from-scratch",
+        action="store_true",
+        help="Pure RL ablation: no --actor-init / --demos / --prior (random policy, online data only).",
+    )
+    parser.add_argument(
         "--variant",
         choices=("mappo_dagger", "mappo_plus", "A6"),
         help="A6 is pure-actor HGAT-MATD3 (O2O, success replay, capture rollback). "
@@ -69,6 +74,39 @@ def build_parser():
         type=float,
         default=None,
         help="Optional annealed final RL blend weight when --residual-base is set",
+    )
+    parser.add_argument(
+        "--residual-mode",
+        choices=("auto", "blend", "residual"),
+        default="auto",
+        help="How to compose teacher+RL. auto: blend (safe with full-action DAgger); "
+        "residual only if demos/labels are δ=(a-a_base)/w",
+    )
+    parser.add_argument(
+        "--validation-pure-rl",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Score held-out best_capture with pure RL (no teacher mix). "
+        "Default: on whenever --residual-base is set.",
+    )
+    parser.add_argument(
+        "--reference-kl-weight",
+        type=float,
+        default=None,
+        help="Override MAPPO O2O KL anchor to the frozen DAgger/init policy "
+        "(default: variant recipe).",
+    )
+    parser.add_argument(
+        "--demo-weight",
+        type=float,
+        default=None,
+        help="Override MAPPO behavior-cloning mix weight on demos (default: variant recipe).",
+    )
+    parser.add_argument(
+        "--demo-weight-floor",
+        type=float,
+        default=None,
+        help="Override annealed floor for --demo-weight (default: variant recipe).",
     )
     parser.add_argument(
         "--validation-episodes",
@@ -200,7 +238,26 @@ def _variant_config(variant, args, env_cfg):
             warmup_steps=15_000,
         )
         _apply_o2o_stable(values, decay)
-        required = (args.actor_init is not None and args.prior is not None)
+        if getattr(args, "from_scratch", False):
+            # Online-only: no expert prior / critic pretrain / BC / actor warm-start.
+            # success_replay_only must be off or early failures starve the buffer.
+            values.update(
+                prior_fraction=0.0,
+                critic_pretrain_updates=0,
+                warmup_steps=5_000,
+                exploration_std=0.15,
+                exploration_final_std=0.05,
+                actor_anchor_weight=0.0,
+                actor_anchor_final_weight=0.0,
+                demo_bc_weight=0.0,
+                demo_bc_final_weight=0.0,
+                td3_bc_alpha=0.0,
+                bc_on_batch=False,
+                success_replay_only=False,
+            )
+            required = (args.actor_init is None and args.prior is None)
+        else:
+            required = (args.actor_init is not None and args.prior is not None)
     elif variant.startswith("mappo_"):
         required = True  # checked in main()
     else:
@@ -326,17 +383,40 @@ def _resolve_residual(args, variant):
         return None
     weight = float(getattr(args, "residual_weight", 0.40))
     weight_final = getattr(args, "residual_weight_final", None)
-    # MAPPO on-policy: store δ / apply base+w·δ (see PursuitDemoTrainer.set_residual).
-    # Blend is reserved for eval-time hybrids on full-action checkpoints.
-    mode = "residual" if str(variant).startswith("mappo") else "blend"
+    mode_arg = str(getattr(args, "residual_mode", "auto") or "auto")
+    # Full-action DAgger π0 + BC demos are NOT residual labels. Using
+    # mode=residual (a=base+w·π) with a full-action network wrecks the teacher
+    # floor once w>0. Prefer blend: a=(1-w)·base+w·π unless demos were residualized.
+    if mode_arg == "auto":
+        mode = "blend"
+    else:
+        mode = mode_arg
+    # Residual ticks once per vector decision step (not per clone). Scale the
+    # anneal so α can reach weight_final (incl. 1.0) before episodes run out.
+    num_envs = max(int(getattr(args, "num_envs", 1) or 1), 1)
+    if weight_final is not None and float(weight_final) >= 0.99:
+        expected_vec_steps = max(int(args.episodes) * 180 // num_envs, 30_000)
+        warmup = max(5_000, expected_vec_steps // 10)
+        decay = max(expected_vec_steps - warmup, 20_000)
+    else:
+        warmup = 10_000
+        decay = max(_scaled_decay_steps(args.episodes), 80_000)
     return ResidualComposeConfig(
         base=requested,
         mode=mode,
         weight=weight,
         weight_final=None if weight_final is None else float(weight_final),
-        weight_warmup_steps=10_000,
-        weight_decay_steps=max(_scaled_decay_steps(args.episodes), 80_000),
+        weight_warmup_steps=int(warmup),
+        weight_decay_steps=int(decay),
     )
+
+
+def _resolve_validation_pure_rl(args) -> bool:
+    explicit = getattr(args, "validation_pure_rl", None)
+    if explicit is not None:
+        return bool(explicit)
+    base = getattr(args, "residual_base", None)
+    return base not in (None, "", "none")
 
 
 def _run_mappo(args, env):
@@ -393,11 +473,20 @@ def _run_mappo(args, env):
     trainer.validation_seeds = _isaac_validation_seeds(args)
     trainer.validation_seed_bank = list(trainer.validation_seeds)
     trainer.on_vector_episode_complete = apply_domain
+    from_scratch = bool(getattr(args, "from_scratch", False))
     # P1: stronger demo retention + KL anchor so DAgger warm-start survives PPO.
-    if args.variant in ("mappo_dagger", "mappo_plus"):
+    if from_scratch:
+        trainer.demo_weight = 0.0
+        trainer.demo_weight_floor = 0.0
+        trainer.reference_kl_weight = 0.0
+        # Random init needs wider action noise than DAgger-warmed mappo_plus.
+        trainer.cfg.continuous_initial_std = max(float(trainer.cfg.continuous_initial_std), 0.15)
+        trainer.cfg.entropy_coef = max(float(trainer.cfg.entropy_coef), 0.003)
+        trainer.cfg.entropy_coef_end = max(float(trainer.cfg.entropy_coef_end), 0.001)
+    elif args.variant in ("mappo_dagger", "mappo_plus"):
         trainer.demo_weight = 0.45 if plus else 0.15
         trainer.demo_weight_floor = 0.20 if plus else 0.04
-    if plus:
+    if plus and not from_scratch:
         # Keep the frozen DAgger policy as a trust-region / KL anchor (O2O).
         # Residual/MPC blend is applied at Isaac *eval* time so on-policy PPO
         # log-probs stay consistent with DAgger full-action initialization.
@@ -413,13 +502,40 @@ def _run_mappo(args, env):
             trainer.reference_kl_weight = max(float(trainer.reference_kl_weight), 0.20)
             trainer.demo_weight = max(float(trainer.demo_weight), 0.50)
             trainer.demo_weight_floor = max(float(trainer.demo_weight_floor), 0.25)
+            # Pure-RL curriculum (α→1): keep a stronger O2O floor so π0 survives.
+            if residual.weight_final is not None and float(residual.weight_final) >= 0.99:
+                trainer.reference_kl_weight = max(float(trainer.reference_kl_weight), 0.25)
+                trainer.demo_weight_floor = max(float(trainer.demo_weight_floor), 0.30)
+    elif from_scratch:
+        residual = _resolve_residual(args, "mappo_plus" if plus else args.variant)
+        if residual is not None:
+            trainer.set_residual(residual)
+    # Explicit O2O overrides win over variant/residual defaults (algo ablations B/C).
+    if getattr(args, "demo_weight", None) is not None:
+        trainer.demo_weight = float(args.demo_weight)
+    if getattr(args, "demo_weight_floor", None) is not None:
+        trainer.demo_weight_floor = float(args.demo_weight_floor)
+    if getattr(args, "reference_kl_weight", None) is not None:
+        trainer.reference_kl_weight = float(args.reference_kl_weight)
+    if float(getattr(trainer, "demo_weight_floor", 0.0) or 0.0) > float(
+        getattr(trainer, "demo_weight", 0.0) or 0.0
+    ):
+        raise ValueError("demo_weight_floor cannot exceed demo_weight")
     from train_pursuit_with_demos import deterministic_action
+
+    validation_pure_rl = _resolve_validation_pure_rl(args)
 
     def _validation_action(obs, env_index=0):
         logic = env
         if num_envs > 1 and hasattr(env, "bridges"):
             logic = env.bridges[int(env_index)].env
-        return deterministic_action(trainer, obs, env=logic)
+        # best_capture must reflect deployable pure RL when requested.
+        return deterministic_action(
+            trainer,
+            obs,
+            env=logic,
+            compose_residual=not validation_pure_rl,
+        )
 
     trainer.physical_metrics_fn = lambda: _physical_validation_metrics(
         env,
@@ -433,6 +549,15 @@ def _run_mappo(args, env):
     )
     trainer.demo_metadata["physics_dt"] = float(env.physics_dt)
     trainer.demo_metadata["experiment_variant"] = args.variant
+    trainer.demo_metadata["from_scratch"] = bool(from_scratch)
+    trainer.demo_metadata["demo_weight"] = float(getattr(trainer, "demo_weight", 0.0) or 0.0)
+    trainer.demo_metadata["demo_weight_floor"] = float(
+        getattr(trainer, "demo_weight_floor", 0.0) or 0.0
+    )
+    trainer.demo_metadata["reference_kl_weight"] = float(
+        getattr(trainer, "reference_kl_weight", 0.0) or 0.0
+    )
+    trainer.demo_metadata["validation_pure_rl"] = bool(validation_pure_rl)
     trainer.demo_metadata["validation_seeds"] = list(trainer.validation_seeds)
     trainer.demo_metadata["training_seeds"] = [
         args.seed * 100_000 + episode for episode in range(args.episodes)
@@ -541,6 +666,7 @@ def _run_matd3(args, env):
         return env
 
     trainer = Matd3Trainer(env_factory, config, seed=args.seed)
+    validation_pure_rl = _resolve_validation_pure_rl(args)
 
     def _validation_action(obs, env_index=0):
         # Match MAPPO: vectorized Isaac validation passes env_index so residual /
@@ -548,7 +674,11 @@ def _run_matd3(args, env):
         logic = env
         if num_envs > 1 and hasattr(env, "bridges"):
             logic = env.bridges[int(env_index)].env
-        return trainer.deterministic_action(obs, env=logic)
+        return trainer.deterministic_action(
+            obs,
+            env=logic,
+            compose_residual=not validation_pure_rl,
+        )
 
     trainer.physical_metrics_fn = lambda: _physical_validation_metrics(
         env,
@@ -561,6 +691,7 @@ def _run_matd3(args, env):
         "isaac_physx_closed" if bool(getattr(args, "physx_closed_loop", False)) else "isaac_physx"
     )
     trainer.demo_metadata["physics_dt"] = float(env.physics_dt)
+    trainer.demo_metadata["validation_pure_rl"] = bool(validation_pure_rl)
     trainer.demo_metadata["training_seeds"] = [
         args.seed * 100_000 + episode for episode in range(args.episodes)
     ]
@@ -581,6 +712,13 @@ def _run_matd3(args, env):
         trainer.cfg.success_replay_only = False
         trainer.demo_metadata["o2o_residual_tight"] = True
         trainer.demo_metadata["residual_zero_init_blend"] = True
+        if residual.weight_final is not None and float(residual.weight_final) >= 0.99:
+            trainer.cfg.actor_anchor_final_weight = max(
+                float(trainer.cfg.actor_anchor_final_weight), 0.45
+            )
+            trainer.cfg.demo_bc_final_weight = max(
+                float(getattr(trainer.cfg, "demo_bc_final_weight", 0.0) or 0.0), 0.35
+            )
     resuming = False
     if args.checkpoint:
         payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -631,6 +769,7 @@ def _run_matd3(args, env):
             )
         )
     trainer.demo_metadata["experiment_variant"] = variant
+    trainer.demo_metadata["from_scratch"] = bool(getattr(args, "from_scratch", False))
     trainer.demo_metadata["num_envs"] = num_envs
     trainer.demo_metadata["validation_seeds"] = list(trainer.validation_seeds)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -676,7 +815,12 @@ def main():
         parser.error("--validation-interval must be positive and --validation-episodes cannot be negative")
     if int(getattr(args, "num_envs", 1) or 1) < 1:
         parser.error("--num-envs must be >= 1")
-    if args.algorithm == "mappo" and args.variant in ("mappo_dagger", "mappo_plus"):
+    if getattr(args, "from_scratch", False):
+        if args.actor_init or args.demos or args.aux_demos or args.prior:
+            parser.error("--from-scratch cannot be combined with --actor-init/--demos/--aux-demos/--prior")
+        if getattr(args, "residual_base", None) not in (None, "", "none"):
+            parser.error("--from-scratch is a pure-RL ablation; omit --residual-base")
+    elif args.algorithm == "mappo" and args.variant in ("mappo_dagger", "mappo_plus"):
         if not args.actor_init or not args.demos:
             parser.error(f"{args.variant} requires Isaac-trained --actor-init and --demos")
     if args.algorithm == "mappo" and args.aux_demos and not args.demos:
@@ -687,8 +831,19 @@ def main():
         parser.error("mappo_* variants require algorithm=mappo")
     if args.algorithm == "mappo" and args.variant not in ("mappo_dagger", "mappo_plus"):
         parser.error("A6 requires algorithm=matd3")
-    if args.residual_weight <= 0 or args.residual_weight > 1:
-        parser.error("--residual-weight must be in (0, 1]")
+    # Allow 0.0 for zero-init soft residual (α:0→final); final may still be >0.
+    if args.residual_weight < 0 or args.residual_weight > 1:
+        parser.error("--residual-weight must be in [0, 1]")
+    if getattr(args, "residual_base", None) not in (None, "", "none"):
+        final_w = getattr(args, "residual_weight_final", None)
+        if final_w is not None and (float(final_w) < 0 or float(final_w) > 1):
+            parser.error("--residual-weight-final must be in [0, 1]")
+        if float(args.residual_weight) == 0.0 and (
+            final_w is None or float(final_w) <= 0.0
+        ):
+            parser.error(
+                "zero-init residual requires --residual-weight-final in (0, 1]"
+            )
     # Resume may pass --checkpoint with --actor-init/--prior: checkpoint restores
     # trained weights; actor-init only seeds the optional O2O anchor; prior refills
     # the offline buffer (not serialized in checkpoints).

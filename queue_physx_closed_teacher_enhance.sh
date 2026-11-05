@@ -45,6 +45,7 @@ FORCE_COLLECT="${FORCE_COLLECT:-0}"
 SEED_START="${SEED_START:-7000000}"
 SEED_COUNT="${SEED_COUNT:-100}"
 SKIP_STAGE0="${SKIP_STAGE0:-0}"
+SKIP_DAGGER="${SKIP_DAGGER:-0}"
 NAME_SUFFIX="_residual_mpc_zeroinit_ep${RESIDUAL_EPISODES}"
 
 {
@@ -84,7 +85,8 @@ export ISAACSIM_PATH=/opt/lab/apps/isaac-sim-4.1.0
 set +u
 # shellcheck disable=SC1091
 source "${ISAACSIM_PATH}/setup_conda_env.sh"
-set +u
+# Isaac setup may clear errexit/pipefail — restore so stage failures stop the queue.
+set -euo pipefail
 export PYTHONPATH="/srv/data/projects/kyy/omnidrones:${ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export XDG_CACHE_HOME="${HOME}/.cache"
@@ -113,26 +115,37 @@ if [[ "${FORCE_COLLECT}" == "1" ]]; then
   collect_args+=(--force)
 fi
 python -u "${ROOT}/collect_isaac_pursuit_data.py" "${collect_args[@]}" 2>&1 | tee -a "$LOG"
+if [[ ! -f "$PRIOR_PT" ]]; then
+  echo "[teacher-enhance] FATAL: collect finished without ${PRIOR_PT}" | tee -a "$LOG"
+  exit 1
+fi
 
 # ---- Stage 2: DAgger ----
-echo "[teacher-enhance] $(date -Is) stage2 DAgger (BC success-only, keep correction states)" | tee -a "$LOG"
-rm -rf "$DAGGER_DIR"
-python -u "${ROOT}/pretrain_isaac_pursuit_actor.py" \
-  --env-config "$ENV_CFG" \
-  --teacher mpc \
-  --seed 11 --demo-seed 2100000 \
-  --bc-episodes 80 --bc-attempts 320 --bc-updates 2000 \
-  --success-only-bc \
-  --dagger-rounds 3 --dagger-episodes 40 --dagger-updates 800 \
-  --dagger-validation-episodes 40 --dagger-validation-seed 5000000 \
-  --physx-closed-loop \
-  --no-native-lidar \
-  --out "$DAGGER_DIR" \
-  2>&1 | tee -a "$LOG"
-
 PI0="${DAGGER_DIR}/pi0_frozen.pt"
-cp -a "${DAGGER_DIR}/best_imitation.pt" "$PI0"
-echo "[teacher-enhance] froze π0 → ${PI0}" | tee -a "$LOG"
+if [[ "${SKIP_DAGGER}" == "1" && -f "$PI0" && -f "${DAGGER_DIR}/dagger_validation.json" ]]; then
+  echo "[teacher-enhance] $(date -Is) stage2 skip (reuse ${PI0})" | tee -a "$LOG"
+else
+  echo "[teacher-enhance] $(date -Is) stage2 DAgger (BC success-only, keep correction states)" | tee -a "$LOG"
+  rm -rf "$DAGGER_DIR"
+  python -u "${ROOT}/pretrain_isaac_pursuit_actor.py" \
+    --env-config "$ENV_CFG" \
+    --teacher mpc \
+    --seed 11 --demo-seed 2100000 \
+    --bc-episodes 80 --bc-attempts 320 --bc-updates 2000 \
+    --success-only-bc \
+    --dagger-rounds 3 --dagger-episodes 40 --dagger-updates 800 \
+    --dagger-validation-episodes 40 --dagger-validation-seed 5000000 \
+    --physx-closed-loop \
+    --no-native-lidar \
+    --out "$DAGGER_DIR" \
+    2>&1 | tee -a "$LOG"
+  cp -a "${DAGGER_DIR}/best_imitation.pt" "$PI0"
+  echo "[teacher-enhance] froze π0 → ${PI0}" | tee -a "$LOG"
+fi
+if [[ ! -f "$PI0" ]]; then
+  echo "[teacher-enhance] FATAL: missing π0 ${PI0}" | tee -a "$LOG"
+  exit 1
+fi
 
 # ---- Stage 3: parallel residual A6 + MAPPO ----
 echo "[teacher-enhance] $(date -Is) stage3 residual-MPC A6∥MAPPO α:0→0.25 parallel=${PARALLEL_TRAIN}" | tee -a "$LOG"
@@ -163,7 +176,7 @@ eval_one() {
   local args=(
     -u "${ROOT}/evaluate_isaac_pursuit.py"
     --method "$method"
-    --levels hard
+    --levels nominal medium hard severe extreme
     --no-skip-existing-levels
     --physx-closed-loop
     --no-native-lidar
@@ -199,7 +212,7 @@ if [[ -f "${RES_A6}/best_capture.pt" ]]; then
 fi
 if [[ -f "${RES_MAPPO}/best_capture.pt" ]]; then
   eval_one mappo "${RES_MAPPO}/best_capture.pt" residual_mappo_best \
-    --residual-base mpc --residual-mode residual --residual-weight "${RESIDUAL_WEIGHT_FINAL}"
+    --residual-base mpc --residual-mode blend --residual-weight "${RESIDUAL_WEIGHT_FINAL}"
 fi
 
 # Archive pure-RL best as controls if present

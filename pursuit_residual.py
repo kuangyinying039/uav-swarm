@@ -85,13 +85,33 @@ def make_base_policy(name: str):
     return BASELINES_3D[name]()
 
 
+def _logic_env(env, env_index: int = 0):
+    """Resolve a single Radar5 logic env from a vector Isaac wrapper if needed."""
+    bridges = getattr(env, "bridges", None)
+    if bridges is not None:
+        return bridges[int(env_index)].env
+    envs = getattr(env, "envs", None)
+    if envs is not None:
+        return envs[int(env_index)]
+    nested = getattr(env, "env", None)
+    if nested is not None and nested is not env:
+        return nested
+    return env
+
+
 def wrap_action_fn(rl_action_fn, env, cfg: ResidualComposeConfig):
-    """Return an action_fn(obs) that mixes a classical base with the RL policy."""
+    """Return an action_fn(obs, env_index=0) that mixes classical base + RL.
+
+    Parallel Isaac eval must pass ``env_index`` so the teacher reads the same
+    slot as the learned policy. Closing over the vector env and calling
+    ``teacher.actions(vector_env)`` silently uses the wrong state and collapses
+    residual/hybrid capture rates (seen as ~APF floor on locked hard).
+    """
     teacher = make_base_policy(cfg.base)
 
-    def action_fn(observation):
+    def action_fn(observation, env_index: int = 0):
         rl = np.asarray(rl_action_fn(observation), dtype=np.float32)
-        base = np.asarray(teacher.actions(env), dtype=np.float32)
+        base = np.asarray(teacher.actions(_logic_env(env, env_index)), dtype=np.float32)
         return compose_actions(base, rl, cfg)
 
     action_fn.residual_cfg = cfg  # type: ignore[attr-defined]

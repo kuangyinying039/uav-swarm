@@ -99,7 +99,11 @@ def _policy_action(method, action_fn, policy, env, observation, env_index: int =
     """Compute one (n_uavs, 4) action for a single parallel slot."""
     if method in ("apf", "frpn", "mpc"):
         return np.asarray(policy.actions(env.bridges[env_index].env), dtype=np.float32)
-    return np.asarray(action_fn(observation), dtype=np.float32)
+    # Residual wrappers accept env_index so the classical teacher sees the same slot.
+    try:
+        return np.asarray(action_fn(observation, env_index=env_index), dtype=np.float32)
+    except TypeError:
+        return np.asarray(action_fn(observation), dtype=np.float32)
 
 
 def _read_partial_rows(path: Path, seeds) -> dict:

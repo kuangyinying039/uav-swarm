@@ -30,6 +30,7 @@ FIELDS = (
     "q1_mean", "q2_mean", "target_q_mean", "td_abs_mean", "q_disagreement",
     "prior_batch_fraction", "replay_size", "prior_size",
     "env_steps", "matd3_updates", "exploration_std", "utd",
+    "residual_α",
 )
 
 

@@ -18,7 +18,8 @@ export OMNIDRONES_SOURCE=/opt/lab/src/OmniDrones-isaac41
 set +u
 # shellcheck disable=SC1091
 source "${ISAACSIM_PATH}/setup_conda_env.sh"
-set +u
+# Isaac/conda setup may clear errexit/pipefail — restore so train failures stop the queue.
+set -euo pipefail
 export PYTHONPATH="/srv/data/projects/kyy/omnidrones:${ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export XDG_CACHE_HOME="${HOME}/.cache"
@@ -42,8 +43,16 @@ VAL_INTERVAL="${VAL_INTERVAL:-100}"
 RESIDUAL_BASE="${RESIDUAL_BASE:-none}"
 RESIDUAL_WEIGHT="${RESIDUAL_WEIGHT:-0.45}"
 RESIDUAL_WEIGHT_FINAL="${RESIDUAL_WEIGHT_FINAL:-0.70}"
+# blend matches full-action DAgger; residual mode needs δ-labels.
+RESIDUAL_MODE="${RESIDUAL_MODE:-blend}"
+# Score best_capture with pure RL (no teacher mix). Empty = train script default
+# (on whenever residual-base is set). Set 1/0 to force --validation-pure-rl /
+# --no-validation-pure-rl.
+VALIDATION_PURE_RL="${VALIDATION_PURE_RL:-}"
 # If set, resume MATD3-A6 from this checkpoint (skips critic pretrain / ep0 val).
 RESUME_CKPT="${RESUME_CKPT:-}"
+# If set, resume MAPPO+ from this checkpoint.
+RESUME_CKPT_MAPPO="${RESUME_CKPT_MAPPO:-}"
 # P0 budget: still allow 1000 ep, but keep mid checkpoints; collapse usually
 # appears by ~300–500 so early-stop / best_capture are the real selectors.
 EPISODES="${EPISODES:-1000}"
@@ -69,14 +78,22 @@ if [[ ! -f "${DATA_ROOT}/dagger_${TEACHER}_hard_seed11/dagger_validation.json" ]
   echo "missing dagger_validation.json (imitation was not validated; rebuild DAgger)" >&2
   exit 1
 fi
+MIN_PRIOR_EPISODES="${MIN_PRIOR_EPISODES:-200}"
+MIN_PRIOR_SUCCESSES="${MIN_PRIOR_SUCCESSES:-200}"
 if ! python - <<PY
 from pursuit.data.transition_dataset import prior_is_complete
 import sys
 # Near-miss priors (keeps_near_misses) are allowed; all-failure pollution is not.
-sys.exit(0 if prior_is_complete("${PRIOR}", min_episodes=200, min_successes=200, allow_failures=False) else 1)
+# MIN_PRIOR_SUCCESSES can be lowered when near-miss collect stopped early but prior is usable.
+sys.exit(0 if prior_is_complete(
+    "${PRIOR}",
+    min_episodes=int("${MIN_PRIOR_EPISODES}"),
+    min_successes=int("${MIN_PRIOR_SUCCESSES}"),
+    allow_failures=False,
+) else 1)
 PY
 then
-  echo "prior is incomplete or failure-polluted: ${PRIOR}" >&2
+  echo "prior is incomplete or failure-polluted: ${PRIOR} (need episodes>=${MIN_PRIOR_EPISODES} successes>=${MIN_PRIOR_SUCCESSES})" >&2
   exit 1
 fi
 
@@ -95,10 +112,15 @@ run_matd3() {
   fi
   residual_args=()
   if [[ "${RESIDUAL_BASE}" != "none" ]]; then
-    residual_args+=(--residual-base "${RESIDUAL_BASE}" --residual-weight "${RESIDUAL_WEIGHT}")
+    residual_args+=(--residual-base "${RESIDUAL_BASE}" --residual-mode "${RESIDUAL_MODE}" --residual-weight "${RESIDUAL_WEIGHT}")
     if [[ -n "${RESIDUAL_WEIGHT_FINAL}" && "${RESIDUAL_WEIGHT_FINAL}" != "none" ]]; then
       residual_args+=(--residual-weight-final "${RESIDUAL_WEIGHT_FINAL}")
     fi
+  fi
+  if [[ "${VALIDATION_PURE_RL}" == "1" ]]; then
+    residual_args+=(--validation-pure-rl)
+  elif [[ "${VALIDATION_PURE_RL}" == "0" ]]; then
+    residual_args+=(--no-validation-pure-rl)
   fi
   if ! python -u "${ROOT}/train_isaac_pursuit.py" matd3 --variant A6 \
     --num-envs "${NUM_ENVS}" \
@@ -136,14 +158,25 @@ run_mappo() {
   local out="${OUT_ROOT}/${name}"
   local log="${LOG_DIR}/${name}.log"
   mkdir -p "$out"
-  : >"$log"
-  echo "[physx_closed] $(date -Is) start ${name} num_envs=${NUM_ENVS} episodes=${EPISODES} residual=${RESIDUAL_BASE} teacher=${TEACHER}" | tee -a "$log"
+  local resume_args=()
+  if [[ -n "${RESUME_CKPT_MAPPO}" ]]; then
+    resume_args+=(--checkpoint "${RESUME_CKPT_MAPPO}")
+    echo "[physx_closed] $(date -Is) resume ${name} from ${RESUME_CKPT_MAPPO} num_envs=${NUM_ENVS} episodes=${EPISODES} val=${VAL_EPISODES}@${VAL_INTERVAL} residual=${RESIDUAL_BASE} teacher=${TEACHER}" | tee -a "$log"
+  else
+    : >"$log"
+    echo "[physx_closed] $(date -Is) start ${name} num_envs=${NUM_ENVS} episodes=${EPISODES} residual=${RESIDUAL_BASE} teacher=${TEACHER}" | tee -a "$log"
+  fi
   mappo_extra=()
   if [[ "${RESIDUAL_BASE}" != "none" ]]; then
-    mappo_extra+=(--residual-base "${RESIDUAL_BASE}" --residual-weight "${RESIDUAL_WEIGHT}")
+    mappo_extra+=(--residual-base "${RESIDUAL_BASE}" --residual-mode "${RESIDUAL_MODE}" --residual-weight "${RESIDUAL_WEIGHT}")
     if [[ -n "${RESIDUAL_WEIGHT_FINAL}" && "${RESIDUAL_WEIGHT_FINAL}" != "none" ]]; then
       mappo_extra+=(--residual-weight-final "${RESIDUAL_WEIGHT_FINAL}")
     fi
+  fi
+  if [[ "${VALIDATION_PURE_RL}" == "1" ]]; then
+    mappo_extra+=(--validation-pure-rl)
+  elif [[ "${VALIDATION_PURE_RL}" == "0" ]]; then
+    mappo_extra+=(--no-validation-pure-rl)
   fi
   if ! python -u "${ROOT}/train_isaac_pursuit.py" mappo --variant mappo_plus \
     --num-envs "${NUM_ENVS}" \
@@ -161,6 +194,7 @@ run_mappo() {
     --demos "$DEMOS" \
     --aux-demos "$AUX_DEMOS" \
     "${mappo_extra[@]}" \
+    "${resume_args[@]}" \
     --out "$out" \
     >>"$log" 2>&1
   then

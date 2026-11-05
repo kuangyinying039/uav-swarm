@@ -172,6 +172,7 @@ class Matd3Trainer:
             "mode": cfg.mode,
             "weight": float(cfg.weight),
             "weight_final": None if cfg.weight_final is None else float(cfg.weight_final),
+            "weight_warmup_steps": int(cfg.weight_warmup_steps),
             "weight_decay_steps": int(cfg.weight_decay_steps),
         }
 
@@ -180,15 +181,20 @@ class Matd3Trainer:
             return None
         return float(self.residual_cfg.weight_at(self.env_steps))
 
-    def _compose_with_base(self, rl_actions, env):
-        if self.residual_cfg is None or env is None or self._residual_teacher is None:
+    def _compose_with_base(self, rl_actions, env, *, compose_residual=True):
+        if (
+            not compose_residual
+            or self.residual_cfg is None
+            or env is None
+            or self._residual_teacher is None
+        ):
             return rl_actions
         from pursuit_residual import compose_actions
 
-        # Isaac vector clones expose the Radar5 logic env on ``.env`` / bridges.
-        logic = getattr(env, "env", env)
-        if hasattr(env, "bridges") and len(getattr(env, "bridges", [])) == 1:
-            logic = env.bridges[0].env
+        from pursuit_residual import _logic_env
+
+        # Vector trainers should pass bridges[i].env; still unwrap if a vec env slips through.
+        logic = _logic_env(env, 0) if hasattr(env, "bridges") or hasattr(env, "envs") else env
         base = np.asarray(self._residual_teacher.actions(logic), dtype=np.float32)
         return compose_actions(
             base,
@@ -242,10 +248,12 @@ class Matd3Trainer:
                 self.demo_metadata["critic_return_clip"] = self.critic_return_clip
 
     @torch.no_grad()
-    def deterministic_action(self, obs, env=None):
+    def deterministic_action(self, obs, env=None, *, compose_residual=True):
         vectors, adjacency, graph = observation_tensors(obs, self.device)
         action = self.actor(vectors, adjacency, graph).tanh().cpu().numpy()
-        return self._compose_with_base(action, env)
+        return self._compose_with_base(
+            action, env, compose_residual=compose_residual
+        )
 
     @torch.no_grad()
     def explore_action(self, obs, rng, env=None):
@@ -522,14 +530,20 @@ class Matd3Trainer:
                 "utd": self.cfg.utd,
                 "actor_grad_norm": last_stats.get("actor_grad_norm"),
                 "critic_grad_norm": last_stats.get("critic_grad_norm"),
+                "residual_α": self.current_residual_weight(),
             }
             self.history.append(clean_history_row(history_row))
             if self.output_directory and (episode + 1 == 1 or (episode + 1) % 10 == 0):
+                residual_w = self.current_residual_weight()
+                residual_tag = (
+                    f" residual_α={residual_w:.3f}" if residual_w is not None else ""
+                )
                 print(
                     f"[matd3] episode={episode + 1} capture={captured} steps={step + 1} "
                     f"return={total_reward:.2f} replay={len(self.online_replay)} "
                     f"success_episodes={self.retained_success_episodes} "
-                    f"updates={self.total_updates} critic={last_stats.get('critic_loss')}",
+                    f"updates={self.total_updates} critic={last_stats.get('critic_loss')}"
+                    f"{residual_tag}",
                     flush=True,
                 )
                 write_reward_capture_chart(self.output_directory / "reward_capture.svg", self.history)
@@ -661,9 +675,16 @@ class Matd3Trainer:
                     if self.output_directory and (
                         completed % max(int(vec_env.num_envs), 1) == 0 or completed >= target
                     ):
+                        residual_w = self.current_residual_weight()
+                        residual_tag = (
+                            f" residual_α={residual_w:.3f}"
+                            if residual_w is not None
+                            else ""
+                        )
                         print(
                             f"[matd3-vec] episode={completed}/{target} capture={captured} "
-                            f"replay={len(self.online_replay)} updates={self.total_updates}",
+                            f"replay={len(self.online_replay)} updates={self.total_updates}"
+                            f"{residual_tag}",
                             flush=True,
                         )
                         write_reward_capture_chart(self.output_directory / "reward_capture.svg", self.history)

@@ -72,8 +72,11 @@ eval_ckpt() {
   local out="${TRAIN_ROOT}/${out_name}"
   local extra=()
   if [[ "$method" == "mappo" && "${RESIDUAL_BASE}" != "none" ]]; then
-    # Train uses residual mode for MAPPO; eval must match.
-    extra+=(--residual-base "${RESIDUAL_BASE}" --residual-mode residual --residual-weight "${RESIDUAL_WEIGHT}")
+    # Match train compose (default blend for full-action DAgger O2O).
+    extra+=(--residual-base "${RESIDUAL_BASE}" --residual-mode "${RESIDUAL_MODE:-blend}" --residual-weight "${RESIDUAL_WEIGHT}")
+  fi
+  if [[ "$method" == "matd3" && "${RESIDUAL_BASE}" != "none" ]]; then
+    extra+=(--residual-base "${RESIDUAL_BASE}" --residual-mode "${RESIDUAL_MODE:-blend}" --residual-weight "${RESIDUAL_WEIGHT}")
   fi
   mkdir -p "$out"
   echo "[eval-closed] $(date -Is) ${method} ckpt=${ckpt} num_envs=${NUM_ENVS} residual=${RESIDUAL_BASE}:${RESIDUAL_WEIGHT}"

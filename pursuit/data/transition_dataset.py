@@ -139,6 +139,7 @@ def collect_teacher_transitions(
     keep_near_misses: bool = False,
     near_miss_gap: float = 1.5,
     max_attempts: int | None = None,
+    min_successes: int = 0,
 ):
     """Collect teacher transitions until ``rollouts`` episodes are **kept**.
 
@@ -158,6 +159,9 @@ def collect_teacher_transitions(
     max_attempts:
         Hard cap on teacher rollouts. Defaults to ``rollouts`` when keeping
         failures, otherwise ``4 * rollouts``.
+    min_successes:
+        Keep collecting past ``rollouts`` until this many successful captures
+        are stored (needed when near-misses fill the kept budget early).
     progress_path:
         Resume/checkpoint file. Must **not** be the final dataset path; callers
         should use :func:`progress_path_for`.
@@ -170,6 +174,7 @@ def collect_teacher_transitions(
         raise ValueError("max_attempts must be >= rollouts")
     if float(near_miss_gap) <= 0.0:
         raise ValueError("near_miss_gap must be positive")
+    min_successes = max(0, int(min_successes))
 
     episodes, report, attempt_report = (
         _resume_teacher_progress(
@@ -214,12 +219,21 @@ def collect_teacher_transitions(
         os.replace(sidecar_tmp, sidecar)
 
     attempts_used = len(attempt_report)
-    while len(episodes) < rollouts:
+
+    def _n_success() -> int:
+        return sum(1 for row in report if row.get("success"))
+
+    def _need_more() -> bool:
+        if len(episodes) < rollouts:
+            return True
+        return bool(min_successes) and _n_success() < min_successes
+
+    while _need_more():
         if attempts_used >= max_attempts:
             raise RuntimeError(
                 f"Only kept {len(episodes)}/{rollouts} teacher episodes after "
-                f"{attempts_used} attempts (successes="
-                f"{sum(1 for row in report if row.get('success'))}); "
+                f"{attempts_used} attempts (successes={_n_success()}"
+                f"{f', need>={min_successes}' if min_successes else ''}); "
                 "raise --max-attempts or inspect the teacher under this config"
             )
         seed = next_seed
@@ -273,10 +287,13 @@ def collect_teacher_transitions(
             episodes.append(trajectory)
             report.append(attempt_row)
         save_progress()
+        target_note = f"{rollouts}"
+        if min_successes:
+            target_note += f" succ={_n_success()}/{min_successes}"
         print(
             f"[transitions] seed={seed} success={success} near_miss={near_miss} "
             f"closest_gap={closest_gap if np.isfinite(closest_gap) else float('nan'):.3f} "
-            f"kept_flag={kept} stored={len(episodes)}/{rollouts} "
+            f"kept_flag={kept} stored={len(episodes)}/{target_note} "
             f"attempts={attempts_used}/{max_attempts}",
             flush=True,
         )
@@ -292,7 +309,7 @@ def collect_teacher_transitions(
         near_miss_gap=near_miss_gap,
         attempt_report=attempt_report,
         complete=True,
-        target_episodes=rollouts,
+        target_episodes=max(rollouts, len(episodes)),
     )
 
 
