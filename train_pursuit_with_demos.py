@@ -1648,16 +1648,16 @@ def main():
                         default=default_output("pursuit_game_v2_run"))
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--demo-seed", type=int, default=2000000)
-    parser.add_argument("--demo-successes", type=int, default=10)
-    parser.add_argument("--demo-attempts", type=int, default=100)
+    parser.add_argument("--demo-successes", type=int, default=30)
+    parser.add_argument("--demo-attempts", type=int, default=300)
     parser.add_argument("--teacher", choices=sorted(BASELINES_3D), default="mpc")
-    parser.add_argument("--bc-updates", type=int, default=1000)
+    parser.add_argument("--bc-updates", type=int, default=3000)
     parser.add_argument("--demo-weight", type=float, help="Initial auxiliary imitation weight")
     parser.add_argument("--demo-weight-floor", type=float,
                         help="Nonzero anti-forgetting imitation floor")
-    parser.add_argument("--correction-fraction", type=float, default=0.5,
+    parser.add_argument("--correction-fraction", type=float, default=0.7,
                         help="Fraction of auxiliary batches sampled from learner-visited DAgger corrections")
-    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--episodes", type=int, default=3000)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4, help="Deprecated shared LR fallback")
@@ -1672,8 +1672,8 @@ def main():
     parser.add_argument("--no-gat", action="store_true")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--torch-threads", type=int, default=1, help="Small graph batches usually benefit from a single CPU thread")
-    parser.add_argument("--validation-interval", type=int, default=50)
-    parser.add_argument("--validation-episodes", type=int, default=10)
+    parser.add_argument("--validation-interval", type=int, default=0, help="0 disables validation during training")
+    parser.add_argument("--validation-episodes", type=int, default=0, help="0 disables validation during training")
     parser.add_argument("--validation-seed", type=int, default=4000000)
     parser.add_argument("--train-seeds-file", type=artifact_path,
                         help="MPC-solvable training seeds, one integer per line")
@@ -1947,7 +1947,7 @@ def main():
     trainer.demo_weight_floor = args.demo_weight_floor
     trainer.correction_fraction = args.correction_fraction
     has_warm_start = trainer.demo_metadata.get("successful_episodes", 0) > 0
-    trainer.reference_kl_weight = args.reference_kl_weight if has_warm_start else 0.0
+    trainer.reference_kl_weight = (0.05 if args.reference_kl_weight is None else args.reference_kl_weight) if has_warm_start else 0.0
     trainer.safeguard_drop = args.safeguard_drop
     trainer.safeguard_patience = args.safeguard_patience
     trainer.min_actor_lr = args.min_actor_lr
