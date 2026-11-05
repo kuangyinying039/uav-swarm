@@ -31,11 +31,15 @@ class Matd3Config:
     use_gat: bool = True
     max_grad_norm: float = 1.0
     utd: int = 1
-    prior_fraction: float = 0.0
+    # Keep expert coverage in every update when a prior dataset is loaded.
+    # Pure-online runs can still override this to zero from the CLI.
+    prior_fraction: float = 0.5
     # When true, online and expert batches keep capture successes only.
     success_replay_only: bool = False
-    demo_bc_weight: float = 0.0
-    demo_bc_final_weight: float = 0.0
+    # A small decaying BC term prevents the actor from drifting away from the
+    # MPC manifold before the centralized critic has become reliable.
+    demo_bc_weight: float = 0.10
+    demo_bc_final_weight: float = 0.02
     demo_bc_decay_steps: int = 100_000
     # TD3+BC (Fujimoto & Gu, 2021): scale RL term by alpha/|Q| and BC toward batch actions.
     td3_bc_alpha: float = 0.0
@@ -43,8 +47,8 @@ class Matd3Config:
     # B3C-style critic target clipping (AAMAS 2026): clamp bootstrap targets by dataset max return.
     critic_return_clip: float | None = None
     # Offline-to-online actor anchor (ANCHOR / WSRL-inspired): stay near frozen init policy.
-    actor_anchor_weight: float = 0.0
-    actor_anchor_final_weight: float = 0.0
+    actor_anchor_weight: float = 0.05
+    actor_anchor_final_weight: float = 0.01
     actor_anchor_decay_steps: int = 100_000
     critic_pretrain_updates: int = 0
     # After this many capture-rate rollbacks, stop and keep best_capture.pt (P0 early stop).
