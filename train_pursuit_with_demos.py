@@ -189,6 +189,41 @@ class PursuitDemoTrainer(MAPPOTrainer):
         self.residual_cfg = None
         self._residual_teacher = None
         self._residual_env_steps = 0
+        self.epn = None
+        self.epn_cfg = None
+        self.epn_runtime = None
+        self.epn_optim = None
+        self.last_epn_mse = 0.0
+        self.last_completed_capture = 0.0
+        self.current_train_domain = None
+
+    def enable_epn(self, cfg=None, env=None):
+        """Attach a shared EvaderPredictionNet to this trainer (and optional env)."""
+        from pursuit_epn import (
+            EPNConfig,
+            attach_epn_to_vector_env,
+            attach_epn_runtime,
+            make_epn,
+            EPNRuntime,
+        )
+
+        probe = env if env is not None else self.env_factory()
+        n_uavs = int(getattr(getattr(probe, "cfg", None), "n_uavs", self.n_agents) or self.n_agents)
+        self.epn_cfg = cfg or EPNConfig(n_uavs=n_uavs)
+        self.epn_cfg.n_uavs = n_uavs
+        self.epn = make_epn(self.epn_cfg, device=self.device)
+        self.epn_optim = torch.optim.Adam(self.epn.parameters(), lr=float(self.epn_cfg.lr))
+        self.epn_runtime = EPNRuntime(self.epn, self.epn_cfg, device=self.device)
+        if env is not None:
+            attach_epn_to_vector_env(env, self.epn_runtime)
+        self.demo_metadata["epn"] = {
+            "enabled": True,
+            "history_steps": int(self.epn_cfg.history_steps),
+            "future_steps": int(self.epn_cfg.future_steps),
+            "hidden_dim": int(self.epn_cfg.hidden_dim),
+            "n_uavs": int(self.epn_cfg.n_uavs),
+        }
+        return self.epn
 
     def set_residual(self, cfg):
         """Compose policy deltas/actions with a classical base before env.step.
@@ -298,8 +333,43 @@ class PursuitDemoTrainer(MAPPOTrainer):
     def _update(self, rollout, episode):
         started = time.perf_counter()
         result = update_pursuit(self, rollout, episode)
+        if self.epn is not None and self.epn_optim is not None:
+            result["epn_mse"] = self._update_epn(rollout)
+            self.last_epn_mse = float(result["epn_mse"])
         result["ppo_update_seconds"] = time.perf_counter() - started
         return result
+
+    def _update_epn(self, rollout):
+        from pursuit_epn import update_epn_from_rollout
+
+        inputs, agents, evaders = [], [], []
+        for row in rollout:
+            if len(row) < 19:
+                continue
+            epn_input, agent_xyz, evader_xyz = row[16], row[17], row[18]
+            if epn_input is None or agent_xyz is None or evader_xyz is None:
+                continue
+            inputs.append(np.asarray(epn_input, dtype=np.float32))
+            agents.append(np.asarray(agent_xyz, dtype=np.float64))
+            evaders.append(np.asarray(evader_xyz, dtype=np.float64))
+        if not inputs:
+            return 0.0
+        cfg_env = type("Cfg", (), self.environment_config)()
+        # dataclass-like attribute access for normalize scales
+        for key, value in self.environment_config.items():
+            setattr(cfg_env, key, value)
+        return float(
+            update_epn_from_rollout(
+                self.epn,
+                self.epn_optim,
+                inputs,
+                agents,
+                evaders,
+                cfg_env,
+                self.epn_cfg,
+                device=self.device,
+            )
+        )
 
     @staticmethod
     def _logic_env_at(vec_env, index: int):
@@ -472,7 +542,7 @@ class PursuitDemoTrainer(MAPPOTrainer):
         executed = np.asarray(actions, dtype=float)
         if hasattr(self, "execution_actions"):
             executed = np.asarray(self.execution_actions(executed, logic_env), dtype=executed.dtype)
-        return executed, {
+        fields = {
             "obs_vec": obs_vec,
             "adjacency": adjacency,
             "hetero_graph": hetero_graph,
@@ -482,7 +552,24 @@ class PursuitDemoTrainer(MAPPOTrainer):
             "policy_samples": policy_samples,
             "logps": logps,
             "value": value,
+            "epn_input": None,
+            "epn_agent_xyz": None,
+            "epn_evader_xyz": None,
         }
+        if self.epn_runtime is not None:
+            from pursuit_epn import agent_xyz, privileged_evader_xyz
+
+            runtime = getattr(logic_env, "epn_runtime", self.epn_runtime)
+            if runtime.last_input is not None:
+                fields["epn_input"] = np.asarray(runtime.last_input, dtype=np.float32).copy()
+            fields["epn_agent_xyz"] = np.stack(
+                [agent_xyz(logic_env, i) for i in range(self.n_agents)], axis=0
+            )
+            try:
+                fields["epn_evader_xyz"] = privileged_evader_xyz(logic_env)
+            except Exception:
+                fields["epn_evader_xyz"] = None
+        return executed, fields
 
     def _append_rollout_transition(self, rollout, fields, transition_result, *, truncated_override=False):
         next_obs = transition_result["obs"]
@@ -514,6 +601,9 @@ class PursuitDemoTrainer(MAPPOTrainer):
                     device=self.device,
                 ),
                 None,
+                fields.get("epn_input"),
+                fields.get("epn_agent_xyz"),
+                fields.get("epn_evader_xyz"),
             )
         )
         return terminated, truncated
@@ -734,6 +824,10 @@ class PursuitDemoTrainer(MAPPOTrainer):
             self._finalize_use_closest_gap = False
             self._finalize_disabled_count = None
             row["residual_α"] = self.current_residual_weight()
+            row["epn_mse"] = float(update_stats.get("epn_mse", self.last_epn_mse) or 0.0)
+            if self.current_train_domain is not None:
+                row["aeg_level"] = self.current_train_domain
+            self.last_completed_capture = float(row.get("capture_success") or 0.0)
             history.append(row)
             callback = getattr(self, "on_vector_episode_complete", None)
             if callable(callback):
@@ -1126,6 +1220,17 @@ class PursuitDemoTrainer(MAPPOTrainer):
         payload["train_seed_bank"] = list(self.train_seed_bank)
         payload["validation_seed_bank"] = list(self.validation_seed_bank)
         payload["seed_bank_version"] = self.seed_bank_version
+        if self.epn is not None:
+            payload["epn"] = self.epn.state_dict()
+            payload["epn_cfg"] = {
+                "history_steps": int(self.epn_cfg.history_steps),
+                "future_steps": int(self.epn_cfg.future_steps),
+                "hidden_dim": int(self.epn_cfg.hidden_dim),
+                "lr": float(self.epn_cfg.lr),
+                "epochs": int(self.epn_cfg.epochs),
+                "n_uavs": int(self.epn_cfg.n_uavs),
+                "missing_fill": float(self.epn_cfg.missing_fill),
+            }
         torch.save(payload, path)
 
     def load_checkpoint(self, path):
@@ -1133,8 +1238,9 @@ class PursuitDemoTrainer(MAPPOTrainer):
         load_environment_config(recorded['env_config'])
         if self.cfg.use_gat and recorded.get("pursuit_graph_version") != PURSUIT_GRAPH_VERSION:
             raise ValueError(
-                "Checkpoint uses the legacy search HGAT and cannot initialize PursuitGraphActor. "
-                "Re-run pretrain/DAgger with the current code; old demo states can be upgraded in memory."
+                "Checkpoint uses a different pursuit graph version and cannot initialize "
+                "PursuitGraphActor. Re-run pretrain/DAgger with the current code; old demo "
+                "states can be upgraded in memory."
             )
         payload = super().load_checkpoint(path)
         self.demo_metadata = payload.get("demo_metadata", {})
@@ -1154,6 +1260,14 @@ class PursuitDemoTrainer(MAPPOTrainer):
         if payload.get("reference_actor") is not None:
             self.capture_reference_policy()
             self.reference_actor.load_state_dict(payload["reference_actor"])
+        if payload.get("epn") is not None:
+            from pursuit_epn import EPNConfig
+
+            epn_cfg = EPNConfig(**payload.get("epn_cfg", {}))
+            if self.epn is None:
+                self.enable_epn(epn_cfg)
+            self.epn.load_state_dict(payload["epn"])
+            self.epn.to(self.device)
         return payload
 
     @torch.no_grad()

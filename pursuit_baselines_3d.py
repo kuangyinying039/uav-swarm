@@ -327,8 +327,393 @@ class CooperativeGuidanceMPC3D:
         return self.plan(env)["actions"]
 
 
+@dataclass
+class NonlinearKinematicMPC3D(CooperativeGuidanceMPC3D):
+    """Receding-horizon nonlinear MPC on the shared velocity-reference plant.
+
+    For this task the learned / classical interface is already a lagged
+    velocity + yaw-rate reference; PhysX + Lee close the loop below that.
+    A torque-level SO(3) NMPC would optimize a different plant than the one
+    the policy actually commands, so this baseline instead:
+
+      * keeps the classic dual-capture goal assignment (interceptor / flanker);
+      * rolls out ``integrate_velocity_reference`` over H knots (accel / tilt
+        limits make the prediction nonlinear);
+      * optimizes a continuous velocity sequence with projected coordinate
+        descent (scipy SLSQP when available).
+
+    Only the first knot is applied (standard receding horizon).
+    """
+
+    horizon: int = 8
+    stage_weight: float = 1.0
+    dual_capture_weight: float = 8.0
+    control_rate_weight: float = 0.15
+    # Keep online eval tractable: 1 warm start + light local polish.
+    refine_passes: int = 2
+    random_restarts: int = 1
+    lbfgs_maxiter: int = 25
+    name: str = "nonlinear_kinematic_mpc_3d"
+
+    def _clip_velocity(self, velocity: np.ndarray, env) -> np.ndarray:
+        c = env.cfg
+        velocity = np.asarray(velocity, dtype=float).copy()
+        horizontal = float(np.linalg.norm(velocity[:2]))
+        if horizontal > c.max_horizontal_velocity:
+            velocity[:2] *= c.max_horizontal_velocity / horizontal
+        velocity[2] = float(
+            np.clip(velocity[2], -c.max_vertical_velocity, c.max_vertical_velocity)
+        )
+        return velocity
+
+    def _yaw_rate_for(self, env, agent: int, state: np.ndarray, velocity: np.ndarray) -> float:
+        c = env.cfg
+        speed_xy = float(np.linalg.norm(velocity[:2]))
+        current_yaw = float(2.0 * math.atan2(state[9], state[6]))
+        desired_yaw = current_yaw if speed_xy < 1e-6 else math.atan2(velocity[1], velocity[0])
+        return float(
+            np.clip(
+                2.0 * _wrap(desired_yaw - current_yaw),
+                -c.max_reference_yaw_rate,
+                c.max_reference_yaw_rate,
+            )
+        )
+
+    def _rollout(
+        self,
+        env,
+        agent: int,
+        start_state: np.ndarray,
+        velocities: np.ndarray,
+        dt: float,
+    ) -> np.ndarray:
+        """Nonlinear first-order velocity-tracking rollout → (H, 3) positions.
+
+        Matches the shared flight-controller lag + accel/speed boxes without the
+        expensive attitude substeps inside ``integrate_velocity_reference``.
+        """
+        del agent  # plant is point-mass / velocity-lag; yaw enters via action only.
+        c = env.cfg
+        tau = max(float(getattr(c, "velocity_response_time", 0.35) or 0.35), 1e-3)
+        alpha = 1.0 - math.exp(-float(dt) / tau)
+        max_acc_xy = float(getattr(c, "max_horizontal_acceleration", 3.0) or 3.0)
+        max_acc_z = float(getattr(c, "max_vertical_acceleration", 2.5) or 2.5)
+        position = np.asarray(start_state[:3], dtype=float).copy()
+        velocity = np.asarray(start_state[3:6], dtype=float).copy()
+        positions = np.zeros((len(velocities), 3), dtype=float)
+        for step, command in enumerate(velocities):
+            command = self._clip_velocity(command, env)
+            delta = (command - velocity) * alpha
+            horiz = float(np.linalg.norm(delta[:2]))
+            limit_xy = max_acc_xy * float(dt)
+            if horiz > limit_xy > 0.0:
+                delta[:2] *= limit_xy / horiz
+            delta[2] = float(np.clip(delta[2], -max_acc_z * dt, max_acc_z * dt))
+            next_velocity = velocity + delta
+            next_velocity = self._clip_velocity(next_velocity, env)
+            position = position + 0.5 * (velocity + next_velocity) * float(dt)
+            velocity = next_velocity
+            positions[step] = position
+        return positions
+
+    def _sequence_cost(
+        self,
+        env,
+        *,
+        agent: int,
+        start_state: np.ndarray,
+        velocities: np.ndarray,
+        goal_traj: np.ndarray,
+        predicted_traj: np.ndarray,
+        previous_velocity: np.ndarray,
+        peer_positions: np.ndarray,
+        capture_radius: float,
+        required: int,
+        separation_weight: float,
+        min_peer_distance: float,
+        dt: float,
+    ) -> float:
+        positions = self._rollout(env, agent, start_state, velocities, dt)
+        cost = 0.0
+        prev = np.asarray(previous_velocity, dtype=float)
+        horizon = len(velocities)
+        for step in range(horizon):
+            weight = self.terminal_weight if step == horizon - 1 else self.stage_weight
+            cost += weight * float(np.sum((positions[step] - goal_traj[step]) ** 2))
+            velocity = self._clip_velocity(velocities[step], env)
+            cost += self.smoothness_weight * float(np.sum((velocity - prev) ** 2))
+            if step > 0:
+                cost += self.control_rate_weight * float(
+                    np.sum((velocity - self._clip_velocity(velocities[step - 1], env)) ** 2)
+                )
+            if len(peer_positions):
+                # Peers assumed nearly stationary over the short horizon (same as classic MPC).
+                peer_distance = float(np.min(np.linalg.norm(peer_positions - positions[step], axis=1)))
+                cost += separation_weight / max(peer_distance, min_peer_distance) ** 2
+            clearance = self._building_clearance(positions[step], env)
+            if np.isfinite(clearance):
+                cost += self.building_weight / max(clearance, 0.2) ** 2
+            prev = velocity
+        if required >= 2:
+            predicted = predicted_traj[-1]
+            distances = [float(np.linalg.norm(positions[-1] - predicted))]
+            if len(peer_positions):
+                distances.extend(
+                    float(x) for x in np.linalg.norm(peer_positions - predicted[None, :], axis=1)
+                )
+            distances.sort()
+            if len(distances) >= 2:
+                slack = max(0.0, distances[1] - float(capture_radius))
+                cost += self.dual_capture_weight * slack * slack
+        return cost
+
+    def _seed_sequence(
+        self,
+        env,
+        *,
+        start: np.ndarray,
+        goal_traj: np.ndarray,
+        previous_velocity: np.ndarray,
+        target_velocity: np.ndarray,
+        dt: float,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        c = env.cfg
+        sequence = np.zeros((self.horizon, 3), dtype=float)
+        position = np.asarray(start, dtype=float).copy()
+        for step in range(self.horizon):
+            desire = (goal_traj[step] - position) / max(dt, 1e-6)
+            # Mild exploration around the bang-bang intercept seed.
+            jitter = rng.normal(0.0, 0.15, size=3) * c.max_horizontal_velocity
+            sequence[step] = self._clip_velocity(desire + jitter, env)
+            position = position + sequence[step] * dt
+        # Always keep a pure previous-velocity / target-velocity seed option.
+        if float(rng.random()) < 0.25:
+            sequence[:] = previous_velocity
+        elif float(rng.random()) < 0.25:
+            sequence[:] = target_velocity
+        return sequence
+
+    def _optimize_sequence(
+        self,
+        env,
+        *,
+        agent: int,
+        start_state: np.ndarray,
+        goal_traj: np.ndarray,
+        predicted_traj: np.ndarray,
+        previous_velocity: np.ndarray,
+        target_velocity: np.ndarray,
+        peer_positions: np.ndarray,
+        capture_radius: float,
+        required: int,
+        separation_weight: float,
+        min_peer_distance: float,
+        dt: float,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, list[np.ndarray]]:
+        cost_kwargs = dict(
+            agent=agent,
+            start_state=start_state,
+            goal_traj=goal_traj,
+            predicted_traj=predicted_traj,
+            previous_velocity=previous_velocity,
+            peer_positions=peer_positions,
+            capture_radius=capture_radius,
+            required=required,
+            separation_weight=separation_weight,
+            min_peer_distance=min_peer_distance,
+            dt=dt,
+        )
+        # Warm start: classic bang-bang toward each predicted goal knot.
+        best = np.zeros((self.horizon, 3), dtype=float)
+        position = np.asarray(start_state[:3], dtype=float).copy()
+        for step in range(self.horizon):
+            desire = (goal_traj[step] - position) / max(dt, 1e-6)
+            best[step] = self._clip_velocity(desire, env)
+            position = position + best[step] * dt
+        best_cost = self._sequence_cost(env, velocities=best, **cost_kwargs)
+        candidates = [best[0].copy()]
+
+        try:
+            from scipy.optimize import minimize
+
+            def pack(seq: np.ndarray) -> np.ndarray:
+                return np.asarray(seq, dtype=float).reshape(-1)
+
+            def unpack(x: np.ndarray) -> np.ndarray:
+                raw = np.asarray(x, dtype=float).reshape(self.horizon, 3)
+                return np.stack([self._clip_velocity(v, env) for v in raw], axis=0)
+
+            def objective(x: np.ndarray) -> float:
+                return self._sequence_cost(env, velocities=unpack(x), **cost_kwargs)
+
+            c = env.cfg
+            bounds = []
+            for _ in range(self.horizon):
+                bounds.extend(
+                    [
+                        (-c.max_horizontal_velocity, c.max_horizontal_velocity),
+                        (-c.max_horizontal_velocity, c.max_horizontal_velocity),
+                        (-c.max_vertical_velocity, c.max_vertical_velocity),
+                    ]
+                )
+            for restart in range(max(1, self.random_restarts)):
+                seed = best if restart == 0 else self._seed_sequence(
+                    env,
+                    start=start_state[:3],
+                    goal_traj=goal_traj,
+                    previous_velocity=previous_velocity,
+                    target_velocity=target_velocity,
+                    dt=dt,
+                    rng=rng,
+                )
+                result = minimize(
+                    objective,
+                    pack(seed),
+                    method="L-BFGS-B",
+                    bounds=bounds,
+                    options={"maxiter": int(self.lbfgs_maxiter), "ftol": 1e-4},
+                )
+                trial = unpack(result.x)
+                cost = float(result.fun)
+                candidates.append(trial[0].copy())
+                if cost + 1e-9 < best_cost:
+                    best_cost = cost
+                    best = trial
+            return best, candidates[:11]
+        except Exception:
+            pass
+
+        # Numpy fallback: projected coordinate descent over a dense candidate set.
+        for restart in range(max(1, self.random_restarts)):
+            sequence = best if restart == 0 else self._seed_sequence(
+                env,
+                start=start_state[:3],
+                goal_traj=goal_traj,
+                previous_velocity=previous_velocity,
+                target_velocity=target_velocity,
+                dt=dt,
+                rng=rng,
+            )
+            cost = self._sequence_cost(env, velocities=sequence, **cost_kwargs)
+            for _ in range(self.refine_passes):
+                for step in range(self.horizon):
+                    local = []
+                    direct = _unit(goal_traj[step] - (start_state[:3] if step == 0 else sequence[step - 1]))
+                    # Rough position estimate along the current plan.
+                    approx = start_state[:3].copy()
+                    for k in range(step):
+                        approx = approx + self._clip_velocity(sequence[k], env) * dt
+                    direct = _unit(goal_traj[step] - approx, direct)
+                    tangent = _unit(np.array([-direct[1], direct[0], 0.0]), np.array([0.0, 1.0, 0.0]))
+                    for speed_fraction in (0.35, 0.55, 0.75, 1.0):
+                        for lateral in (-0.55, -0.25, 0.0, 0.25, 0.55):
+                            direction = _unit(direct + lateral * tangent, direct)
+                            local.append(
+                                direction * env.cfg.max_horizontal_velocity * speed_fraction
+                            )
+                    local.append(np.zeros(3))
+                    local.append(np.asarray(target_velocity, dtype=float))
+                    local.append(np.asarray(previous_velocity, dtype=float))
+                    local.append(sequence[step].copy())
+                    for cand in local:
+                        trial = sequence.copy()
+                        trial[step] = self._clip_velocity(cand, env)
+                        trial_cost = self._sequence_cost(env, velocities=trial, **cost_kwargs)
+                        if trial_cost + 1e-9 < cost:
+                            cost = trial_cost
+                            sequence = trial
+            candidates.append(sequence[0].copy())
+            if cost + 1e-9 < best_cost:
+                best_cost = cost
+                best = sequence
+        return best, candidates[:11]
+
+    def plan(self, env) -> dict:
+        if not hasattr(self, "previous_velocity"):
+            self.reset(env)
+        if not hasattr(self, "_rng"):
+            self._rng = np.random.default_rng(0)
+        c = env.cfg
+        dt = float(getattr(env, "current_decision_dt", c.decision_dt))
+        positions = env.quadrotor_states[:, :3]
+        tracks = [_local_track(env, i) for i in range(c.n_uavs)]
+        n_uavs = c.n_uavs
+        goals, teacher_role, teacher_goal, predicted_target, required = self._assign_goals(
+            env, tracks, positions, self.horizon * dt
+        )
+        separation_weight = (
+            0.35 * self.separation_weight if required >= 2 else self.separation_weight
+        )
+        min_peer_distance = 0.45 if required >= 2 else 0.2
+        capture_radius = float(
+            getattr(c, "capture_radius", max(2.0 * getattr(c, "target_diameter", 0.5), 1e-6))
+        )
+        actions = []
+        candidate_velocity = np.zeros((n_uavs, 11, 3), dtype=np.float32)
+        selected_velocity = np.zeros((n_uavs, 3), dtype=np.float32)
+
+        for i, state in enumerate(env.quadrotor_states):
+            target_position, target_velocity = tracks[i]
+            visible_peers = np.flatnonzero(env.policy_peer_mask(i))
+            peer_ids = [j for j in visible_peers if j != i]
+            peer_positions = positions[peer_ids] if peer_ids else np.zeros((0, 3), dtype=float)
+            goal_traj = np.zeros((self.horizon, 3), dtype=float)
+            predicted_traj = np.zeros((self.horizon, 3), dtype=float)
+            goal = np.asarray(goals[i], dtype=float)
+            # Propagate intercept / flank geometry along constant-velocity prediction.
+            base_offset = goal - (target_position + target_velocity * (self.horizon * dt))
+            for step in range(self.horizon):
+                predicted = target_position + target_velocity * ((step + 1) * dt)
+                predicted_traj[step] = predicted
+                goal_traj[step] = predicted + base_offset
+
+            sequence, first_cands = self._optimize_sequence(
+                env,
+                agent=i,
+                start_state=state,
+                goal_traj=goal_traj,
+                predicted_traj=predicted_traj,
+                previous_velocity=self.previous_velocity[i],
+                target_velocity=target_velocity,
+                peer_positions=peer_positions,
+                capture_radius=capture_radius,
+                required=required,
+                separation_weight=separation_weight,
+                min_peer_distance=min_peer_distance,
+                dt=dt,
+                rng=self._rng,
+            )
+            best_velocity = self._clip_velocity(sequence[0], env)
+            self.previous_velocity[i] = best_velocity
+            actions.append(_reference_action(env, i, best_velocity))
+            stacked = np.stack(first_cands[:11]) if first_cands else np.repeat(best_velocity[None, :], 11, axis=0)
+            if stacked.shape[0] < 11:
+                pad = np.repeat(stacked[-1][None, :], 11 - stacked.shape[0], axis=0)
+                stacked = np.concatenate([stacked, pad], axis=0)
+            candidate_velocity[i] = stacked[:11]
+            selected_velocity[i] = best_velocity
+            teacher_goal[i] = goal_traj[-1]
+
+        return {
+            "actions": np.asarray(actions),
+            "teacher_role": teacher_role,
+            "teacher_goal": teacher_goal,
+            "predicted_target": predicted_target,
+            "candidate_velocity": candidate_velocity,
+            "selected_velocity": selected_velocity,
+            "capture_required_uavs": int(required),
+            "solver": "nmpc_velocity_reference",
+        }
+
+    def actions(self, env) -> np.ndarray:
+        return self.plan(env)["actions"]
+
+
 BASELINES_3D = {
     "apf": ArtificialPotentialField3D,
     "frpn": FastResponseProportionalNavigation3D,
     "mpc": CooperativeGuidanceMPC3D,
+    "nmpc": NonlinearKinematicMPC3D,
 }

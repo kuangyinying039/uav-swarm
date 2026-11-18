@@ -12,9 +12,14 @@ from torch import nn
 from torch.nn import functional as F
 
 
-PURSUIT_GRAPH_VERSION = 3
+PURSUIT_GRAPH_VERSION = 4
 SELF_DIM = 16
-TARGET_DIM = 8
+# Base track features (8) + EPN future relative xyz (3 * H_fut=5). Prediction
+# slots are zeros when EPN is disabled / history is cold. Keep H_fut in sync
+# with pursuit_epn.EPN_FUTURE_STEPS.
+EPN_FUTURE_STEPS = 5
+EPN_TARGET_OFFSET = 8
+TARGET_DIM = EPN_TARGET_OFFSET + 3 * EPN_FUTURE_STEPS
 PEER_DIM = 7
 BUILDING_DIM = 7
 
@@ -26,6 +31,18 @@ def _signed_box_clearance(point, lower, upper):
     if distance > 1e-12:
         return distance
     return -float(np.min(np.r_[point - lower, upper - point]))
+
+
+def _target_node_with_epn(base8: np.ndarray, env, agent: int) -> np.ndarray:
+    """Append EPN future relative xyz (or zeros) to the 8-D track features."""
+    node = np.zeros(TARGET_DIM, dtype=np.float32)
+    node[:EPN_TARGET_OFFSET] = np.asarray(base8, dtype=np.float32).reshape(-1)[:EPN_TARGET_OFFSET]
+    pred = getattr(env, "epn_predicted_rel", None)
+    if pred is not None:
+        flat = np.asarray(pred[agent], dtype=np.float32).reshape(-1)
+        width = min(flat.size, TARGET_DIM - EPN_TARGET_OFFSET)
+        node[EPN_TARGET_OFFSET : EPN_TARGET_OFFSET + width] = flat[:width]
+    return node
 
 
 def pursuit_graph_observation(env):
@@ -86,13 +103,14 @@ def pursuit_graph_observation(env):
                 except ImportError:
                     from .pursuit_lidar import lidar_sees_point
                 own_lidar = float(lidar_sees_point(env, agent, track.mean[:3]))
-                graph["target_nodes"][agent, 0] = np.r_[
+                base = np.r_[
                     relative[:2] / cfg.grid_size,
                     relative[2] / z_scale,
                     np.asarray(track.mean[3:6], dtype=float) / target_speed,
                     min(distance / cfg.grid_size, 1.0),
                     own_lidar,
                 ]
+                graph["target_nodes"][agent, 0] = _target_node_with_epn(base, env, agent)
                 graph["target_mask"][agent, 0] = True
 
         if hasattr(env, "last_graph"):
@@ -172,10 +190,14 @@ def pursuit_graph_from_flat_observation(observation, cfg):
             relative = np.r_[vectors[agent, 10:12] * cfg.grid_size, vectors[agent, 7] * z_scale]
             velocity = np.r_[vectors[agent, 8:10] * cfg.target_speed,
                              vectors[agent, 15] * cfg.target_vertical_speed]
-            graph["target_nodes"][agent, 0] = np.r_[
+            base = np.r_[
                 relative[:2] / cfg.grid_size, relative[2] / z_scale,
                 velocity / target_speed, min(np.linalg.norm(relative) / cfg.grid_size, 1.0), 1.0,
             ]
+            # Legacy flat demos have no EPN history; prediction slots stay zero.
+            node = np.zeros(TARGET_DIM, dtype=np.float32)
+            node[:EPN_TARGET_OFFSET] = np.asarray(base, dtype=np.float32).reshape(-1)[:EPN_TARGET_OFFSET]
+            graph["target_nodes"][agent, 0] = node
             graph["target_mask"][agent, 0] = True
         peer_rows = vectors[agent, peer_start:building_start].reshape(n_agents, PEER_DIM).copy()
         # Legacy flat context normalized all xyz deltas by grid size; the new

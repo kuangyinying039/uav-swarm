@@ -1,0 +1,22 @@
+{
+  "method": "mpc",
+  "seed": 1000,
+  "formation": "one_side",
+  "perception": "mid360",
+  "outcome": "dynamic_collision",
+  "physics_steps": 71,
+  "simulation_seconds": 1.42,
+  "height_min": 4.938825607299805,
+  "height_max": 5.161134243011475,
+  "evader_xyz": [
+    0.5368676781654358,
+    -9.167694091796875,
+    5.161134243011475
+  ],
+  "pursuer_distance": [
+    5.317060947418213,
+    7.965546607971191,
+    6.136014461517334
+  ],
+  "video": "/srv/data/projects/kyy/xieton/repro/results/same-scene-seed1000/mpc.mp4"
+}

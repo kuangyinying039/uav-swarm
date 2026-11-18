@@ -682,15 +682,18 @@ class IsaacPursuitEnv:
         self._target_paths = []
         self._target_translates = []
         self._building_ops = []  # list[env][building] -> (translate, scale)
-        # Near-black slate — stays dark under dome light, clear in top-down.
+        # Light concrete (GUI): matches Oct20 coop reference + user request for
+        # lighter buildings that do not blend into dark Hummingbird meshes.
+        # Slight per-building variation keeps outlines readable.
         building_palette = [
-            (0.08, 0.09, 0.11),
-            (0.06, 0.07, 0.09),
-            (0.10, 0.09, 0.08),
-            (0.07, 0.08, 0.10),
+            (0.82, 0.84, 0.88),
+            (0.78, 0.80, 0.84),
+            (0.85, 0.83, 0.80),
+            (0.76, 0.78, 0.82),
         ]
-        # Fully opaque physical buildings (GUI + headless).
-        building_opacity = 1.0
+        # GUI: translucent so occluded UAVs remain visible; headless stays opaque
+        # (semantics / collision unchanged either way).
+        building_opacity = 0.42 if not self._headless else 1.0
         # Pad only slightly beyond the Radar5 grid (25 m + 1.5 m each side).
         ground_margin = 1.5
         ground_extent = float(self.cfg.grid_size) + 2.0 * ground_margin
@@ -733,6 +736,11 @@ class IsaacPursuitEnv:
                 add_update_semantics(target.GetPrim(), "radar5_target", "type")
             except Exception:
                 pass
+            # physx_closed already has a Hummingbird body for the evader; the
+            # solid radar5_target sphere would sit on top and hide that mesh in
+            # GUI. Keep collision/semantics for LiDAR, hide the render only.
+            if self._physx_closed_loop and not self._headless:
+                UsdGeom.Imageable(target.GetPrim()).MakeInvisible()
             UsdPhysics.CollisionAPI.Apply(target.GetPrim())
             rigid = UsdPhysics.RigidBodyAPI.Apply(target.GetPrim())
             rigid.CreateKinematicEnabledAttr(True)
@@ -939,7 +947,7 @@ class IsaacPursuitEnv:
             pass
         print(
             f"[isaac] viewport presentation applied "
-            f"(pad={float(self.cfg.grid_size):.0f}m+margin, solid buildings)",
+            f"(pad={float(self.cfg.grid_size):.0f}m+margin, light translucent buildings)",
             flush=True,
         )
 

@@ -1,0 +1,22 @@
+{
+  "method": "cbf",
+  "seed": 1000,
+  "formation": "one_side",
+  "perception": "mid360",
+  "outcome": "captured",
+  "physics_steps": 197,
+  "simulation_seconds": 3.94,
+  "height_min": 4.889819145202637,
+  "height_max": 5.660600662231445,
+  "evader_xyz": [
+    1.3044042587280273,
+    -4.7179341316223145,
+    5.660600662231445
+  ],
+  "pursuer_distance": [
+    0.5891324877738953,
+    5.35344123840332,
+    1.366774320602417
+  ],
+  "video": "/srv/data/projects/kyy/xieton/repro/results/same-scene-seed1000/cbf.mp4"
+}

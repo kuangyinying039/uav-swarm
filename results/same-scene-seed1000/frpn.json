@@ -1,0 +1,22 @@
+{
+  "method": "frpn",
+  "seed": 1000,
+  "formation": "one_side",
+  "perception": "mid360",
+  "outcome": "success",
+  "physics_steps": 673,
+  "simulation_seconds": 13.46,
+  "height_min": 4.946372985839844,
+  "height_max": 5.627940654754639,
+  "evader_xyz": [
+    1.5877723693847656,
+    10.726608276367188,
+    5.452757835388184
+  ],
+  "pursuer_distance": [
+    7.045418739318848,
+    7.922377109527588,
+    13.759767532348633
+  ],
+  "video": "/srv/data/projects/kyy/xieton/repro/results/same-scene-seed1000/frpn.mp4"
+}

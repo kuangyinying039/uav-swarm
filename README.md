@@ -8,6 +8,7 @@ real flight.
 
 | Document | Purpose |
 |----------|---------|
+| **[`CODE_EXPLAINED.md`](CODE_EXPLAINED.md)** | **中文详解**：场景设定、工程约束、问题与解决思路、算法原理 |
 | **[`TECHNICAL_SPEC.md`](TECHNICAL_SPEC.md)** | Current configs, algorithm stack, and **hybrid vs physx_closed** result tables (anti-confusion) |
 | [`SIM2REAL.md`](SIM2REAL.md) | Action / obs / capture contract for PX4 |
 | [`results/`](results/) | Frozen compact eval summaries (JSON) |
@@ -36,11 +37,14 @@ deployment code**. Large checkpoints (`.pt`) stay under `$UAV_PROJECT_RUNS`.
 ## Repository layout
 
 ```
+CODE_EXPLAINED.md       # 中文：场景 / 约束 / 问题 / 思路 / 算法
 TECHNICAL_SPEC.md       # configs + methods + dual result tables
 SIM2REAL.md
 results/                # compact held-out capture summaries
 configs/pursuit_v2/     # dual difficulty ladder (+ *_physx_closed, optional *_d05)
 pursuit/                # algorithms, trainers, datasets
+pursuit_epn.py / pursuit_aeg.py   # 逃逸预测 + 离散课程
+pursuit_baselines_3d.py           # APF / FRPN / MPC / NMPC
 isaac_pursuit_backend.py
 train_isaac_pursuit.py / evaluate_isaac_pursuit.py
 collect_isaac_pursuit_data.py / pretrain_isaac_pursuit_actor.py

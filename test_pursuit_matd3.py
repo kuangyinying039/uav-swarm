@@ -49,9 +49,9 @@ class PursuitMatd3Tests(unittest.TestCase):
         teacher.reset(env)
         np.testing.assert_allclose(planned["actions"], teacher.actions(env))
         self.assertEqual(planned["teacher_role"].shape, (env.cfg.n_uavs,))
-        self.assertTrue(set(planned["teacher_role"]).issubset({0, 1}))
+        self.assertTrue(set(planned["teacher_role"]).issubset({0, 1, 2}))
 
-    def test_mpc_dual_capture_assigns_multiple_interceptors(self):
+    def test_mpc_dual_capture_assigns_interceptors_and_flanker(self):
         cfg = QuadrotorPursuitConfig(
             seed=4, building_count=0, capture_required_uavs=2, search_steps=3
         )
@@ -61,16 +61,17 @@ class PursuitMatd3Tests(unittest.TestCase):
         env.disabled_uavs = np.zeros(cfg.n_uavs, dtype=bool)
         env.quadrotor_states = np.zeros((cfg.n_uavs, 13), dtype=float)
         env.quadrotor_states[:, 6] = 1.0
+        # Two nearby pursuers + one far flanker; target moving +Y.
         env.quadrotor_states[:, :3] = [[4.0, 5.0, 5.0], [6.0, 5.0, 5.0], [12.0, 12.0, 5.0]]
         env.dynamic_targets = np.array([[5.0, 5.0]])
         env.target_altitudes = np.array([5.0])
         env.target_velocity = np.zeros((1, 2), dtype=float)
         env.target_vertical_velocity = np.zeros(1, dtype=float)
-        # Minimal track memory: initialized local estimates at the true target.
+
         class _Track:
             def __init__(self):
                 self.initialized = True
-                self.mean = np.array([5.0, 5.0, 5.0, 0.0, 0.0, 0.0], dtype=float)
+                self.mean = np.array([5.0, 5.0, 5.0, 0.0, 1.0, 0.0], dtype=float)
 
         env.track_memory = [[_Track()] for _ in range(cfg.n_uavs)]
         env.last_graph = np.ones((cfg.n_uavs, cfg.n_uavs), dtype=float)
@@ -80,13 +81,48 @@ class PursuitMatd3Tests(unittest.TestCase):
         teacher.reset(env)
         planned = teacher.plan(env)
         self.assertEqual(planned["capture_required_uavs"], 2)
-        self.assertGreaterEqual(int(np.count_nonzero(planned["teacher_role"] == 0)), 2)
-        # Intercept goals stay inside the capture sphere around the prediction.
-        for agent in np.flatnonzero(planned["teacher_role"] == 0):
+        roles = planned["teacher_role"]
+        # Classic MPC: role 0 = interceptor (k closest), role 1 = flanker.
+        self.assertEqual(int(np.count_nonzero(roles == 0)), 2)
+        self.assertEqual(int(np.count_nonzero(roles == 1)), 1)
+        for agent in np.flatnonzero(roles == 0):
             offset = np.linalg.norm(
                 planned["teacher_goal"][agent] - planned["predicted_target"][agent]
             )
             self.assertLessEqual(offset, cfg.capture_radius + 1e-6)
+        dists = [
+            float(np.linalg.norm(env.quadrotor_states[i, :3] - planned["predicted_target"][i]))
+            for i in range(cfg.n_uavs)
+        ]
+        order = list(np.argsort(dists))
+        self.assertEqual(int(roles[order[0]]), 0)
+        self.assertEqual(int(roles[order[1]]), 0)
+        self.assertEqual(int(roles[order[2]]), 1)
+
+    def test_nmpc_plan_matches_actions_and_uses_nonlinear_solver(self):
+        from pursuit_baselines_3d import NonlinearKinematicMPC3D
+
+        env = QuadrotorPursuitEnv(self.env_cfg)
+        teacher = NonlinearKinematicMPC3D(random_restarts=1, refine_passes=1)
+        teacher.reset(env)
+        planned = teacher.plan(env)
+        teacher.reset(env)
+        np.testing.assert_allclose(planned["actions"], teacher.actions(env))
+        self.assertEqual(planned["solver"], "nmpc_velocity_reference")
+        self.assertEqual(planned["selected_velocity"].shape, (env.cfg.n_uavs, 3))
+
+    def test_evader_velocity_command_respects_speed_limits(self):
+        # Classic PhysX-closed path uses the base heading command (no EMA smooth).
+        env = QuadrotorPursuitEnv(
+            QuadrotorPursuitConfig(seed=4, building_count=0, search_steps=3, evader_policy="occlusion")
+        )
+        cmd = env.desired_evader_world_velocity(0)
+        self.assertEqual(cmd.shape, (3,))
+        self.assertLessEqual(
+            float(np.linalg.norm(cmd[:2])),
+            float(env.cfg.target_speed) + 1e-6,
+        )
+        self.assertLessEqual(abs(float(cmd[2])), float(env.cfg.target_vertical_speed) + 1e-6)
 
     def test_transition_keeps_proposed_action_and_optional_failures(self):
         env = QuadrotorPursuitEnv(self.env_cfg)

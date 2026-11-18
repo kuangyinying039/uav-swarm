@@ -32,7 +32,7 @@ def _level_config_path(level: str, *, physx_closed: bool = False) -> Path:
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--method", choices=("apf", "frpn", "mpc", "mappo", "matd3"), required=True)
+    parser.add_argument("--method", choices=("apf", "frpn", "mpc", "nmpc", "mappo", "matd3"), required=True)
     parser.add_argument("--checkpoint", type=artifact_path,
                         help="Required for MAPPO/MATD3; never use an old kinematic checkpoint")
     parser.add_argument("--levels", nargs="+", choices=LEVELS, default=list(LEVELS))
@@ -56,7 +56,7 @@ def build_parser():
     )
     parser.add_argument(
         "--residual-base",
-        choices=("apf", "frpn", "mpc"),
+        choices=("apf", "frpn", "mpc", "nmpc"),
         default=None,
         help="If set with a learned method, mix classical base + RL (see --residual-mode)",
     )
@@ -97,7 +97,7 @@ def build_parser():
 
 def _policy_action(method, action_fn, policy, env, observation, env_index: int = 0):
     """Compute one (n_uavs, 4) action for a single parallel slot."""
-    if method in ("apf", "frpn", "mpc"):
+    if method in ("apf", "frpn", "mpc", "nmpc"):
         return np.asarray(policy.actions(env.bridges[env_index].env), dtype=np.float32)
     # Residual wrappers accept env_index so the classical teacher sees the same slot.
     try:
@@ -204,6 +204,11 @@ def load_policy(method, checkpoint, env, device):
             config.device = device
             trainer = PursuitDemoTrainer(lambda _episode=0: env, config)
             trainer.load_checkpoint(checkpoint)
+            if trainer.epn is not None and trainer.epn_runtime is not None:
+                from pursuit_epn import attach_epn_to_vector_env
+
+                attach_epn_to_vector_env(env, trainer.epn_runtime)
+                trainer.epn.eval()
             trainer.actor.eval()
             return lambda observation: deterministic_action(trainer, observation), trainer
 
@@ -512,7 +517,7 @@ def main():
         parser.error("--seed-count must be positive and --max-steps nonnegative")
     if args.method in ("mappo", "matd3") and args.checkpoint is None:
         parser.error("--checkpoint is required for learned methods")
-    if args.method in ("apf", "frpn", "mpc") and args.checkpoint is not None:
+    if args.method in ("apf", "frpn", "mpc", "nmpc") and args.checkpoint is not None:
         parser.error("baseline methods do not accept --checkpoint")
     if args.residual_base is not None and args.method not in ("mappo", "matd3"):
         parser.error("--residual-base requires --method mappo or matd3")

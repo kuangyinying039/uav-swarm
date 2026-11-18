@@ -1,0 +1,22 @@
+{
+  "method": "orca",
+  "seed": 1000,
+  "formation": "one_side",
+  "perception": "mid360",
+  "outcome": "success",
+  "physics_steps": 784,
+  "simulation_seconds": 15.68,
+  "height_min": 4.8481950759887695,
+  "height_max": 5.732222080230713,
+  "evader_xyz": [
+    1.8131909370422363,
+    11.17904281616211,
+    5.663031578063965
+  ],
+  "pursuer_distance": [
+    4.796151161193848,
+    2.3748509883880615,
+    4.995677947998047
+  ],
+  "video": "/srv/data/projects/kyy/xieton/repro/results/same-scene-seed1000/orca.mp4"
+}

@@ -146,6 +146,24 @@ def build_parser():
         action="store_true",
         help="Pure PhysX 3+1 closed loop (same-model evader drone); see SIM2REAL.md",
     )
+    parser.add_argument(
+        "--epn",
+        action="store_true",
+        help="Enable Evader Prediction Network (LSTM) for MAPPO; bumps pursuit graph v4",
+    )
+    parser.add_argument(
+        "--aeg",
+        action="store_true",
+        help="Enable discrete Adaptive Environment Generator over medium/hard/severe",
+    )
+    parser.add_argument("--aeg-r-min", type=float, default=0.5)
+    parser.add_argument("--aeg-r-max", type=float, default=0.9)
+    parser.add_argument("--aeg-window", type=int, default=50)
+    parser.add_argument(
+        "--aeg-levels",
+        default="medium,hard,severe",
+        help="Comma-separated ladder levels for --aeg",
+    )
     return parser
 
 
@@ -273,33 +291,54 @@ def _variant_config(variant, args, env_cfg):
 
 TRAIN_DOMAINS = ("hard",)
 EVAL_DOMAINS = ("nominal", "medium", "hard", "severe", "extreme")
+AEG_DEFAULT_LEVELS = ("medium", "hard", "severe")
 
 
-def _training_mix(*, physx_closed: bool = False):
+def _parse_aeg_levels(raw) -> tuple[str, ...]:
+    text = str(raw or "").strip()
+    if not text:
+        return AEG_DEFAULT_LEVELS
+    levels = tuple(part.strip() for part in text.split(",") if part.strip())
+    if not levels:
+        raise ValueError("--aeg-levels must list at least one domain")
+    return levels
+
+
+def _training_mix(*, physx_closed: bool = False, levels=None):
     root = Path(__file__).resolve().parent / "configs" / "pursuit_v2"
     suffix = "_physx_closed" if physx_closed else ""
+    domain_levels = tuple(levels) if levels is not None else TRAIN_DOMAINS
     return [
         _load_env_config(root / f"radar5_dual_{level}{suffix}.json")
-        for level in TRAIN_DOMAINS
+        for level in domain_levels
     ]
 
 
-def _bind_training_domains(env):
+def _bind_training_domains(env, levels=None):
     # Closed-loop envs must mix *_physx_closed ladder JSONs so capture_radius /
     # building_count stay on the same contract as IsaacPursuitEnv.cfg.
     closed = bool(getattr(env, "_physx_closed_loop", False))
-    mix = _training_mix(physx_closed=closed)
+    domain_levels = tuple(levels) if levels is not None else TRAIN_DOMAINS
+    mix = _training_mix(physx_closed=closed, levels=domain_levels)
+    level_to_cfg = {level: cfg for level, cfg in zip(domain_levels, mix)}
 
     def apply(episode):
         cfg = mix[int(episode) % len(mix)]
         env.configure_domain(cfg)
         return cfg
 
-    def apply_medium():
-        env.configure_domain(mix[0])
-        return mix[0]
+    def apply_level(level: str):
+        cfg = level_to_cfg[str(level)]
+        env.configure_domain(cfg)
+        return cfg
 
-    return apply, apply_medium, mix
+    def apply_medium():
+        # Held-out physical validation stays on the first configured domain
+        # (hard for the default AEG mix; hard-only when AEG is off).
+        preferred = "hard" if "hard" in level_to_cfg else domain_levels[0]
+        return apply_level(preferred)
+
+    return apply, apply_medium, mix, domain_levels, apply_level
 
 
 def _physical_validation_metrics(env, apply_medium, action_fn, seeds):
@@ -452,11 +491,38 @@ def _run_mappo(args, env):
         checkpoint_path=str(args.out / "latest.pt"),
         episode_budget_checkpoints=_parse_budget_checkpoints(args.budget_checkpoints, args.episodes),
     )
-    apply_domain, apply_medium, mix = _bind_training_domains(env)
+    use_aeg = bool(getattr(args, "aeg", False))
+    aeg_levels = _parse_aeg_levels(getattr(args, "aeg_levels", None)) if use_aeg else TRAIN_DOMAINS
+    apply_domain, apply_medium, mix, domain_levels, apply_level = _bind_training_domains(
+        env, levels=aeg_levels if use_aeg else TRAIN_DOMAINS
+    )
     num_envs = int(getattr(args, "num_envs", 1) or 1)
+    aeg = None
+    if use_aeg:
+        from pursuit_aeg import AEGConfig, DiscreteAEG
+
+        aeg = DiscreteAEG(
+            AEGConfig(
+                levels=tuple(domain_levels),
+                r_min=float(getattr(args, "aeg_r_min", 0.5)),
+                r_max=float(getattr(args, "aeg_r_max", 0.9)),
+                window=int(getattr(args, "aeg_window", 50)),
+                cold_start_level="hard" if "hard" in domain_levels else domain_levels[0],
+            )
+        )
+        aeg.set_seed(int(args.seed))
+
+    domain_state = {
+        "level": aeg.current_level if aeg is not None else domain_levels[0]
+    }
 
     def env_factory(episode=0):
-        apply_domain(episode)
+        if aeg is None:
+            apply_domain(episode)
+            domain_state["level"] = domain_levels[int(episode) % len(domain_levels)]
+        else:
+            domain_state["level"] = aeg.current_level
+            apply_level(domain_state["level"])
         if num_envs > 1:
             env.reset(
                 seeds=[
@@ -472,7 +538,28 @@ def _run_mappo(args, env):
     trainer.output_directory = args.out
     trainer.validation_seeds = _isaac_validation_seeds(args)
     trainer.validation_seed_bank = list(trainer.validation_seeds)
-    trainer.on_vector_episode_complete = apply_domain
+    trainer.current_train_domain = domain_state["level"]
+
+    def on_episode_complete(completed):
+        level = trainer.current_train_domain or domain_state["level"]
+        captured = bool(getattr(trainer, "last_completed_capture", 0.0))
+        if aeg is not None:
+            aeg.observe(level, captured)
+            next_level = aeg.next_level()
+            domain_state["level"] = next_level
+            trainer.current_train_domain = next_level
+            apply_level(next_level)
+            trainer.demo_metadata["aeg_stats"] = aeg.stats()
+        else:
+            apply_domain(completed)
+            domain_state["level"] = domain_levels[int(completed) % len(domain_levels)]
+            trainer.current_train_domain = domain_state["level"]
+
+    trainer.on_vector_episode_complete = on_episode_complete
+    if bool(getattr(args, "epn", False)):
+        from pursuit_epn import EPNConfig
+
+        trainer.enable_epn(EPNConfig(n_uavs=int(env.cfg.n_uavs)), env=env)
     from_scratch = bool(getattr(args, "from_scratch", False))
     # P1: stronger demo retention + KL anchor so DAgger warm-start survives PPO.
     if from_scratch:
@@ -543,7 +630,9 @@ def _run_mappo(args, env):
         _validation_action,
         trainer.validation_seeds,
     )
-    trainer.demo_metadata["train_domains"] = list(TRAIN_DOMAINS)
+    trainer.demo_metadata["train_domains"] = list(domain_levels)
+    trainer.demo_metadata["aeg"] = bool(use_aeg)
+    trainer.demo_metadata["epn"] = bool(getattr(args, "epn", False))
     trainer.demo_metadata["execution_backend"] = (
         "isaac_physx_closed" if bool(getattr(args, "physx_closed_loop", False)) else "isaac_physx"
     )
@@ -624,7 +713,8 @@ def _run_mappo(args, env):
             trainer.validate_capture(0)
         except Exception as error:
             print(f"[mappo] pre-RL validation skipped: {error}", flush=True)
-    if num_envs > 1:
+    # EPN label collection and AEG domain callbacks live on the vectorized path.
+    if num_envs > 1 or bool(getattr(args, "epn", False)) or bool(getattr(args, "aeg", False)):
         history = trainer.train_vectorized(env)
     else:
         history = trainer.train()
@@ -651,7 +741,7 @@ def _run_matd3(args, env):
     config.max_steps = int(args.max_steps)
     num_envs = int(getattr(args, "num_envs", 1) or 1)
 
-    apply_domain, apply_medium, mix = _bind_training_domains(env)
+    apply_domain, apply_medium, mix, _domain_levels, _apply_level = _bind_training_domains(env)
 
     def env_factory(episode=0):
         apply_domain(episode)
