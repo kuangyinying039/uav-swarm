@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "simulation": {
+    "drone_model": "Hummingbird",
+    "controller": "LeePositionController",
+    "dt": 0.016129032258064516,
+    "flight_mode": "planar",
+    "target_height": 1.5,
+    "headless": true,
+    "aircraft_collisions": false,
+    "env_spacing": null,
+    "minimum_env_spacing": 32.0,
+    "env_spacing_margin": 6.0,
+    "evader_speed_limit": 2.0
+  },
+  "task": {
+    "type": "peg_evader",
+    "goal_radius": 0.75,
+    "max_episode_steps": 3200,
+    "terminate_on": {
+      "captured": true,
+      "static_collision": true,
+      "dynamic_collision": true,
+      "out_of_bounds": true,
+      "physical_failure": true,
+      "success": true
+    },
+    "physical_failure": {
+      "min_height": 1.2,
+      "max_height": 1.8,
+      "max_horizontal_speed": 3.0
+    }
+  },
+  "reward": {
+    "terms": {
+      "captured": {
+        "enabled": true,
+        "scale": -20.0
+      },
+      "static_collision": {
+        "enabled": true,
+        "scale": -20.0
+      },
+      "dynamic_collision": {
+        "enabled": true,
+        "scale": -20.0
+      },
+      "out_of_bounds": {
+        "enabled": true,
+        "scale": -20.0
+      },
+      "physical_failure": {
+        "enabled": true,
+        "scale": -20.0
+      },
+      "success": {
+        "enabled": true,
+        "scale": 80.0
+      },
+      "timeout": {
+        "enabled": true,
+        "scale": -20.0
+      },
+      "progress": {
+        "enabled": true,
+        "scale": 8.0
+      },
+      "goal_velocity": {
+        "enabled": true,
+        "scale": 0.1
+      },
+      "step": {
+        "enabled": true,
+        "scale": -0.01
+      },
+      "stall": {
+        "enabled": true,
+        "scale": -0.5
+      }
+    },
+    "progress": {
+      "mode": "distance",
+      "gamma": 0.999,
+      "potential_distance_scale": 1.0,
+      "zero_potential_on_termination": true,
+      "zero_potential_on_truncation": false
+    },
+    "stall": {
+      "window_steps": 32,
+      "near_goal_distance": 2.0,
+      "min_static_clearance": 0.3,
+      "min_pursuer_clearance": 0.3,
+      "min_progress": 0.03,
+      "max_speed": 0.08
+    }
+  },
+  "observation": {
+    "pursuers": {
+      "fields": [
+        "position",
+        "velocity",
+        "attitude",
+        "angular_velocity",
+        "motor_throttle",
+        "radius"
+      ],
+      "range": null,
+      "max_count": 3
+    },
+    "lidar_range": 4.0,
+    "dynamic_range": 4.0
+  },
+  "scene": {
+    "bounds": {
+      "half_extent_x": 10.5,
+      "half_extent_y": 13.0
+    },
+    "evader_radius": 0.3,
+    "start_goal": {
+      "start_side": "south",
+      "goal_side": "north",
+      "side_mode": "opposite",
+      "half_extent": 11.0,
+      "min_distance": 1.5,
+      "boundary_clearance": 0.1
+    },
+    "static_obstacles": {
+      "count": 16,
+      "radius_min": 0.2,
+      "radius_max": 0.55,
+      "region_half_extent": 10.0,
+      "spacing_margin": 0.05,
+      "start_goal_clearance": 0.1
+    },
+    "dynamic_obstacles": {
+      "count": 3,
+      "radii": [
+        0.125,
+        0.25,
+        0.375,
+        0.5
+      ],
+      "speed_min": 0.5,
+      "speed_max": 1.5,
+      "region_half_extent": 10.0,
+      "spacing_margin": 0.2,
+      "start_goal_clearance": 0.1,
+      "local_goal_half_range": 5.0,
+      "goal_switch_threshold": 0.5
+    },
+    "max_sampling_attempts": 4096
+  }
+}

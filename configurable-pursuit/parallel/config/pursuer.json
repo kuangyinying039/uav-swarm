@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "sampling_seed": 0,
+  "common": {
+    "use_detection_range": true,
+    "detection_range": 4.0,
+    "responsibility_radius": 7.5,
+    "search_duration": 0.5,
+    "patrol_speed": 0.8,
+    "goal_switch_threshold": 0.5,
+    "idle_mode": "patrol"
+  },
+  "strategies": [
+    {
+      "name": "direct_chase",
+      "weight": 0.3,
+      "params": {}
+    },
+    {
+      "name": "cut_front",
+      "weight": 0.3,
+      "params": {
+        "cut_in_distance": 2.0
+      }
+    },
+    {
+      "name": "follow_pressure",
+      "weight": 0.1,
+      "params": {
+        "rear_distance": 0.8,
+        "lateral_distance": 1.6
+      }
+    },
+    {
+      "name": "choke_block",
+      "weight": 0.3,
+      "params": {
+        "min_gap": 1.2,
+        "max_gap": 3.5,
+        "route_half_width": 2.5,
+        "min_forward_distance": 1.0,
+        "max_forward_distance": 20.0,
+        "formation_offset": 0.25,
+        "fallback_distance": 3.0,
+        "deployment_radius": 10.0,
+        "deployment_speed": 1.2,
+        "route_progress": 0.55,
+        "static_margin": 0.7
+      }
+    }
+  ],
+  "spawn": {
+    "count": 3,
+    "radius": 0.3,
+    "speed_min": 2.0,
+    "speed_max": 2.0,
+    "region_half_extent": 10.0,
+    "patrol_radius": 3.0,
+    "stratified": true,
+    "spacing_margin": 0.2,
+    "start_goal_clearance": 0.1,
+    "anchor_clearance": 4.000001
+  }
+}

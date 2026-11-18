@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "static_obstacles": {
+    "visible": true,
+    "color": [
+      0.32,
+      0.46,
+      0.62
+    ],
+    "height": 3.0
+  },
+  "dynamic_obstacles": {
+    "visible": true,
+    "color": [
+      1.0,
+      0.48,
+      0.08
+    ],
+    "height": 3.0
+  },
+  "camera": {
+    "resolution": [
+      1920,
+      1080
+    ],
+    "height": 40.0,
+    "margin": 2.0,
+    "view": "oblique",
+    "position": [
+      20.0,
+      -28.0,
+      32.0
+    ],
+    "target": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "follow_evader": false,
+    "zoom": 1.0
+  },
+  "recording": {
+    "enabled": false,
+    "output_dir": "parallel/examples/render",
+    "fps": 30
+  },
+  "markers": {
+    "evader_color": [
+      0.1,
+      0.7,
+      1.0
+    ],
+    "pursuer_color": [
+      1.0,
+      0.15,
+      0.15
+    ],
+    "goal_color": [
+      0.25,
+      1.0,
+      0.15
+    ],
+    "boundary_color": [
+      1.0,
+      0.85,
+      0.25
+    ],
+    "line_width": 0.06
+  }
+}

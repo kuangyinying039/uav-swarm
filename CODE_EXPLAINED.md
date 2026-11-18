@@ -1,5 +1,7 @@
 # Radar5 多机追逃：代码详解（场景 · 约束 · 问题 · 思路 · 算法）
 
+> 正在训练的圆柱场景、单机扫掠捕获和 MAPPO/MATD3 见 [`configurable-pursuit/CURRENT_SYSTEM.md`](configurable-pursuit/CURRENT_SYSTEM.md)。下文是本仓库原先的 `isaac_dual_physx_closed`：五栋建筑、双机捕获球。两套设定不要混读，数字也不能并排比较。
+
 | 字段 | 值 |
 |------|----|
 | 文档版本 | 2026-11-18 |
