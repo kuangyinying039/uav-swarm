@@ -37,6 +37,7 @@ from parallel.training.mappo import (
     _build_app,
     _evaluate_controller,
     imitation_phase,
+    imitation_budget,
     reference_scale,
     _evaluate_batches,
     SuccessSteps,
@@ -248,11 +249,6 @@ def update_matd3(
     return stats
 
 
-def _weights(update: int, warmup: int, span: int) -> float:
-    progress = min(max(update - warmup, 0) / max(span, 1), 1.0)
-    return max(1.0 * (1.0 - progress) + 0.35 * progress, 0.35)
-
-
 def train(args):
     from parallel.examples.radar5_guidance import PursuerGuidance, evader_command, shield_pursuer_command
     from parallel.training.aeg import AEGConfig, DiscreteAEG, LEVEL_SPEED, LayoutCurriculum, reset_with_curriculum
@@ -263,6 +259,14 @@ def train(args):
         args.num_envs, args.seed, args.output, args.scene, args.perception,
         resume=bool(getattr(args, "resume", False)),
     )
+    import subprocess
+    try:
+        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+    manifest = {"revision": revision, "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                "bc_metric": "normalized_action_mse", "resume_kind": "partial" if args.resume else "fresh"}
+    (args.output / f"run_{time.time_ns()}.json").write_text(json.dumps(manifest, indent=2))
     device = env.device
     try:
         state = env.state()
@@ -346,36 +350,6 @@ def train(args):
         def pursue_teacher(_state, _progress):
             return teacher.command(env)
 
-        def gate() -> dict:
-            nonlocal matched, accepted_actor, teacher_report, anchor
-            saved_h = env.evader_horizontal.clone()
-            saved_v = env.evader_vertical.clone()
-            if evader_level == "aeg":
-                horizontal, vertical = LEVEL_SPEED["medium"]
-                env.evader_horizontal.fill_(horizontal)
-                env.evader_vertical.fill_(vertical)
-            seeds = list(range(8_000_000, 8_000_000 + int(env.n)))
-            actor_report = _evaluate_controller(
-                env, forecaster, observe, evader_command, max_steps, pursue_actor, seeds
-            )
-            held_teacher = _evaluate_controller(
-                env, forecaster, observe, evader_command, max_steps, pursue_teacher, seeds
-            )
-            teacher.previous.zero_()
-            env.evader_horizontal.copy_(saved_h)
-            env.evader_vertical.copy_(saved_v)
-            if actor_report["capture_rate"] + 1e-6 >= held_teacher["capture_rate"] - 0.02:
-                matched = True
-            teacher_report = held_teacher
-            emit(
-                f"[matd3] gate actor={actor_report['capture_rate']:.3f} "
-                f"collisions={actor_report['static_collisions']}+{actor_report['dynamic_collisions']} "
-                f"teacher={held_teacher['capture_rate']:.3f} "
-                f"teacher_collisions={held_teacher['static_collisions']}+{held_teacher['dynamic_collisions']} "
-                f"matched={int(matched)}"
-            )
-            return actor_report
-
         completed = 0
         update = 0
         dagger_origin = None
@@ -397,17 +371,12 @@ def train(args):
             if payload.get("epn") is not None:
                 forecaster.net.load_state_dict(payload["epn"])
             history = list(payload.get("history") or [])
-            hist_path = args.output / "history.json"
-            if hist_path.is_file():
-                disk_history = json.loads(hist_path.read_text())
-                if len(disk_history) >= len(history):
-                    history = list(disk_history)
             if history:
                 update = int(history[-1].get("update") or -1) + 1
                 completed = int(history[-1].get("episodes") or 0)
                 stored = history[-1].get("env_steps")
                 env_steps = int(stored) if stored is not None else update * args.rollout_steps * args.num_envs
-                critic_warmup = 4
+                critic_warmup = 0
             emit(f"[matd3] resume from {ckpt_path} steps={env_steps} update={update} episodes={completed}")
         rl_at = None
         extend_note = False
@@ -426,6 +395,7 @@ def train(args):
 
         def snapshot() -> dict:
             return {
+                "epn": {key: value.detach().cpu().clone() for key, value in forecaster.net.state_dict().items()},
                 "actor": {key: value.detach().cpu().clone() for key, value in actor.state_dict().items()},
                 "actor_target": {key: value.detach().cpu().clone() for key, value in actor_target.state_dict().items()},
                 "critic": {key: value.detach().cpu().clone() for key, value in critic.state_dict().items()},
@@ -433,6 +403,8 @@ def train(args):
             }
 
         def restore(snap: dict) -> None:
+            forecaster.net.load_state_dict(snap["epn"])
+            forecaster.optimizer.state.clear()
             actor.load_state_dict(snap["actor"])
             actor_target.load_state_dict(snap["actor_target"])
             critic.load_state_dict(snap["critic"])
@@ -642,6 +614,7 @@ def train(args):
             )
             row = {
                 "update": update,
+                "env_steps": env_steps,
                 "episodes": completed,
                 "finished": finished_steps,
                 "captures": captures,
@@ -716,6 +689,7 @@ def train(args):
         if evader_level == "aeg":
             for index in range(env.n):
                 _apply_level(env, index, "medium")
+        torch.save(_payload(actor, critic, actor_target, critic_target, forecaster, history, args), args.output / "matd3_eval.pt")
         actor_report = _evaluate_batches(
             env, forecaster, observe, evader_command, max_steps, pursue_actor, 10_000_000, args.final_episodes,
         )
@@ -729,12 +703,13 @@ def train(args):
             **actor_report,
             "teacher": args.teacher,
             "perception": args.perception,
-            "dagger": True,
+            "dagger": teacher is not None and any(row.get("phase") == "dagger" for row in history),
             "teacher_eval": held_teacher,
             "control": "learner mean action, no teacher in the action, safety shield on",
             "eval_evader_level": "medium" if evader_level == "aeg" else evader_level,
-            "checkpoint": "best capture",
-            "best_capture": best_capture,
+            "checkpoint": "matd3_eval.pt",
+            "selection": "best confirmed" if best_snap is not None else "final",
+            "best_capture": best_capture if best_capture >= 0 else None,
             "matched": matched,
             "epn": True,
             "aeg": evader_level == "aeg",
@@ -816,8 +791,7 @@ def _payload(actor, critic, actor_target, critic_target, forecaster, history, ar
             "teacher": None if args.teacher == "none" else args.teacher,
             "scene": args.scene,
             "exploration_std": args.exploration_std,
-            "bc_floor": 0.35,
-            "anchor_floor": 0.35,
+            "bc_metric": "normalized_action_mse",
         },
     }
 
@@ -830,7 +804,6 @@ def main():
     parser.add_argument("--rl-steps", type=int, default=5_000_000)
     parser.add_argument("--confirm-episodes", type=int, default=1024)
     parser.add_argument("--final-episodes", type=int, default=4096)
-    parser.add_argument("--max-episodes", type=int, default=20000)
     parser.add_argument("--rollout-steps", type=int, default=32)
     parser.add_argument("--updates-per-rollout", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -850,14 +823,21 @@ def main():
     parser.add_argument("--bc-max", type=int, default=48)
     parser.add_argument("--bc-steps", type=int, default=64)
     parser.add_argument("--gate-interval", type=int, default=8)
-    parser.add_argument("--dagger-warmup", type=int, default=8)
     parser.add_argument("--dagger-decay", type=int, default=24)
     parser.add_argument("--dagger-fit", type=float, default=0.35)
-    parser.add_argument("--dagger-latest", type=int, default=32, help="保留参数，不再用来强制进入混合")
     parser.add_argument("--perception", choices=("truth", "mid360"), default="mid360")
     parser.add_argument("--resume", action="store_true", help="从输出目录里的 matd3.pt 继续")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--allow-partial-resume", action="store_true",
+                        help="Explicitly accept resetting replay, optimizers and curriculum; pure RL only")
     args = parser.parse_args()
+    if args.resume and (not args.allow_partial_resume or args.teacher != "none"):
+        parser.error("Checkpoints do not support full continuation. For pure RL only, use --allow-partial-resume to explicitly accept a partial restart; teacher runs must start fresh.")
+    if args.teacher != "none":
+        args.imitation_max_steps = imitation_budget(
+            args.imitation_max_steps, args.num_envs, args.rollout_steps,
+            args.bc_max, args.dagger_decay,
+        )
     if not 1 <= args.num_envs <= 1024:
         parser.error("num-envs must be 1..1024")
     if args.episodes < 1 or args.policy_delay < 1 or args.batch_size < 1:

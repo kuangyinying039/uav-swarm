@@ -107,7 +107,7 @@ def _intent_cylinders(env, points: torch.Tensor):
     keep = 3
     if valid is None or centers.shape[2] <= keep:
         return centers, radii, motion, valid
-    gap = torch.linalg.vector_norm(points[:, :, None, :2] - centers[..., :2], dim=-1)
+    gap = torch.linalg.vector_norm(points[:, :, None, :2] - centers[..., :2], dim=-1) - radii - BODY_RADIUS
     gap = gap.masked_fill(~valid, 1.0e6)
     index = torch.topk(gap, keep, dim=-1, largest=False).indices
     centers = centers.gather(2, index.unsqueeze(-1).expand(*index.shape, centers.shape[-1]))
@@ -630,10 +630,7 @@ class PursuerGuidance:
             raw = apf_velocity(env) if self.method == "apf" else frpn_velocity(env)
             velocity = keep_in_band(raw, points[..., 2], PURSUER_VERTICAL)
             preferred = pack_command(velocity, state[:, 1:, 3:7])
-            executed = pack_command(
-                shield_velocity(velocity, points, env, peers=True, horizontal=PURSUER_HORIZONTAL, vertical=PURSUER_VERTICAL),
-                state[:, 1:, 3:7],
-            )
+            executed = shield_pursuer_command(env, preferred)
             return preferred, executed
         if self.method == "orca":
             velocity = orca_guidance(env)
@@ -642,10 +639,7 @@ class PursuerGuidance:
         else:
             velocity = mpc_guidance(env, self.previous)
         preferred = pack_command(velocity, state[:, 1:, 3:7])
-        executed = pack_command(
-            shield_velocity(velocity, points, env, peers=True, horizontal=PURSUER_HORIZONTAL, vertical=PURSUER_VERTICAL),
-            state[:, 1:, 3:7],
-        )
+        executed = shield_pursuer_command(env, preferred)
         return preferred, executed
 
     def command(self, env) -> torch.Tensor:

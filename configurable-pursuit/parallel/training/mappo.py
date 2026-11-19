@@ -8,7 +8,7 @@ then adds the capture bonus, a collision penalty, and a per-step time penalty.
 
 Run from environments/configurable-pursuit after source ./activate.sh:
 
-    python -m parallel.training.mappo --num-envs 128 --updates 20 --rollout-steps 32 --output runtime/mappo-radar5
+    python -m parallel.training.mappo --num-envs 128 --rl-steps 100000 --rollout-steps 32 --output runtime/mappo-radar5
 """
 
 from __future__ import annotations
@@ -69,6 +69,12 @@ def bc_stalled(values: list[float], fit: float, window: int = 16, tolerance: flo
     if len(values) < window + 8 or min(values) <= fit:
         return False
     return min(values[-window:]) > min(values[:-window]) - tolerance
+
+
+def imitation_budget(requested: int, num_envs: int, rollout_steps: int, bc_max: int, dagger_steps: int) -> int:
+    """Allow the latest BC/DAgger transition and one rollout to enter RL."""
+    minimum = (bc_max + dagger_steps + 1) * num_envs * rollout_steps
+    return max(requested, minimum)
 
 
 def still_training(env_steps: int, imitation_max_steps: int, rl_steps: int, teacher_on: bool, rl_at_steps: int | None) -> bool:
@@ -537,12 +543,20 @@ def _intent_nll(mean: torch.Tensor, log_std: torch.Tensor, command: torch.Tensor
 
 
 def _intent_mse(prediction: torch.Tensor, command: torch.Tensor, alive: torch.Tensor) -> torch.Tensor:
-    error = (prediction - command).square().sum(-1)
+    error = (command_to_unit(prediction) - command_to_unit(command)).square().mean(-1)
     return (error * alive).sum() / alive.sum().clamp_min(1.0)
 
 
 def _evaluate_controller(env, forecaster, observe, evader_command, max_steps, pursue, seeds) -> dict:
     """pursue(state, progress) 返回已经过安全过滤的追捕机指令。"""
+    import subprocess
+    try:
+        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+    manifest = {"revision": revision, "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                "bc_metric": "normalized_action_mse", "resume_kind": "partial" if args.resume else "fresh"}
+    (args.output / f"run_{time.time_ns()}.json").write_text(json.dumps(manifest, indent=2))
     device = env.device
     ids = torch.arange(env.n, device=device)
     forecaster.reset(ids)
@@ -675,11 +689,6 @@ def train(args):
             if payload.get("epn") is not None:
                 forecaster.net.load_state_dict(payload["epn"])
             history = list(payload.get("history") or [])
-            hist_path = args.output / "history.json"
-            if hist_path.is_file():
-                disk_history = json.loads(hist_path.read_text())
-                if len(disk_history) >= len(history):
-                    history = list(disk_history)
             if history:
                 env_steps = int(history[-1].get("env_steps") or 0)
                 update = int(history[-1].get("update") or -1) + 1
@@ -699,24 +708,6 @@ def train(args):
         def observe(state, progress):
             return graph_observation(state, env, forecaster.observe(state, progress, *radar_track(env)))
 
-        def fit_teacher(obs_f, teacher_f, alive_f, epochs: int) -> float:
-            mse = 0.0
-            flat_count = obs_f.shape[0]
-            for _epoch in range(epochs):
-                order = torch.randperm(flat_count, device=device)
-                for start in range(0, flat_count, args.minibatch):
-                    batch = order[start:start + args.minibatch]
-                    mean, _std = actor(obs_f[batch])
-                    error = (pursuer_command(mean) - teacher_f[batch]).square().sum(-1)
-                    mask = alive_f[batch]
-                    bc_loss = (error * mask).sum() / mask.sum().clamp_min(1.0)
-                    bc_optimizer.zero_grad()
-                    bc_loss.backward()
-                    nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
-                    bc_optimizer.step()
-                    mse = float(bc_loss.detach())
-            return mse
-
         replay = CommandReplay(524_288, n_pursuers, obs_dim, action_dim, device)
         val_replay = CommandReplay(65_536, n_pursuers, obs_dim, action_dim, device)
         successes = SuccessSteps(env.n)
@@ -726,11 +717,14 @@ def train(args):
 
         def snapshot() -> dict:
             return {
+                "epn": {key: value.detach().cpu().clone() for key, value in forecaster.net.state_dict().items()},
                 "actor": {key: value.detach().cpu().clone() for key, value in actor.state_dict().items()},
                 "critic": {key: value.detach().cpu().clone() for key, value in critic.state_dict().items()},
             }
 
         def restore(snap: dict) -> None:
+            forecaster.net.load_state_dict(snap["epn"])
+            forecaster.optimizer.state.clear()
             actor.load_state_dict(snap["actor"])
             critic.load_state_dict(snap["critic"])
             actor_optimizer.state.clear()
@@ -1091,6 +1085,7 @@ def train(args):
         if evader_level == "aeg":
             for index in range(env.n):
                 _apply_level(env, index, "medium")
+        torch.save(_payload(actor, critic, forecaster, history, evader_level, static_count, dynamic_count, args.teacher, args.scene, evader_level == "aeg"), args.output / "mappo_eval.pt")
         actor_report = _evaluate_batches(
             env, forecaster, observe, evader_command, max_steps, pursue_actor, 10_000_000, args.final_episodes,
         )
@@ -1103,12 +1098,13 @@ def train(args):
             **actor_report,
             "teacher": args.teacher,
             "perception": args.perception,
-            "dagger": True,
+            "dagger": teacher is not None and any(row.get("phase") == "dagger" for row in history),
             "teacher_eval": held_teacher,
             "control": "learner mean action, no teacher in the action, safety shield on",
             "eval_evader_level": "medium" if evader_level == "aeg" else evader_level,
-            "checkpoint": "best capture",
-            "best_capture": best_capture,
+            "checkpoint": "mappo_eval.pt",
+            "selection": "best confirmed" if best_snap is not None else "final",
+            "best_capture": best_capture if best_capture >= 0 else None,
             "matched": matched,
         }
         (args.output / "eval.json").write_text(json.dumps(evaluation, indent=2))
@@ -1161,7 +1157,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--episodes", type=int, default=5000, help="保留参数，停止条件改用环境步数")
-    parser.add_argument("--max-episodes", type=int, default=20000, help="保留参数，停止条件改用环境步数")
     parser.add_argument("--imitation-max-steps", type=int, default=600_000)
     parser.add_argument("--rl-steps", type=int, default=5_000_000)
     parser.add_argument("--confirm-episodes", type=int, default=1024)
@@ -1179,10 +1174,8 @@ def main():
     parser.add_argument("--bc-max", type=int, default=48)
     parser.add_argument("--bc-steps", type=int, default=64)
     parser.add_argument("--gate-interval", type=int, default=8)
-    parser.add_argument("--dagger-warmup", type=int, default=8)
     parser.add_argument("--dagger-decay", type=int, default=24)
     parser.add_argument("--dagger-fit", type=float, default=0.35)
-    parser.add_argument("--dagger-latest", type=int, default=32, help="保留参数，阶段不再由它推动")
     parser.add_argument("--kl-coef", type=float, default=0.5)
     parser.add_argument("--kl-target", type=float, default=0.03)
     parser.add_argument("--perception", choices=("truth", "mid360"), default="mid360")
@@ -1192,7 +1185,16 @@ def main():
         action="store_true",
         help="Continue from output/mappo.pt and history.json in an existing output directory",
     )
+    parser.add_argument("--allow-partial-resume", action="store_true",
+                        help="Explicitly accept resetting replay, optimizers and curriculum; pure RL only")
     args = parser.parse_args()
+    if args.resume and (not args.allow_partial_resume or args.teacher != "none"):
+        parser.error("Checkpoints do not support full continuation. For pure RL only, use --allow-partial-resume to explicitly accept a partial restart; teacher runs must start fresh.")
+    if args.teacher != "none":
+        args.imitation_max_steps = imitation_budget(
+            args.imitation_max_steps, args.num_envs, args.rollout_steps,
+            args.bc_max, args.dagger_decay,
+        )
     if not 1 <= args.num_envs <= 1024:
         parser.error("num-envs must be 1..1024")
     if args.episodes < 1:
