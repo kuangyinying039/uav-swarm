@@ -259,7 +259,10 @@ def train(args):
     from parallel.training.hetero import graph_observation
     from parallel.training.epn import FUTURE_STEPS, BatchEPN, radar_track
 
-    app, env = _build_app(args.num_envs, args.seed, args.output, args.scene, args.perception)
+    app, env = _build_app(
+        args.num_envs, args.seed, args.output, args.scene, args.perception,
+        resume=bool(getattr(args, "resume", False)),
+    )
     device = env.device
     try:
         state = env.state()
@@ -382,6 +385,30 @@ def train(args):
         low_streak = 0
         best_monitor = -1.0
         critic_warmup = 0
+        if bool(getattr(args, "resume", False)):
+            ckpt_path = args.output / "matd3.pt"
+            if not ckpt_path.is_file():
+                raise FileNotFoundError(f"--resume needs {ckpt_path}")
+            payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            actor.load_state_dict(payload["actor"])
+            actor_target.load_state_dict(payload.get("actor_target") or payload["actor"])
+            critic.load_state_dict(payload["critic"])
+            critic_target.load_state_dict(payload.get("critic_target") or payload["critic"])
+            if payload.get("epn") is not None:
+                forecaster.net.load_state_dict(payload["epn"])
+            history = list(payload.get("history") or [])
+            hist_path = args.output / "history.json"
+            if hist_path.is_file():
+                disk_history = json.loads(hist_path.read_text())
+                if len(disk_history) >= len(history):
+                    history = list(disk_history)
+            if history:
+                update = int(history[-1].get("update") or -1) + 1
+                completed = int(history[-1].get("episodes") or 0)
+                stored = history[-1].get("env_steps")
+                env_steps = int(stored) if stored is not None else update * args.rollout_steps * args.num_envs
+                critic_warmup = 4
+            emit(f"[matd3] resume from {ckpt_path} steps={env_steps} update={update} episodes={completed}")
         rl_at = None
         extend_note = False
         bc_trace: list[float] = []
@@ -646,6 +673,7 @@ def train(args):
             emit(
                 f"[matd3] update={update} episodes={completed}/{args.episodes} "
                 f"phase={row['phase']} capture_rate={row['capture_rate']:.3f} reward={row['mean_reward']:.3f} "
+                f"epn_mse={epn_mse:.4f} "
                 f"critic={critic_loss if critic_loss is not None else 0:.3f} "
                 f"bc={bc_mse if bc_mse is not None else 0:.4f} successes={successes.kept} "
                 f"anchor={anchor_mse if anchor_mse is not None else 0:.4f} "
@@ -827,12 +855,15 @@ def main():
     parser.add_argument("--dagger-fit", type=float, default=0.35)
     parser.add_argument("--dagger-latest", type=int, default=32, help="保留参数，不再用来强制进入混合")
     parser.add_argument("--perception", choices=("truth", "mid360"), default="mid360")
+    parser.add_argument("--resume", action="store_true", help="从输出目录里的 matd3.pt 继续")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 1 <= args.num_envs <= 1024:
         parser.error("num-envs must be 1..1024")
     if args.episodes < 1 or args.policy_delay < 1 or args.batch_size < 1:
         parser.error("episodes, policy-delay and batch-size must be positive")
+    if args.resume and not (args.output / "matd3.pt").is_file():
+        parser.error(f"--resume requires {args.output / 'matd3.pt'}")
     started = time.time()
     train(args)
     print(f"[matd3] elapsed={time.time() - started:.1f}s", flush=True)

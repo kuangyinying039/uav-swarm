@@ -149,12 +149,12 @@ def build_parser():
     parser.add_argument(
         "--epn",
         action="store_true",
-        help="Enable Evader Prediction Network (LSTM) for MAPPO; bumps pursuit graph v4",
+        help="Enable Evader Prediction Network (LSTM) for MAPPO/MATD3; bumps pursuit graph v4",
     )
     parser.add_argument(
         "--aeg",
         action="store_true",
-        help="Enable discrete Adaptive Environment Generator over medium/hard/severe",
+        help="Enable discrete Adaptive Environment Generator over medium/hard/severe (MAPPO/MATD3)",
     )
     parser.add_argument("--aeg-r-min", type=float, default=0.5)
     parser.add_argument("--aeg-r-max", type=float, default=0.9)
@@ -741,10 +741,37 @@ def _run_matd3(args, env):
     config.max_steps = int(args.max_steps)
     num_envs = int(getattr(args, "num_envs", 1) or 1)
 
-    apply_domain, apply_medium, mix, _domain_levels, _apply_level = _bind_training_domains(env)
+    use_aeg = bool(getattr(args, "aeg", False))
+    aeg_levels = _parse_aeg_levels(getattr(args, "aeg_levels", None)) if use_aeg else TRAIN_DOMAINS
+    apply_domain, apply_medium, mix, domain_levels, apply_level = _bind_training_domains(
+        env, levels=aeg_levels if use_aeg else TRAIN_DOMAINS
+    )
+    aeg = None
+    if use_aeg:
+        from pursuit_aeg import AEGConfig, DiscreteAEG
+
+        aeg = DiscreteAEG(
+            AEGConfig(
+                levels=tuple(domain_levels),
+                r_min=float(getattr(args, "aeg_r_min", 0.5)),
+                r_max=float(getattr(args, "aeg_r_max", 0.9)),
+                window=int(getattr(args, "aeg_window", 50)),
+                cold_start_level="hard" if "hard" in domain_levels else domain_levels[0],
+            )
+        )
+        aeg.set_seed(int(args.seed))
+
+    domain_state = {
+        "level": aeg.current_level if aeg is not None else domain_levels[0]
+    }
 
     def env_factory(episode=0):
-        apply_domain(episode)
+        if aeg is None:
+            apply_domain(episode)
+            domain_state["level"] = domain_levels[int(episode) % len(domain_levels)]
+        else:
+            domain_state["level"] = aeg.current_level
+            apply_level(domain_state["level"])
         if num_envs > 1:
             env.reset(
                 seeds=[
@@ -756,6 +783,28 @@ def _run_matd3(args, env):
         return env
 
     trainer = Matd3Trainer(env_factory, config, seed=args.seed)
+    trainer.current_train_domain = domain_state["level"]
+
+    def on_episode_complete(completed):
+        level = trainer.current_train_domain or domain_state["level"]
+        captured = bool(getattr(trainer, "last_completed_capture", 0.0))
+        if aeg is not None:
+            aeg.observe(level, captured)
+            next_level = aeg.next_level()
+            domain_state["level"] = next_level
+            trainer.current_train_domain = next_level
+            apply_level(next_level)
+            trainer.demo_metadata["aeg_stats"] = aeg.stats()
+        else:
+            apply_domain(completed)
+            domain_state["level"] = domain_levels[int(completed) % len(domain_levels)]
+            trainer.current_train_domain = domain_state["level"]
+
+    trainer.on_vector_episode_complete = on_episode_complete
+    if bool(getattr(args, "epn", False)):
+        from pursuit_epn import EPNConfig
+
+        trainer.enable_epn(EPNConfig(n_uavs=int(env.cfg.n_uavs)), env=env)
     validation_pure_rl = _resolve_validation_pure_rl(args)
 
     def _validation_action(obs, env_index=0):
@@ -776,7 +825,9 @@ def _run_matd3(args, env):
         _validation_action,
         trainer.validation_seeds,
     )
-    trainer.demo_metadata["train_domains"] = list(TRAIN_DOMAINS)
+    trainer.demo_metadata["train_domains"] = list(domain_levels)
+    trainer.demo_metadata["aeg"] = bool(use_aeg)
+    trainer.demo_metadata["epn"] = bool(getattr(args, "epn", False))
     trainer.demo_metadata["execution_backend"] = (
         "isaac_physx_closed" if bool(getattr(args, "physx_closed_loop", False)) else "isaac_physx"
     )
@@ -877,7 +928,7 @@ def _run_matd3(args, env):
             from pursuit.eval import evaluate_policy
 
             trainer.validate(0, evaluate_policy)
-    if num_envs > 1:
+    if num_envs > 1 or bool(getattr(args, "epn", False)) or bool(getattr(args, "aeg", False)):
         history = trainer.train_vectorized(rng, env)
     else:
         history = trainer.train(rng)

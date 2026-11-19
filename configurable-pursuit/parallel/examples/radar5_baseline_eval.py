@@ -62,16 +62,25 @@ def _build(episodes: int, seed: int, output: Path, perception: str | None, forma
     return app, env
 
 
-def run_method(env, method: str, seeds: list[int]) -> dict:
+def run_method(env, method: str, seeds: list[int], level: str) -> dict:
     device = env.device
     guidance = PursuerGuidance(method, env.n, device)
     env.reset(seeds=seeds)
+    from parallel.training.aeg import LEVEL_SPEED
+
+    horizontal, vertical = LEVEL_SPEED[level]
+    env.evader_horizontal = torch.full((env.n,), horizontal, device=device)
+    env.evader_vertical = torch.full((env.n,), vertical, device=device)
     guidance.reset()
     outcome = torch.zeros(env.n, dtype=torch.long, device=device)
     end_step = torch.full((env.n,), -1, device=device)
     min_height = torch.full((env.n,), float("inf"), device=device)
     track_hits = 0
     track_slots = 0
+    team_visible_steps = 0
+    open_env_steps = 0
+    uav_visible_sum = 0.0
+    living_uav_steps = 0
     dt = float(env.rules.settings["simulation"]["dt"])
     substeps = physics_substeps(dt)
     max_steps = int(env.rules.settings["task"]["max_episode_steps"])
@@ -92,19 +101,28 @@ def run_method(env, method: str, seeds: list[int]) -> dict:
             end_step = torch.where(done & (end_step < 0), end_step.new_tensor(steps), end_step)
             min_height = torch.minimum(min_height, info["state"][..., 2].amin(-1))
             if env.mid360 is not None:
+                alive = ~env.disabled[:, 1:]
+                open_env = outcome == 0
+                seeing = env.mid360.visible & alive & open_env[:, None]
+                living = alive & open_env[:, None]
+                team_visible_steps += int(seeing.any(-1).sum())
+                open_env_steps += int(open_env.sum())
+                uav_visible_sum += float(seeing.sum())
+                living_uav_steps += int(living.sum())
                 track_hits += int(env.mid360.valid.sum())
                 track_slots += int(env.mid360.valid.numel())
             if bool((outcome != 0).all()):
                 break
         if steps % (50 * substeps) < substeps:
             print(
-                f"[baseline] {method} step={steps} "
+                f"[baseline] {level} {method} step={steps} "
                 f"captured={int((outcome == 1).sum())} goal={int((outcome == 6).sum())} "
                 f"open={int((outcome == 0).sum())}",
                 flush=True,
             )
     captured = outcome == 1
     capture_times = end_step[captured].float() * dt
+    capture_steps = torch.ceil(end_step[captured].float() / substeps)
     episodes = env.n
     summary = {
         "episodes": episodes,
@@ -116,13 +134,18 @@ def run_method(env, method: str, seeds: list[int]) -> dict:
         "dynamic_collisions": int((outcome == 3).sum()),
         "physical_failures": int((outcome == 5).sum()),
         "capture_rate": float(captured.float().mean()),
+        "mean_capture_steps": float(capture_steps.mean()) if int(captured.sum()) else None,
+        "team_visibility_ratio": None if open_env_steps == 0 else team_visible_steps / open_env_steps,
+        "uav_visibility_ratio": None if living_uav_steps == 0 else uav_visible_sum / living_uav_steps,
         "goal_rate": float((outcome == 6).float().mean()),
         "timeout_rate": float((outcome == 7).float().mean()),
         "mean_capture_seconds": float(capture_times.mean()) if int(captured.sum()) else None,
+        "mean_goal_seconds": float(end_step[outcome == 6].float().mean() * dt) if int((outcome == 6).sum()) else None,
+        "mean_episode_seconds": float(end_step[outcome != 0].float().mean() * dt) if int((outcome != 0).sum()) else None,
         "min_height": float(min_height.min()),
         "track_valid_rate": None if track_slots == 0 else track_hits / track_slots,
     }
-    print(f"[baseline] {method} {json.dumps(summary)}", flush=True)
+    print(f"[baseline] {level} {method} {json.dumps(summary)}", flush=True)
     return summary
 
 
@@ -148,24 +171,29 @@ def main():
             "episodes": args.episodes,
             "seed_start": args.seed,
             "decision_dt": 0.2,
+            "capture_step": "one 0.2 s decision; mean_capture_steps counts decisions until capture",
             "flight_mode": "free_3d",
             "capture": "3D swept contact between the evader and any living pursuer",
             "goal": "evader inside the 3D goal ball and no failure",
-            "evader": "goal_avoid with vertical evasion up to 0.88 m/s",
-            "evader_speed_limit": 2.0,
-            "spawn": "goal side of the evader, 8–10 m, initially visible" if args.formation == "one_side" else "peg stratified",
+            "evader": "goal_avoid at the three reinforcement-learning AEG levels",
+            "levels_m_s": {"medium": [1.46, 0.84], "hard": [1.52, 0.88], "severe": [1.72, 1.00]},
+            "spawn": "handoff triangle on the goal side of the evader, 8-10 m, initially visible; cylinders replace the five buildings" if args.formation == "one_side" else "peg stratified",
+            "visibility": "team_visibility_ratio is the fraction of steps in which at least one living pursuer has geometric line of sight; uav_visibility_ratio is the fraction of living pursuer-steps with line of sight. Cylinders occlude.",
             "perception": "per-pursuer MID-360 track with smoothed velocity, coast limit and teammate track sharing; no track searches the goal; cylinders occlude" if args.perception == "mid360" else "simulator truth",
+            "bounds_half_extent_m": [10.5, 13.0],
             "obstacles": "16 static cylinders and 3 dynamic obstacles; any living aircraft that touches one ends the episode and is disabled",
             "guidance": "APF, FRPN, ORCA, CBF-QP and receding-horizon MPC each propose a velocity. The issued command of every method then passes the same brake half-space shield. Obstacle geometry and the target point both come from each pursuer's MID-360 track. Unseen cylinders are ignored. Tracked cylinders use a 0.55 m assumed radius.",
             "aircraft_collision": "3D body contact disables both aircraft; evader-pursuer contact is capture",
             "termination": "peg: capture, collision, out_of_bounds, physical_failure, success, timeout",
-            "methods": {},
+            "levels": {},
         }
-        for method in args.methods:
-            started = time.time()
-            summary = run_method(env, method, seeds)
-            summary["seconds"] = time.time() - started
-            report["methods"][method] = summary
+        for level in ("medium", "hard", "severe"):
+            report["levels"][level] = {"horizontal_m_s": report["levels_m_s"][level][0], "vertical_m_s": report["levels_m_s"][level][1], "methods": {}}
+            for method in args.methods:
+                started = time.time()
+                summary = run_method(env, method, seeds, level)
+                summary["seconds"] = time.time() - started
+                report["levels"][level]["methods"][method] = summary
         (args.output / "summary.json").write_text(json.dumps(report, indent=2))
         print(f"[baseline] wrote {args.output / 'summary.json'}", flush=True)
     except BaseException:

@@ -157,7 +157,11 @@ def one_side_triangle(rng: np.random.Generator, target: np.ndarray, buildings: l
 
 
 def one_side_visible(rng: np.random.Generator, target: np.ndarray, cylinders: list[tuple[float, float, float]], bounds: tuple[float, float], preferred_angle: float | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """三架追捕机在逃逸机朝目标的一侧，距离 8–10 米，开局视线不被圆柱挡住。"""
+    """交接三角：8–10 米、开局看得见，另外两架在锚点左右各 36 度。
+
+    给出 preferred_angle 时，三架都放在该方向一侧，也就是逃逸机朝向目标的一侧。
+    这一侧被圆柱挡住就失败，不改到目标的背面。
+    """
     radii = np.linspace(FORMATION_MIN + 0.25, FORMATION_MAX - 0.25, 4)
     angle_offsets = (0.0, -math.pi / 18.0, math.pi / 18.0, -math.pi / 9.0, math.pi / 9.0)
     half_x, half_y = bounds
@@ -170,7 +174,8 @@ def one_side_visible(rng: np.random.Generator, target: np.ndarray, cylinders: li
                 return False
         return True
 
-    def sees(point: np.ndarray, yaw: float) -> bool:
+    def sees(point: np.ndarray) -> bool:
+        yaw = math.atan2(target[1] - point[1], target[0] - point[0])
         local = _body_local(target - point, yaw)
         distance = float(np.linalg.norm(local))
         elevation = math.degrees(math.atan2(local[2], max(math.hypot(local[0], local[1]), 1e-12)))
@@ -180,8 +185,8 @@ def one_side_visible(rng: np.random.Generator, target: np.ndarray, cylinders: li
             return False
         return not cylinders_block(point, target, cylinders)
 
-    def candidates(expected_angle: float, band: np.ndarray):
-        for radius in band:
+    def candidates(expected_angle: float):
+        for radius in radii:
             for angle_offset in angle_offsets:
                 angle = expected_angle + angle_offset
                 for dz in (0.0, 0.35, -0.35):
@@ -193,58 +198,52 @@ def one_side_visible(rng: np.random.Generator, target: np.ndarray, cylinders: li
                     ])
                     if abs(point[0]) > half_x - 0.5 or abs(point[1]) > half_y - 0.5:
                         continue
-                    if not 1.0 <= point[2] <= 12.0 or not clear(point):
+                    if not 1.0 <= point[2] <= 12.0 or not clear(point) or not sees(point):
                         continue
-                    yaw = math.atan2(target[1] - point[1], target[0] - point[0])
-                    if sees(point, yaw):
-                        yield point
+                    yield point
 
-    def place(band: np.ndarray):
-        base_angle = float(rng.uniform(-math.pi, math.pi)) if preferred_angle is None else float(preferred_angle) + float(rng.uniform(-math.pi / 6.0, math.pi / 6.0))
-        anchor = next(iter(candidates(base_angle, band)), None)
-        if anchor is None:
-            sweep = np.linspace(-math.pi, math.pi, 37)[:-1] if preferred_angle is None else np.linspace(preferred_angle - math.pi / 2.0, preferred_angle + math.pi / 2.0, 25)
-            anchor = next(
-                (point for angle in sweep for point in candidates(float(angle), band)),
-                None,
-            )
-        if anchor is None:
-            return None
-        selected = [anchor]
-        anchor_angle = math.atan2(anchor[1] - target[1], anchor[0] - target[0])
-        for offset in (-math.pi / 5.0, math.pi / 5.0):
-            expected = anchor_angle + offset
+    if preferred_angle is None:
+        base_angle = float(rng.uniform(-math.pi, math.pi))
+        sweep = np.linspace(-math.pi, math.pi, 37, endpoint=False)
+    else:
+        base_angle = float(preferred_angle)
+        sweep = np.linspace(base_angle - math.pi / 2.0, base_angle + math.pi / 2.0, 25)
+    anchor = next(iter(candidates(base_angle)), None)
+    if anchor is None:
+        anchor = next(
+            (point for angle in sweep for point in candidates(float(angle))),
+            None,
+        )
+    if anchor is None:
+        raise RuntimeError("Unable to place a visible one-side formation among cylinders")
+    selected = [anchor]
+    anchor_angle = math.atan2(anchor[1] - target[1], anchor[0] - target[0])
+    for offset in (-math.pi / 5.0, math.pi / 5.0):
+        expected = anchor_angle + offset
+        point = next(
+            (
+                candidate
+                for candidate in candidates(expected)
+                if all(np.linalg.norm(candidate - other) >= 2.0 * CLEARANCE for other in selected)
+            ),
+            None,
+        )
+        if point is None:
             point = next(
                 (
                     candidate
-                    for candidate in candidates(expected, band)
+                    for angle in np.linspace(expected - math.pi / 8.0, expected + math.pi / 8.0, 17)
+                    for candidate in candidates(float(angle))
                     if all(np.linalg.norm(candidate - other) >= 2.0 * CLEARANCE for other in selected)
                 ),
                 None,
             )
-            if point is None:
-                point = next(
-                    (
-                        candidate
-                        for angle in np.linspace(expected - math.pi / 8.0, expected + math.pi / 8.0, 17)
-                        for candidate in candidates(float(angle), band)
-                        if all(np.linalg.norm(candidate - other) >= 2.0 * CLEARANCE for other in selected)
-                    ),
-                    None,
-                )
-            if point is None:
-                return None
-            selected.append(point)
-        positions = np.asarray(selected, dtype=float)
-        yaws = np.arctan2(target[1] - positions[:, 1], target[0] - positions[:, 0])
-        return positions, yaws
-
-    placed = place(radii)
-    if placed is None:
-        placed = place(np.linspace(6.0, 12.0, 5))
-    if placed is None:
-        raise RuntimeError("Unable to place a visible one-side formation among cylinders")
-    return placed
+        if point is None:
+            raise RuntimeError("Unable to place a visible one-side formation among cylinders")
+        selected.append(point)
+    positions = np.asarray(selected, dtype=float)
+    yaws = np.arctan2(target[1] - positions[:, 1], target[0] - positions[:, 0])
+    return positions, yaws
 
 
 def _torch_blocked(start: torch.Tensor, end: torch.Tensor, centers: torch.Tensor, radii: torch.Tensor) -> torch.Tensor:

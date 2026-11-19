@@ -138,6 +138,88 @@ class Matd3Trainer:
         # Optional classical+RL hybrid (blend/residual). None = pure RL actions.
         self.residual_cfg = None
         self._residual_teacher = None
+        self.epn = None
+        self.epn_cfg = None
+        self.epn_runtime = None
+        self.epn_optim = None
+        self.last_epn_mse = 0.0
+        self._epn_inputs = []
+        self._epn_agents = []
+        self._epn_evaders = []
+        self.last_completed_capture = 0.0
+        self.current_train_domain = None
+        self.on_vector_episode_complete = None
+
+    def enable_epn(self, cfg=None, env=None):
+        """Attach a shared EvaderPredictionNet (same contract as MAPPO)."""
+        from pursuit_epn import (
+            EPNConfig,
+            EPNRuntime,
+            attach_epn_to_vector_env,
+            make_epn,
+        )
+
+        probe = env if env is not None else self.env_factory()
+        n_uavs = int(getattr(getattr(probe, "cfg", None), "n_uavs", self.n_agents) or self.n_agents)
+        self.epn_cfg = cfg or EPNConfig(n_uavs=n_uavs)
+        self.epn_cfg.n_uavs = n_uavs
+        self.epn = make_epn(self.epn_cfg, device=self.device)
+        self.epn_optim = torch.optim.Adam(self.epn.parameters(), lr=float(self.epn_cfg.lr))
+        self.epn_runtime = EPNRuntime(self.epn, self.epn_cfg, device=self.device)
+        if env is not None:
+            attach_epn_to_vector_env(env, self.epn_runtime)
+        self.demo_metadata["epn"] = {
+            "enabled": True,
+            "history_steps": int(self.epn_cfg.history_steps),
+            "future_steps": int(self.epn_cfg.future_steps),
+            "hidden_dim": int(self.epn_cfg.hidden_dim),
+            "n_uavs": int(self.epn_cfg.n_uavs),
+        }
+        return self.epn
+
+    def _record_epn_step(self, logic_env):
+        if self.epn_runtime is None or logic_env is None:
+            return
+        from pursuit_epn import agent_xyz, privileged_evader_xyz
+
+        runtime = getattr(logic_env, "epn_runtime", self.epn_runtime)
+        if runtime is None or getattr(runtime, "last_input", None) is None:
+            return
+        try:
+            evader = privileged_evader_xyz(logic_env)
+        except Exception:
+            return
+        if evader is None:
+            return
+        self._epn_inputs.append(np.asarray(runtime.last_input, dtype=np.float32).copy())
+        self._epn_agents.append(np.stack([agent_xyz(logic_env, i) for i in range(self.n_agents)]))
+        self._epn_evaders.append(np.asarray(evader, dtype=np.float64).copy())
+
+    def _flush_epn(self):
+        if self.epn is None or self.epn_optim is None or not self._epn_inputs:
+            return 0.0
+        from pursuit_epn import update_epn_from_rollout
+
+        cfg_env = type("Cfg", (), self.environment_config)()
+        for key, value in self.environment_config.items():
+            setattr(cfg_env, key, value)
+        mse = float(
+            update_epn_from_rollout(
+                self.epn,
+                self.epn_optim,
+                self._epn_inputs,
+                self._epn_agents,
+                self._epn_evaders,
+                cfg_env,
+                self.epn_cfg,
+                device=self.device,
+            )
+        )
+        self.last_epn_mse = mse
+        self._epn_inputs.clear()
+        self._epn_agents.clear()
+        self._epn_evaders.clear()
+        return mse
 
     def load_actor_weights(self, state_dict):
         self.actor.load_state_dict(state_dict)
@@ -609,8 +691,13 @@ class Matd3Trainer:
             results = vec_env.step_joint(actions)
             for index, result in enumerate(results):
                 active = np.ones(self.n_agents, dtype=bool)
+                logic_env = None
                 if hasattr(vec_env, "envs"):
-                    active = ~vec_env.envs[index].disabled_uavs
+                    logic_env = vec_env.envs[index]
+                    active = ~logic_env.disabled_uavs
+                elif hasattr(vec_env, "bridges"):
+                    logic_env = vec_env.bridges[index].env
+                self._record_epn_step(logic_env)
                 # Auto-reset replaces result["obs"] with the next episode; store
                 # the terminal transition against info["final_obs"] instead.
                 transition_result = dict(result)
@@ -637,6 +724,9 @@ class Matd3Trainer:
                 self._stage_transition(row, slot=index)
                 self.env_steps += 1
                 last_stats = self._maybe_update() or last_stats
+                if self.epn is not None and len(self._epn_inputs) >= max(int(self.epn_cfg.history_steps) + int(self.epn_cfg.future_steps), 16):
+                    last_stats = dict(last_stats)
+                    last_stats["epn_mse"] = self._flush_epn()
                 local_steps[index] += 1
                 episode_returns[index] += float(result.get("reward", 0.0))
                 force_done = step_limit > 0 and local_steps[index] >= step_limit
@@ -647,6 +737,9 @@ class Matd3Trainer:
                     ep_return = float(
                         result.get("info", {}).get("episode_return", episode_returns[index])
                     )
+                    if self.epn is not None and self._epn_inputs:
+                        last_stats = dict(last_stats)
+                        last_stats["epn_mse"] = self._flush_epn()
                     history_row = {
                         "episode": completed,
                         "reward": ep_return,
@@ -657,8 +750,15 @@ class Matd3Trainer:
                         "num_envs": int(vec_env.num_envs),
                         "critic_loss": last_stats.get("critic_loss"),
                         "actor_loss": last_stats.get("actor_loss"),
+                        "epn_mse": float(last_stats.get("epn_mse", self.last_epn_mse) or 0.0),
                     }
+                    if self.current_train_domain is not None:
+                        history_row["aeg_level"] = self.current_train_domain
                     self.history.append(clean_history_row(history_row))
+                    self.last_completed_capture = float(captured)
+                    callback = getattr(self, "on_vector_episode_complete", None)
+                    if callable(callback):
+                        callback(completed)
                     local_steps[index] = 0
                     episode_returns[index] = 0.0
                     # If trainer-side step_limit fired without env auto-reset, soft-reset

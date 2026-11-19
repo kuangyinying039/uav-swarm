@@ -140,6 +140,38 @@ class Scene:
         o=self.initial[i]['dynamic_obstacles'][self.layout.num_dynamic+j]
         return self._target(self.generators[i],np.array([o['origin_x'],o['origin_y']]),True)
 
+    def _handoff_triangle(self,rng,start,goal,columns,bounds):
+        """三架放在逃逸机朝向目标的一侧。这一侧放不下时只改逃逸机位置，圆柱不动。"""
+        from parallel.env.mid360 import one_side_visible
+        height=self.target_height
+        half_x,half_y=bounds
+        body=float(self.config['evader_radius'])
+        goal_gap=float(self.config['start_goal']['min_distance'])
+        goal=np.asarray(goal,dtype=float)
+
+        def free(point):
+            if abs(point[0])>half_x-0.5 or abs(point[1])>half_y-0.5:
+                return False
+            if np.linalg.norm(point-goal)<goal_gap:
+                return False
+            return all(math.hypot(point[0]-x,point[1]-y)>radius+body+0.45 for x,y,radius in columns)
+
+        last_error=None
+        origin=np.asarray(start,dtype=float)
+        for attempt in range(128):
+            if attempt:
+                origin=np.array([rng.uniform(-half_x+0.5,half_x-0.5),rng.uniform(-half_y+0.5,half_y-0.5)])
+                if not free(origin):
+                    continue
+            heading=math.atan2(float(goal[1]-origin[1]), float(goal[0]-origin[0]))
+            try:
+                placed=one_side_visible(rng,np.array([origin[0],origin[1],height]),columns,(float(half_x),float(half_y)),heading)
+            except RuntimeError as exc:
+                last_error=exc
+                continue
+            return placed,origin
+        raise RuntimeError('Unable to place a visible one-side formation among cylinders') from last_error
+
     def _generate(self,rng):
         c=self.config;start,goal=self._anchors(rng)
         forward=(goal-start)/np.linalg.norm(goal-start);left=np.array([-forward[1],forward[0]])
@@ -173,11 +205,9 @@ class Scene:
                 objects.extend(triangle)
                 continue
             if pursuer and self.formation=='one_side':
-                from parallel.env.mid360 import one_side_visible
                 columns=[(o['x'],o['y'],o['radius']) for o in static if 'radius' in o]
                 columns.extend((o['x'],o['y'],o['radius']) for o in objects)
-                heading=math.atan2(float(goal[1]-start[1]), float(goal[0]-start[0]))
-                positions,yaws=one_side_visible(rng,np.array([start[0],start[1],self.target_height]),columns,(float(bounds[0]),float(bounds[1])),heading)
+                (positions,yaws),start=self._handoff_triangle(rng,start,goal,columns,(float(bounds[0]),float(bounds[1])))
                 for point,yaw in zip(positions,yaws):
                     objects.append(dict(x=float(point[0]),y=float(point[1]),z=float(point[2]),
                         origin_x=float(point[0]),origin_y=float(point[1]),radius=float(q['radius']),
@@ -211,6 +241,7 @@ class Scene:
                     speed=speed,heading=heading,vx=float(velocity[0]),vy=float(velocity[1]),angular_velocity=0.,
                     goal_x=float(target[0]),goal_y=float(target[1]),is_pursuer=pursuer,pursuer_mode=0,
                     pursuer_ever_detected=False,pursuer_detected=False,pursuer_search_steps_remaining=0,last_seen_x=0.,last_seen_y=0.))
+        forward=(goal-start)/np.linalg.norm(goal-start);left=np.array([-forward[1],forward[0]])
         return dict(schema_version=1,start=start.tolist(),goal=goal.tolist(),frame_x=forward.tolist(),frame_y=left.tolist(),
             static_obstacles=[o for o in static if 'radius' in o],buildings=buildings,dynamic_obstacles=objects,
             robot_state=dict(x=float(start[0]),y=float(start[1]),heading=math.atan2(forward[1],forward[0]),vx=0.,vy=0.,angular_velocity=0.),

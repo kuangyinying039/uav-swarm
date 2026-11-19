@@ -111,14 +111,22 @@ def imitation_phase(
     return beta, origin, "dagger"
 
 
-def _build_app(num_envs: int, seed: int, output: Path, scene: str = "full", perception: str = "mid360"):
+def _build_app(
+    num_envs: int,
+    seed: int,
+    output: Path,
+    scene: str = "full",
+    perception: str = "mid360",
+    *,
+    resume: bool = False,
+):
     from omegaconf import OmegaConf
     from omni_drones import init_simulation_app
     from parallel.env.config_loader import configure_isaac_app, load_visualization
     from parallel.env.dependencies import resolve_source, select_source
     from parallel.strategies.config import load_config
 
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(parents=True, exist_ok=bool(resume))
     source = resolve_source(None)
     select_source(source)
     settings = _training_settings() if scene == "simple" else _radar5_settings()
@@ -565,7 +573,14 @@ def train(args):
     from parallel.training.hetero import graph_observation
     from parallel.training.epn import FUTURE_STEPS, BatchEPN, radar_track
 
-    app, env = _build_app(args.num_envs, args.seed, args.output, args.scene, args.perception)
+    app, env = _build_app(
+        args.num_envs,
+        args.seed,
+        args.output,
+        args.scene,
+        args.perception,
+        resume=bool(getattr(args, "resume", False)),
+    )
     device = env.device
     try:
         state = env.state()
@@ -619,6 +634,9 @@ def train(args):
         history = []
         best_capture = -1.0
         best_snap = None
+        completed = 0
+        env_steps = 0
+        update = 0
 
         def emit(message: str) -> None:
             try:
@@ -627,6 +645,56 @@ def train(args):
                 pass
             with (args.output / "train.log").open("a") as handle:
                 handle.write(message + "\n")
+
+        def persist(tag: str = "checkpoint") -> None:
+            torch.save(
+                _payload(
+                    actor,
+                    critic,
+                    forecaster,
+                    history,
+                    evader_level,
+                    static_count,
+                    dynamic_count,
+                    args.teacher,
+                    args.scene,
+                    evader_level == "aeg",
+                ),
+                args.output / "mappo.pt",
+            )
+            (args.output / "history.json").write_text(json.dumps(history, indent=2))
+            emit(f"[mappo] {tag} steps={env_steps} update={update} episodes={completed}")
+
+        if bool(getattr(args, "resume", False)):
+            ckpt_path = args.output / "mappo.pt"
+            if not ckpt_path.is_file():
+                raise FileNotFoundError(f"--resume needs {ckpt_path}")
+            payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            actor.load_state_dict(payload["actor"])
+            critic.load_state_dict(payload["critic"])
+            if payload.get("epn") is not None:
+                forecaster.net.load_state_dict(payload["epn"])
+            history = list(payload.get("history") or [])
+            hist_path = args.output / "history.json"
+            if hist_path.is_file():
+                disk_history = json.loads(hist_path.read_text())
+                if len(disk_history) >= len(history):
+                    history = list(disk_history)
+            if history:
+                env_steps = int(history[-1].get("env_steps") or 0)
+                update = int(history[-1].get("update") or -1) + 1
+                completed = int(history[-1].get("episodes") or 0)
+            emit(f"[mappo] resume from {ckpt_path} steps={env_steps} update={update} episodes={completed}")
+
+        import signal
+
+        def _stop_and_save(signum, _frame):
+            emit(f"[mappo] caught signal={signum}; saving before exit")
+            persist("signal-save")
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, _stop_and_save)
+        signal.signal(signal.SIGINT, _stop_and_save)
 
         def observe(state, progress):
             return graph_observation(state, env, forecaster.observe(state, progress, *radar_track(env)))
@@ -721,9 +789,6 @@ def train(args):
             env.evader_vertical.copy_(saved_v)
             return actor_report
 
-        completed = 0
-        env_steps = 0
-        update = 0
         dagger_origin = None
         rl_at_steps = None
         extend_note = False
@@ -1019,9 +1084,8 @@ def train(args):
                         emit(f"[mappo] confirmed capture={best_capture:.3f} phase={phase} steps={env_steps}")
             update += 1
             if update % 10 == 0:
-                torch.save(_payload(actor, critic, forecaster, history, evader_level, static_count, dynamic_count, args.teacher, args.scene, evader_level == "aeg"), args.output / "mappo.pt")
-        torch.save(_payload(actor, critic, forecaster, history, evader_level, static_count, dynamic_count, args.teacher, args.scene, evader_level == "aeg"), args.output / "mappo.pt")
-        emit(f"[mappo] wrote {args.output / 'mappo.pt'} episodes={completed}")
+                persist("checkpoint")
+        persist("final")
         if best_snap is not None:
             restore(best_snap)
         if evader_level == "aeg":
@@ -1123,11 +1187,18 @@ def main():
     parser.add_argument("--kl-target", type=float, default=0.03)
     parser.add_argument("--perception", choices=("truth", "mid360"), default="mid360")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from output/mappo.pt and history.json in an existing output directory",
+    )
     args = parser.parse_args()
     if not 1 <= args.num_envs <= 1024:
         parser.error("num-envs must be 1..1024")
     if args.episodes < 1:
         parser.error("--episodes must be positive")
+    if args.resume and not (args.output / "mappo.pt").is_file():
+        parser.error(f"--resume requires {args.output / 'mappo.pt'}")
     started = time.time()
     train(args)
     print(f"[mappo] elapsed={time.time() - started:.1f}s", flush=True)
