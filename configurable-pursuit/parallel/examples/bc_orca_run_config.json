@@ -1,0 +1,54 @@
+{
+  "purpose": "Reproducible reference for the independent ORCA behavior-cloning run and the later dynamic-collision inspection. The checkpoint is the frozen baseline; do not overwrite it when changing the observation, the dataset filter, or the shield.",
+  "observation_version": "graph-v1",
+  "observation_contract": {
+    "width": 64,
+    "obstacle_node_width": 6,
+    "obstacle_fields": ["relative_xy/20", "gap/5", "radius/2", "moving_flag", "seen"],
+    "validity_channel": "last dimension of each obstacle node; HeteroEncoder masks with block[..., -1] > 0.5",
+    "obstacle_velocity": "read by sensed_cylinders and discarded in graph_observation; not in this checkpoint"
+  },
+  "behavior_cloning": {
+    "script": "configurable-pursuit/parallel/examples/bc_orca.py",
+    "command": "python -m parallel.examples.bc_orca",
+    "launch": "source activate.sh from the Isaac work tree, then run with PYTHONPATH set to this repo's configurable-pursuit directory",
+    "teacher": "orca",
+    "dagger": false,
+    "num_envs": 100,
+    "scene": "full",
+    "perception": "mid360",
+    "formation": "one_side",
+    "evader": "medium 1.46 m/s horizontal, 0.84 m/s vertical",
+    "near_success_m": 1.5,
+    "label": "pre-brake ORCA intent",
+    "loss": "normalized four-dimensional MSE",
+    "stop": "validation normalized MSE plateau for 5 epochs, maximum 40 epochs; 0.35 is not a gate",
+    "split": "every 8th qualifying episode is validation; split is by episode, not by adjacent fragments",
+    "collection_seeds": "scene seeds start at 1000 and increase as episodes are reset",
+    "closed_loop_seeds": "2000000 through 2000099",
+    "output": "results/bc-orca-300",
+    "checkpoint": "results/bc-orca-300/bc_orca.pt",
+    "report": "results/bc-orca-300/bc_report.json",
+    "checkpoint_sha256": "404935e3e72f27ddb7c6144da4cb18c77c7c7335da00f42a96e09c19f4306589"
+  },
+  "inspection": {
+    "script": "configurable-pursuit/parallel/examples/bc_orca_inspect.py",
+    "command": "python -m parallel.examples.bc_orca_inspect",
+    "checkpoint": "results/bc-orca-300/bc_orca.pt",
+    "output": "results/bc-orca-inspect",
+    "scene_seeds": "2000000 through 2000099",
+    "torch_seed_each_rollout": 20261119,
+    "coverage_torch_seed": 20261120,
+    "paired_definition": "student final outcome is dynamic collision and the teacher never hits a static or dynamic obstacle on the same scene seed",
+    "note": "The original closed-loop pair was not logged per seed. This inspection is a seeded replay, not those exact 16 trajectories. The first collection's 19 discarded episodes were not saved; coverage.json is a later replay with 24 discarded episodes."
+  },
+  "reinforcement_learning": {
+    "script": "configurable-pursuit/parallel/training/mappo.py",
+    "command": "python -m parallel.training.mappo --teacher none --from-bc results/bc-orca-300/bc_orca.pt --num-envs 128 --rl-steps 5000000 --scene full --perception mid360 --clip 0.08 --kl-coef 0.5 --kl-target 0.03 --entropy 0.01 --output results/mappo-bc-rl",
+    "from_bc": true,
+    "dagger": false,
+    "matd3_after": false,
+    "o2o": "frozen BC policy KL coefficient 0.5 for the first 20 percent of RL steps, then linear decay to 0; PPO ratio clip 0.92-1.08; stop an update after two minibatches with approximate KL above 0.03; initial log_std -2.2; roll back if confirmed capture stays 0.08 below the BC opening rate"
+  },
+  "git_head_when_collected": "9369abb1906fc723c2af08500c0f3ee13d371e23"
+}

@@ -1,0 +1,33 @@
+{
+  "tight": {
+    "samples": 294,
+    "horizontal_rmse_m_s": 0.5668,
+    "vertical_rmse_m_s": 0.1537,
+    "yaw_rmse_rad_s": 0.8207
+  },
+  "approach": {
+    "samples": 490,
+    "horizontal_rmse_m_s": 0.5582,
+    "vertical_rmse_m_s": 0.1491,
+    "yaw_rmse_rad_s": 0.8457
+  },
+  "ordinary": {
+    "samples": 23741,
+    "horizontal_rmse_m_s": 0.5206,
+    "vertical_rmse_m_s": 0.1602,
+    "yaw_rmse_rad_s": 0.7893
+  },
+  "hazard_visibility": {
+    "decisions_with_dynamic_gap_below_1m": 766,
+    "nearest_disk_tracked_ratio": 0.9974,
+    "nearest_disk_in_top3_ratio": 0.9974,
+    "yaw_error_above_0_5": {
+      "samples": 274,
+      "tracked_and_top3_ratio": 1.0
+    },
+    "yaw_error_at_most_0_5": {
+      "samples": 492,
+      "tracked_and_top3_ratio": 0.9959
+    }
+  }
+}

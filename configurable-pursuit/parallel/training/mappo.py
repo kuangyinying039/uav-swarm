@@ -513,7 +513,7 @@ def _outcome_report(outcomes: torch.Tensor) -> dict:
     }
 
 
-def _evaluate_batches(env, forecaster, observe, evader_command, max_steps, pursue, seed_start: int, episodes: int) -> dict:
+def _evaluate_batches(env, forecaster, observe, evader_command, max_steps, pursue, seed_start: int, episodes: int, run_args=None) -> dict:
     """按环境数分批评测。监控、确认和最终测试使用不同的种子段。"""
     width = int(env.n)
     batches = max(1, (int(episodes) + width - 1) // width)
@@ -521,7 +521,7 @@ def _evaluate_batches(env, forecaster, observe, evader_command, max_steps, pursu
     keys = ("episodes", "captures", "static_collisions", "dynamic_collisions", "out_of_bounds", "physical_failures", "goals", "timeouts", "ongoing")
     for batch in range(batches):
         seeds = list(range(seed_start + batch * width, seed_start + (batch + 1) * width))
-        report = _evaluate_controller(env, forecaster, observe, evader_command, max_steps, pursue, seeds)
+        report = _evaluate_controller(env, forecaster, observe, evader_command, max_steps, pursue, seeds, run_args)
         if combined is None:
             combined = report
             continue
@@ -547,16 +547,21 @@ def _intent_mse(prediction: torch.Tensor, command: torch.Tensor, alive: torch.Te
     return (error * alive).sum() / alive.sum().clamp_min(1.0)
 
 
-def _evaluate_controller(env, forecaster, observe, evader_command, max_steps, pursue, seeds) -> dict:
+def _evaluate_controller(env, forecaster, observe, evader_command, max_steps, pursue, seeds, run_args=None) -> dict:
     """pursue(state, progress) 返回已经过安全过滤的追捕机指令。"""
-    import subprocess
-    try:
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    except (OSError, subprocess.CalledProcessError):
-        revision = None
-    manifest = {"revision": revision, "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                "bc_metric": "normalized_action_mse", "resume_kind": "partial" if args.resume else "fresh"}
-    (args.output / f"run_{time.time_ns()}.json").write_text(json.dumps(manifest, indent=2))
+    if run_args is not None:
+        import subprocess
+        try:
+            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        except (OSError, subprocess.CalledProcessError):
+            revision = None
+        manifest = {
+            "revision": revision,
+            "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(run_args).items()},
+            "bc_metric": "normalized_action_mse",
+            "resume_kind": "from_bc" if getattr(run_args, "from_bc", None) else ("partial" if run_args.resume else "fresh"),
+        }
+        (run_args.output / f"run_{time.time_ns()}.json").write_text(json.dumps(manifest, indent=2))
     device = env.device
     ids = torch.arange(env.n, device=device)
     forecaster.reset(ids)
@@ -772,11 +777,11 @@ def train(args):
                 env.evader_horizontal.fill_(horizontal)
                 env.evader_vertical.fill_(vertical)
             actor_report = _evaluate_batches(
-                env, forecaster, observe, evader_command, max_steps, pursue_actor, seed_start, episodes,
+                env, forecaster, observe, evader_command, max_steps, pursue_actor, seed_start, episodes, args,
             )
             if teacher is not None:
                 teacher_report = _evaluate_batches(
-                    env, forecaster, observe, evader_command, max_steps, pursue_teacher, seed_start, episodes,
+                    env, forecaster, observe, evader_command, max_steps, pursue_teacher, seed_start, episodes, args,
                 )
                 teacher.previous.zero_()
             env.evader_horizontal.copy_(saved_h)
@@ -795,6 +800,26 @@ def train(args):
         reference = None
         low_streak = 0
         best_monitor = -1.0
+        if getattr(args, "from_bc", None):
+            import copy
+            blob = torch.load(args.from_bc, map_location=device, weights_only=False)
+            actor.load_state_dict(blob["actor"])
+            if blob.get("epn") is not None:
+                forecaster.net.load_state_dict(blob["epn"])
+            actor.log_std.data.fill_(-2.2)
+            reference = copy.deepcopy(actor).eval()
+            for parameter in reference.parameters():
+                parameter.requires_grad_(False)
+            rl_at_steps = 0
+            rl_ready = True
+            opening = scored(9_000_000, args.confirm_episodes)
+            init_capture = opening["capture_rate"]
+            best_capture = init_capture
+            best_snap = snapshot()
+            emit(
+                f"[mappo] rl from bc={args.from_bc} init_capture={init_capture:.3f} "
+                f"log_std={float(actor.log_std.mean()):.3f} kl_coef={args.kl_coef} clip={args.clip}"
+            )
         while still_training(env_steps, args.imitation_max_steps, args.rl_steps, teacher is not None, rl_at_steps):
             obs_buf, raw_buf, logp_buf = [], [], []
             state_buf, reward_buf, done_buf, value_buf = [], [], [], []
@@ -1087,12 +1112,12 @@ def train(args):
                 _apply_level(env, index, "medium")
         torch.save(_payload(actor, critic, forecaster, history, evader_level, static_count, dynamic_count, args.teacher, args.scene, evader_level == "aeg"), args.output / "mappo_eval.pt")
         actor_report = _evaluate_batches(
-            env, forecaster, observe, evader_command, max_steps, pursue_actor, 10_000_000, args.final_episodes,
+            env, forecaster, observe, evader_command, max_steps, pursue_actor, 10_000_000, args.final_episodes, args,
         )
         held_teacher = None
         if teacher is not None:
             held_teacher = _evaluate_batches(
-                env, forecaster, observe, evader_command, max_steps, pursue_teacher, 10_000_000, args.final_episodes,
+                env, forecaster, observe, evader_command, max_steps, pursue_teacher, 10_000_000, args.final_episodes, args,
             )
         evaluation = {
             **actor_report,
@@ -1180,6 +1205,8 @@ def main():
     parser.add_argument("--kl-target", type=float, default=0.03)
     parser.add_argument("--perception", choices=("truth", "mid360"), default="mid360")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--from-bc", type=Path, default=None,
+                        help="Load this behavior-cloning actor and EPN, then train RL with a frozen KL anchor")
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -1188,6 +1215,11 @@ def main():
     parser.add_argument("--allow-partial-resume", action="store_true",
                         help="Explicitly accept resetting replay, optimizers and curriculum; pure RL only")
     args = parser.parse_args()
+    if args.from_bc is not None:
+        if args.teacher != "none" or args.resume:
+            parser.error("--from-bc starts RL from the saved actor and does not rerun BC or DAgger")
+        if not args.from_bc.is_file():
+            parser.error(f"--from-bc requires {args.from_bc}")
     if args.resume and (not args.allow_partial_resume or args.teacher != "none"):
         parser.error("Checkpoints do not support full continuation. For pure RL only, use --allow-partial-resume to explicitly accept a partial restart; teacher runs must start fresh.")
     if args.teacher != "none":

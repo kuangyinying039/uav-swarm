@@ -1,0 +1,74 @@
+{
+  "paired_definition": "student final outcome is dynamic collision, and the teacher never hit a static or dynamic obstacle on the same scene seed",
+  "paired_cases": 16,
+  "classification_counts": {
+    "execution": 7,
+    "policy_shift": 8,
+    "teacher_unreliable": 1
+  },
+  "student_dynamic_outcomes": 17,
+  "teacher_dynamic_outcomes": 12,
+  "student_captures": 67,
+  "teacher_captures": 60,
+  "segments": {
+    "tight": {
+      "samples": 294,
+      "horizontal_rmse_m_s": 0.5668,
+      "vertical_rmse_m_s": 0.1537,
+      "yaw_rmse_rad_s": 0.8207
+    },
+    "approach": {
+      "samples": 490,
+      "horizontal_rmse_m_s": 0.5582,
+      "vertical_rmse_m_s": 0.1491,
+      "yaw_rmse_rad_s": 0.8457
+    },
+    "ordinary": {
+      "samples": 23741,
+      "horizontal_rmse_m_s": 0.5206,
+      "vertical_rmse_m_s": 0.1602,
+      "yaw_rmse_rad_s": 0.7893
+    },
+    "hazard_visibility": {
+      "decisions_with_dynamic_gap_below_1m": 766,
+      "nearest_disk_tracked_ratio": 0.9974,
+      "nearest_disk_in_top3_ratio": 0.9974,
+      "yaw_error_above_0_5": {
+        "samples": 274,
+        "tracked_and_top3_ratio": 1.0
+      },
+      "yaw_error_at_most_0_5": {
+        "samples": 492,
+        "tracked_and_top3_ratio": 0.9959
+      }
+    }
+  },
+  "coverage_summary": {
+    "qualified": {
+      "episodes": 300,
+      "episodes_with_dynamic_gap_below_1m": 146,
+      "episodes_with_dynamic_gap_below_0_5m": 74,
+      "hazard_decision_ratio": 0.0867,
+      "tight_decision_ratio": 0.0249,
+      "hazard_decisions_missing_top3_ratio": 0.0012
+    },
+    "discarded": {
+      "episodes": 24,
+      "episodes_with_dynamic_gap_below_1m": 23,
+      "episodes_with_dynamic_gap_below_0_5m": 22,
+      "hazard_decision_ratio": 0.3577,
+      "tight_decision_ratio": 0.2266,
+      "hazard_decisions_missing_top3_ratio": 0.0
+    }
+  },
+  "decision": {
+    "start_dagger": false,
+    "reason": [
+      "Nearest moving disk is already tracked and inside the top-three obstacle nodes in 99.7% of decisions with gap under 1 m. Yaw error does not change that rate, and obstacle visibility does not use yaw.",
+      "Obstacle velocity is used by ORCA and the shield but is absent from the student graph. All 16 student-only collisions are with disks moving about 0.5 to 1.4 m/s. Add that channel and rerun behavior cloning before adding DAgger labels.",
+      "At the last decision, the largest shield change is a column sweep in 9 cases and a peer sweep in 6. In several of those the sweep reduces an avoidance command, and body velocity does not reach the shielded command before contact. That is an execution check, which DAgger does not replace.",
+      "Hazard versus ordinary action RMSE differs by only about 0.05 m/s horizontally and 0.03 rad/s in yaw, so the aggregate MSE is not hiding a separate hazard-only regression.",
+      "Qualified episodes spend 8.7% of decisions inside 1 m of a moving disk. Discarded episodes spend 35.8%, and 22 of 24 reach 0.5 m. Those avoidance segments are worth keeping even though the episode never came within 1.5 m of the evader."
+    ]
+  }
+}
